@@ -1,0 +1,31 @@
+[package]
+name = "punch-hole-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.punch-hole]
+path = ".."
+
+# Keeps the fuzz crate out of any workspace declared around the library.
+[workspace]
+
+[[bin]]
+name = "fuzz_sig_frame"
+path = "fuzz_targets/fuzz_sig_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_data_packet"
+path = "fuzz_targets/fuzz_data_packet.rs"
+test = false
+doc = false
+bench = false
