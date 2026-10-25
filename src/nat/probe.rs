@@ -1,22 +1,24 @@
 //! STUN binding prober.
 //!
 //! The wire subset is one binding request and one response, written in-tree
-//! per the architecture notes. The prober queries several distinct
-//! destinations from one socket, which yields the allocation sequence that
-//! classification fits.
+//! per the architecture notes. The prober resolves every address of every
+//! configured server and queries all destinations from one socket in one
+//! fan-out round, which yields the allocation sequence that classification
+//! fits.
 
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    time::Duration,
 };
+
+use tokio::time::Instant;
 
 use crate::{
     config::PunchConfig,
-    error::PunchError,
+    error::{Phase, PunchError},
     msg::{MAX_ALLOC_SEQ, MAX_V6_ADDRS},
-    nat::{FilterClass, NatInfo, V4Nat, V6Nat, classify},
-    socket::{Family, UdpFactory},
+    nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat, classify},
+    socket::{Family, UdpFactory, UdpIo},
 };
 
 const COOKIE: [u8; 4] = 0x2112_a442u32.to_be_bytes();
@@ -25,58 +27,64 @@ const BINDING_RESPONSE: u16 = 0x0101;
 const ATTR_XOR_MAPPED: u16 = 0x0020;
 
 /// Runs the Probe phase and returns the evidence it collected.
+///
+/// Both address families fit inside `cfg.probe_timeout`.
 pub(crate) async fn probe<F: UdpFactory>(
     cfg: &PunchConfig,
     factory: &F,
 ) -> Result<NatInfo, PunchError> {
-    let v4_servers = resolve(cfg, false).await;
-    if v4_servers.is_empty() {
+    let start = Instant::now();
+    let deadline = start + cfg.probe_timeout;
+
+    let v4_dests = resolve(cfg, false).await;
+    if v4_dests.is_empty() {
         return Err(PunchError::Io(io::Error::other(
             "no STUN server resolved to an IPv4 address",
         )));
     }
     let socket = factory.bind(Family::V4.any_addr()).await?;
 
-    // One answer per distinct destination, in send order.
-    let per_server =
-        (cfg.probe_timeout / v4_servers.len().max(1) as u32).max(Duration::from_millis(1));
-    let mut reflexives = Vec::with_capacity(v4_servers.len());
-    for server in &v4_servers {
-        if let Some(addr) = stun_query(&socket, *server, per_server).await {
-            reflexives.push(addr);
-        }
+    // Destination count above the wire cap adds evidence the frames cannot
+    // carry, so the fan-out stops there.
+    let mut round = Fanout::new(v4_dests.into_iter().take(MAX_ALLOC_SEQ).collect());
+    round.send_pending(&socket).await;
+    round.collect(&socket, start + cfg.probe_timeout / 2).await;
+    // One retry round for silent destinations, bounded by the phase deadline.
+    if round.pending() > 0 {
+        round.send_pending(&socket).await;
+        round.collect(&socket, deadline).await;
     }
-    if reflexives.is_empty() {
+
+    // The first answered sample in send order fixes the reflexive address,
+    // which keeps the result deterministic.
+    let Some((first_idx, reflexive)) = round.first() else {
         return Err(PunchError::Timeout {
-            phase: crate::error::Phase::Probe,
+            phase: Phase::Probe,
         });
+    };
+    let observed = round.observed();
+    let public = is_public(&socket, round.dest(first_idx), &reflexive);
+
+    // A second socket to the first answered destination confirms socket
+    // independence: one shared external port for two local sockets outranks
+    // the sequence.
+    let same_port = match factory.bind(Family::V4.any_addr()).await {
+        Ok(second) => {
+            // The confirmation waits at most half the budget and never past
+            // the phase deadline.
+            let until = (Instant::now() + cfg.probe_timeout / 2).min(deadline);
+            stun_query(&second, round.dest(first_idx), until)
+                .await
+                .is_some_and(|addr| addr.port() == reflexive.port())
+        },
+        Err(_) => false,
+    };
+    let mut class = classify::classify(public, &observed);
+    if same_port && matches!(class, NatClass::EasySym { .. } | NatClass::HardSym) {
+        class = NatClass::Cone;
     }
 
-    let ports: Vec<u16> = reflexives.iter().map(SocketAddr::port).collect();
-    let public = is_public(&socket, v4_servers[0], &reflexives[0]);
-
-    // A second socket to the first destination confirms socket independence:
-    // one shared external port for two local sockets outranks the sequence.
-    let class = match factory.bind(Family::V4.any_addr()).await {
-        Ok(second) => {
-            let same = stun_query(&second, v4_servers[0], per_server)
-                .await
-                .is_some_and(|a| a.port() == ports[0]);
-            let mut class = classify::classify(public, &ports);
-            if same
-                && matches!(
-                    class,
-                    crate::nat::NatClass::EasySym { .. } | crate::nat::NatClass::HardSym
-                )
-            {
-                class = crate::nat::NatClass::Cone;
-            }
-            class
-        },
-        Err(_) => classify::classify(public, &ports),
-    };
-
-    let filtering = if class == crate::nat::NatClass::Cone && reflexives.len() >= 2 {
+    let filtering = if class == NatClass::Cone && observed.len() >= 2 {
         // Multiple destinations answered through one port: the mapping is
         // endpoint independent, and precise filtering needs a third-party
         // echo the prober does not have.
@@ -88,18 +96,18 @@ pub(crate) async fn probe<F: UdpFactory>(
     let v4 = V4Nat {
         class,
         reflexive: SocketAddrV4::new(
-            match reflexives[0].ip() {
+            match reflexive.ip() {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
             },
-            ports[0],
+            reflexive.port(),
         ),
-        alloc_seq: ports.into_iter().take(MAX_ALLOC_SEQ).collect(),
+        alloc_seq: observed.iter().map(|&(_, port)| port).collect(),
         filtering,
     };
 
     let v6 = if cfg.ipv6 {
-        probe_v6(cfg, factory, &v4_servers).await
+        probe_v6(cfg, factory, deadline).await
     } else {
         None
     };
@@ -108,41 +116,140 @@ pub(crate) async fn probe<F: UdpFactory>(
 }
 
 /// Collects global IPv6 reflexive addresses when a server and a route exist.
+///
+/// One fan-out round inside what remains of the phase budget, at most half
+/// of it, so a silent IPv6 path delays the session by half a budget at most.
 async fn probe_v6<F: UdpFactory>(
     cfg: &PunchConfig,
     factory: &F,
-    v4_servers: &[SocketAddr],
+    deadline: Instant,
 ) -> Option<V6Nat> {
     let servers = resolve(cfg, true).await;
     if servers.is_empty() {
         return None;
     }
     let socket = factory.bind(Family::V6.any_addr()).await.ok()?;
-    let per_server = (cfg.probe_timeout / (servers.len() + v4_servers.len()).max(1) as u32)
-        .max(Duration::from_millis(1));
-    let mut addrs = Vec::with_capacity(MAX_V6_ADDRS);
-    for server in servers {
-        if let Some(addr) = stun_query(&socket, server, per_server).await {
-            if addrs.len() < MAX_V6_ADDRS {
-                addrs.push(match addr {
-                    SocketAddr::V6(a) => a,
-                    SocketAddr::V4(_) => continue,
-                });
+    let until = (Instant::now() + cfg.probe_timeout / 2).min(deadline);
+    let mut round = Fanout::new(servers.into_iter().take(MAX_V6_ADDRS).collect());
+    round.send_pending(&socket).await;
+    round.collect(&socket, until).await;
+    // A V4 answer on the v6 socket carries no IPv6 address.
+    let addrs: Vec<_> = round
+        .slots
+        .iter()
+        .flatten()
+        .filter_map(|addr| match addr {
+            SocketAddr::V6(addr) => Some(*addr),
+            SocketAddr::V4(_) => None,
+        })
+        .collect();
+    (!addrs.is_empty()).then_some(V6Nat { addrs })
+}
+
+/// One round set of binding queries over one socket.
+///
+/// Slot `i` holds the answer of `dests[i]`. The slot index is the send
+/// index: queries go out in index order, so a symmetric NAT allocates the
+/// ports in index order and the slots record the allocation sequence.
+struct Fanout {
+    dests: Vec<SocketAddr>,
+    /// One transaction id per destination, kept stable across retry rounds,
+    /// so a late answer to an earlier round still matches its slot.
+    txids: Vec<[u8; 12]>,
+    slots: Vec<Option<SocketAddr>>,
+}
+
+impl Fanout {
+    fn new(dests: Vec<SocketAddr>) -> Self {
+        let slots = vec![None; dests.len()];
+        let txids = dests.iter().map(|_| rand::random()).collect();
+        Self {
+            dests,
+            txids,
+            slots,
+        }
+    }
+
+    /// Destinations that have no answer yet.
+    fn pending(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_none()).count()
+    }
+
+    /// The destination of one send index.
+    fn dest(&self, idx: usize) -> SocketAddr {
+        self.dests[idx]
+    }
+
+    /// Sends one request per still-silent destination, in send-index order.
+    ///
+    /// A retry targets the same destination from the same socket, so the NAT
+    /// reuses the mapping of the first send. Retries allocate nothing new,
+    /// and the send indexes stay allocation indexes.
+    async fn send_pending<S: UdpIo>(&self, socket: &S) {
+        for ((slot, dst), txid) in self.slots.iter().zip(&self.dests).zip(&self.txids) {
+            if slot.is_some() {
+                continue;
+            }
+            let request = binding_request(txid);
+            // A failed send leaves a hole the fit treats as an unknown port.
+            let _ = socket.send_to(&request, *dst).await;
+        }
+    }
+
+    /// Collects answers until no destination pends or `until` passes.
+    async fn collect<S: UdpIo>(&mut self, socket: &S, until: Instant) {
+        while self.pending() > 0 {
+            let mut buf = [0u8; 128];
+            // A deadline miss or a socket error ends the round; whatever
+            // answered so far stands.
+            let Ok(Ok((len, _))) = tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            self.absorb(&buf[..len]);
+        }
+    }
+
+    /// Places one answer datagram into the slot of its transaction id.
+    ///
+    /// Answers overtake each other; the transaction id selects the slot, so
+    /// the slots keep send order whatever the arrival order is. A duplicate
+    /// of an answered slot matches no pending slot and is dropped.
+    fn absorb(&mut self, buf: &[u8]) {
+        for (slot, txid) in self.slots.iter_mut().zip(&self.txids) {
+            if slot.is_none() {
+                if let Some(addr) = parse_mapped(buf, txid) {
+                    *slot = Some(addr);
+                    break;
+                }
             }
         }
     }
-    (!addrs.is_empty()).then_some(V6Nat { addrs })
+
+    /// The first answered sample in send order.
+    fn first(&self) -> Option<(usize, SocketAddr)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .find_map(|(idx, slot)| slot.map(|addr| (idx, addr)))
+    }
+
+    /// The `(send index, port)` pairs classification fits. A missing index
+    /// marks an allocation whose port no server reported.
+    fn observed(&self) -> Vec<(usize, u16)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.map(|addr| (idx, addr.port())))
+            .collect()
+    }
 }
 
 /// A socket is public when its reflexive address is its own address.
 ///
 /// Sockets bound to the wildcard report `0.0.0.0`, so the interface address
 /// toward the server stands in for the local one.
-fn is_public<S: crate::socket::UdpIo>(
-    socket: &S,
-    server: SocketAddr,
-    reflexive: &SocketAddr,
-) -> bool {
+fn is_public<S: UdpIo>(socket: &S, server: SocketAddr, reflexive: &SocketAddr) -> bool {
     let Ok(local) = socket.local_addr() else {
         return false
     };
@@ -167,6 +274,10 @@ fn is_public<S: crate::socket::UdpIo>(
 }
 
 /// Resolves configured servers to addresses of one family.
+///
+/// Every address of a hostname joins the destination list, and a literal IP
+/// resolves to itself. Duplicates drop out, so one destination means one
+/// mapping.
 async fn resolve(cfg: &PunchConfig, want_v6: bool) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for server in &cfg.stun_servers {
@@ -174,30 +285,34 @@ async fn resolve(cfg: &PunchConfig, want_v6: bool) -> Vec<SocketAddr> {
             continue
         };
         for addr in list {
-            if addr.is_ipv6() == want_v6 {
+            if addr.is_ipv6() == want_v6 && !out.contains(&addr) {
                 out.push(addr);
-                break;
             }
         }
     }
     out
 }
 
-/// Sends one binding request per timeout slice until a matching answer.
+/// Queries one server from one socket until an answer or `until`.
 ///
-/// Shared with the punch engine, which re-queries a punch socket to learn
-/// its fresh external port for a `PortUpdate`.
-pub(crate) async fn stun_query<S: crate::socket::UdpIo>(
+/// Two attempts split the remaining budget, so the pair ends by `until`.
+/// The second-socket confirmation runs on this helper.
+async fn stun_query<S: UdpIo>(
     socket: &S,
     server: SocketAddr,
-    timeout: Duration,
+    until: Instant,
 ) -> Option<SocketAddr> {
     let txid: [u8; 12] = rand::random();
     let request = binding_request(&txid);
-    for _ in 0..2 {
+    let now = Instant::now();
+    // The first attempt waits half of what is left, the second the rest.
+    let first_until = now + until.saturating_duration_since(now) / 2;
+    let mut buf = [0u8; 128];
+    for attempt_until in [first_until, until] {
         socket.send_to(&request, server).await.ok()?;
-        let mut buf = [0u8; 128];
-        if let Ok(Ok((len, _))) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+        if let Ok(Ok((len, _))) =
+            tokio::time::timeout_at(attempt_until, socket.recv_from(&mut buf)).await
+        {
             if let Some(addr) = parse_mapped(&buf[..len], &txid) {
                 return Some(addr);
             }
@@ -306,5 +421,54 @@ mod tests {
     fn mismatched_transaction_ids_are_rejected() {
         let resp = binding_request(&[0u8; 12]);
         assert!(parse_mapped(&resp, &[9u8; 12]).is_none());
+    }
+
+    /// A binding response that reports `port` for the transaction `txid`.
+    fn binding_response(txid: &[u8; 12], port: u16) -> Vec<u8> {
+        let ip: Ipv4Addr = [203, 0, 113, 7].into();
+        let mut attr = vec![0x00, 0x01];
+        attr.extend_from_slice(&(port ^ 0x2112).to_be_bytes());
+        let xip: Vec<u8> = ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k).collect();
+        attr.extend_from_slice(&xip);
+
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        resp.extend_from_slice(&8u16.to_be_bytes());
+        resp.extend_from_slice(&COOKIE);
+        resp.extend_from_slice(txid);
+        resp.extend_from_slice(&ATTR_XOR_MAPPED.to_be_bytes());
+        resp.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&attr);
+        resp
+    }
+
+    #[test]
+    fn answers_land_in_send_order_slots() {
+        let dests: Vec<SocketAddr> = (0..3u16)
+            .map(|port| SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478 + port)))
+            .collect();
+        let mut round = Fanout::new(dests);
+        // Destination 2 answers first and destination 1 last.
+        round.absorb(&binding_response(&round.txids[2], 5012));
+        round.absorb(&binding_response(&round.txids[0], 5010));
+        round.absorb(&binding_response(&round.txids[1], 5011));
+        // Ports sit at their send indexes, whatever the arrival order was.
+        assert_eq!(round.observed(), vec![(0, 5010), (1, 5011), (2, 5012)]);
+        assert_eq!(
+            round.first().map(|(idx, addr)| (idx, addr.port())),
+            Some((0, 5010))
+        );
+    }
+
+    #[test]
+    fn duplicate_and_foreign_answers_are_dropped() {
+        let dest = vec![SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478))];
+        let mut round = Fanout::new(dest);
+        round.absorb(&binding_response(&round.txids[0], 5010));
+        // A retransmitted answer and a foreign transaction change nothing.
+        round.absorb(&binding_response(&round.txids[0], 5099));
+        round.absorb(&binding_response(&[9u8; 12], 5000));
+        assert_eq!(round.observed(), vec![(0, 5010)]);
+        assert_eq!(round.pending(), 0);
     }
 }
