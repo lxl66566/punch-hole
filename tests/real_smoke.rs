@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashSet,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -25,11 +25,16 @@ struct LocalStun {
 }
 
 async fn local_stun() -> std::io::Result<LocalStun> {
+    Ok(LocalStun {
+        addrs: stun_endpoints(IpAddr::from([127, 0, 0, 1]), 4).await?,
+    })
+}
+
+/// Binds `count` STUN endpoints on one loopback address and serves them.
+async fn stun_endpoints(ip: IpAddr, count: usize) -> std::io::Result<Vec<String>> {
     let mut addrs = Vec::new();
-    for _ in 0..4 {
-        let sock = TokioFactory
-            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await?;
+    for _ in 0..count {
+        let sock = TokioFactory.bind(SocketAddr::new(ip, 0)).await?;
         let addr = sock.local_addr()?;
         addrs.push(addr.to_string());
         tokio::spawn(async move {
@@ -45,11 +50,11 @@ async fn local_stun() -> std::io::Result<LocalStun> {
             }
         });
     }
-    Ok(LocalStun { addrs })
+    Ok(addrs)
 }
 
 /// Minimal binding response that echoes the request's transaction id and
-/// maps the requester's address.
+/// maps the requester's address on either family.
 fn binding_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
     if request.len() < 20
         || u16::from_be_bytes([request[0], request[1]]) != 0x0001
@@ -57,23 +62,39 @@ fn binding_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
     {
         return None;
     }
-    let ip = match from.ip() {
-        IpAddr::V4(ip) => ip,
-        IpAddr::V6(_) => return None,
+    // The XOR mask is the cookie for IPv4 and cookie plus transaction id
+    // for IPv6, which is what the prober's parser expects.
+    let (family, xaddr): (u8, Vec<u8>) = match from.ip() {
+        IpAddr::V4(ip) => (
+            0x01,
+            ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k).collect(),
+        ),
+        IpAddr::V6(ip) => {
+            let mut mask = [0u8; 16];
+            mask[..4].copy_from_slice(&COOKIE);
+            mask[4..].copy_from_slice(&request[8..20]);
+            (
+                0x02,
+                ip.octets().iter().zip(mask).map(|(b, k)| b ^ k).collect(),
+            )
+        },
     };
-    let port = from.port() ^ 0x2112;
-    let xip: Vec<u8> = ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k).collect();
-    let mut out = Vec::with_capacity(32);
+    let attr_len: u16 = if family == 0x01 {
+        8
+    } else {
+        20
+    };
+    let mut out = Vec::with_capacity(48);
     out.extend_from_slice(&0x0101u16.to_be_bytes());
-    out.extend_from_slice(&12u16.to_be_bytes());
+    out.extend_from_slice(&attr_len.to_be_bytes());
     out.extend_from_slice(&COOKIE);
     out.extend_from_slice(&request[8..20]);
     out.extend_from_slice(&0x0020u16.to_be_bytes());
-    out.extend_from_slice(&8u16.to_be_bytes());
+    out.extend_from_slice(&attr_len.to_be_bytes());
     out.push(0);
-    out.push(0x01);
-    out.extend_from_slice(&port.to_be_bytes());
-    out.extend_from_slice(&xip);
+    out.push(family);
+    out.extend_from_slice(&(from.port() ^ 0x2112).to_be_bytes());
+    out.extend_from_slice(&xaddr);
     Some(out)
 }
 
@@ -224,4 +245,54 @@ async fn keepalive_beats_and_stops_with_guard() {
             .is_err(),
         "the heartbeat stopped with the guard"
     );
+}
+
+/// A full session whose Direct stage runs over IPv6.
+///
+/// The prober records any IPv6 reflexive address, so `::1` stands in for a
+/// global one and the whole path runs on loopback: v6 probe, v6 PortUpdate,
+/// v6 handshake, and a v6 winner socket. Routing and firewall behavior with
+/// real global addresses stay untested here.
+#[tokio::test]
+async fn direct_v6_session_runs_on_loopback() {
+    let v6 = match stun_endpoints(IpAddr::from(Ipv6Addr::LOCALHOST), 2).await {
+        Ok(v6) => v6,
+        Err(e) => {
+            eprintln!("skipped, no IPv6 loopback available: {e}");
+            return;
+        },
+    };
+    let stun = local_stun().await.expect("local stun binds");
+    let mut cfg = loopback_config(&stun);
+    cfg.ipv6 = true;
+    cfg.stun_servers.extend(v6);
+    // Real time drives this test; the margin keeps the window from closing
+    // before the PortUpdate pair crosses.
+    cfg.direct_window = Duration::from_secs(2);
+
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    connect(ha, hb);
+    let cfg_b = cfg.clone();
+    let a = tokio::spawn(async move { Puncher::new(cfg)?.with_signaling(la).initiator().await });
+    let b = tokio::spawn(async move { Puncher::new(cfg_b)?.with_signaling(lb).responder().await });
+    let pa = a.await.expect("initiator task").expect("v6 punch");
+    let pb = b.await.expect("responder task").expect("v6 punch");
+
+    // A v6 peer address can only come from the Direct stage, because the
+    // matrix strategies bind IPv4 only.
+    assert!(pa.peer_addr.is_ipv6(), "got {}", pa.peer_addr);
+    assert!(pb.peer_addr.is_ipv6(), "got {}", pb.peer_addr);
+    assert_eq!(pa.report.local_class, punch_hole::NatClass::Public);
+
+    let mut buf = [0u8; 64];
+    pa.socket
+        .send_to(b"VPING", pa.peer_addr)
+        .await
+        .expect("v6 ping");
+    let (n, from) = recv_business(&pb.socket, &mut buf).await;
+    assert_eq!(&buf[..n], b"VPING");
+    pb.socket.send_to(b"VPONG", from).await.expect("v6 pong");
+    let (n, _) = recv_business(&pa.socket, &mut buf).await;
+    assert_eq!(&buf[..n], b"VPONG");
 }
