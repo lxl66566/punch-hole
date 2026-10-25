@@ -104,6 +104,21 @@ fn loopback_config(stun: &LocalStun) -> PunchConfig {
     cfg
 }
 
+/// Reads until a business datagram arrives. Around handover the peer's
+/// handshake retries may still land in the winner socket, so protocol
+/// packets are skipped instead of failing the exchange.
+async fn recv_business(sock: &tokio::net::UdpSocket, buf: &mut [u8]) -> (usize, SocketAddr) {
+    loop {
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(buf))
+            .await
+            .expect("business datagram within 2s")
+            .expect("socket alive");
+        if buf[0] != punch_hole::msg::DATA_MAGIC {
+            return (n, from);
+        }
+    }
+}
+
 async fn punch_loopback() -> (Punched, Punched) {
     let stun = local_stun().await.expect("local stun binds");
     let cfg = loopback_config(&stun);
@@ -132,19 +147,11 @@ async fn loopback_punch_exchanges_business_bytes() {
         .send_to(b"PING", pa.peer_addr)
         .await
         .expect("ping");
-    let (n, from) = pb
-        .socket
-        .recv_from(&mut buf)
-        .await
-        .expect("pong side hears");
+    let (n, from) = recv_business(&pb.socket, &mut buf).await;
     assert_eq!(&buf[..n], b"PING");
     assert_eq!(from.ip(), pb.peer_addr.ip());
     pb.socket.send_to(b"PONG", from).await.expect("pong");
-    let (n, _) = pa
-        .socket
-        .recv_from(&mut buf)
-        .await
-        .expect("ping side hears");
+    let (n, _) = recv_business(&pa.socket, &mut buf).await;
     assert_eq!(&buf[..n], b"PONG");
 }
 
@@ -176,7 +183,7 @@ async fn winner_socket_outlives_the_session() {
         .await
         .expect("winner still sends");
     let mut buf = [0u8; 64];
-    let (n, _) = peer.recv_from(&mut buf).await.expect("peer still receives");
+    let (n, _) = recv_business(&peer, &mut buf).await;
     assert_eq!(&buf[..n], b"STILL ALIVE");
 }
 

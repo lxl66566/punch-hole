@@ -57,6 +57,20 @@ pub async fn punch_pair(
     )
 }
 
+/// Reads until a business datagram arrives, skipping handshake packets
+/// still in flight around handover.
+async fn recv_business<S: punch_hole::socket::UdpIo>(
+    sock: &S,
+    buf: &mut [u8],
+) -> (usize, std::net::SocketAddr) {
+    loop {
+        let (n, from) = sock.recv_from(buf).await.expect("business recv");
+        if buf[0] != punch_hole::msg::DATA_MAGIC {
+            return (n, from);
+        }
+    }
+}
+
 /// Exchanges one business datagram each way over the winner sockets.
 pub async fn assert_business_traffic(a: &Punched<SimSocket>, b: &Punched<SimSocket>) {
     use punch_hole::UdpIo;
@@ -67,7 +81,7 @@ pub async fn assert_business_traffic(a: &Punched<SimSocket>, b: &Punched<SimSock
         .expect("ping send");
     // The responder sees the initiator's external address, which is its own
     // peer address.
-    let (n, from) = b.socket.recv_from(&mut buf).await.expect("ping recv");
+    let (n, from) = recv_business(&b.socket, &mut buf).await;
     assert_eq!(&buf[..n], b"PING");
     assert_eq!(
         from.ip(),
@@ -75,7 +89,7 @@ pub async fn assert_business_traffic(a: &Punched<SimSocket>, b: &Punched<SimSock
         "ping came from the initiator's NAT"
     );
     b.socket.send_to(b"PONG", from).await.expect("pong send");
-    let (n, from) = a.socket.recv_from(&mut buf).await.expect("pong recv");
+    let (n, from) = recv_business(&a.socket, &mut buf).await;
     assert_eq!(&buf[..n], b"PONG");
     assert_eq!(
         from.ip(),
