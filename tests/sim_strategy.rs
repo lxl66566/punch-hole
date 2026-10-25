@@ -42,6 +42,52 @@ async fn hard_sym_cone_uses_sym_probe() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn hard_sym_cone_apdf_punches_via_spray() {
+    let net = Net::seeded("hard_sym_cone_apdf");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::random(30000..30100));
+    // Port-strict filtering on the cone side: the peer's Syn pulses arrive
+    // from sources the cone never wrote to, so only the cone's own spray
+    // opens the path.
+    let b = net.host(NatSpec::cone_apdf());
+    let mut cfg = config(&stun);
+    // Model margin: the probe pins the HardSym space to the observed spread
+    // plus 2 * 64 margin, at most 100 + 128 = 228. With m = 16 peer sockets
+    // and target 0.99, c = ceil(ln(100) * 228 / 16) = 66 and the estimate
+    // 1 - exp(-16 * 66 / 228) >= 0.99. A narrower observed spread only
+    // raises it, so the 0.98 bar keeps float noise out of the assertion.
+    cfg.target_success = 0.99;
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("spray punches");
+    let pb = rb.expect("spray punches");
+    assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+    assert_eq!(pb.report.strategy, StrategyId::SymProbe);
+    // Both roles carry the estimate: the responder rebuilds it over its own
+    // view of the two NATs.
+    assert!(pa.report.success_estimate.unwrap_or(0.0) > 0.98);
+    assert_eq!(pb.report.success_estimate, pa.report.success_estimate);
+    common::assert_business_traffic(&pa, &pb).await;
+    let _ = net.mapping_count();
+}
+
+#[tokio::test(start_paused = true)]
+async fn easy_sym_cone_apdf_punches_via_prediction() {
+    let net = Net::seeded("easy_sym_cone_apdf");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::cone_apdf());
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("prediction spray punches");
+    let pb = rb.expect("prediction spray punches");
+    assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+    assert_eq!(pb.report.strategy, StrategyId::SymProbe);
+    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
+    assert_eq!(pb.report.local_class, NatClass::Cone);
+    common::assert_business_traffic(&pa, &pb).await;
+    let _ = net.mapping_count();
+}
+
+#[tokio::test(start_paused = true)]
 async fn easy_sym_pair_uses_predictions() {
     let net = Net::seeded("easy_sym_pair");
     let stun = net.stun_server();

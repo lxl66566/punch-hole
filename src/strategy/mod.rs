@@ -25,8 +25,20 @@ pub(crate) struct Selection {
     pub strategy: StrategyId,
     pub initiator_sockets: u16,
     pub responder_sockets: u16,
-    /// The birthday model's estimate, when the strategy is a burst.
+    /// The success model's estimate, when the strategy carries one.
     pub estimate: Option<f64>,
+}
+
+impl Selection {
+    /// Fills the model estimate over the local view of both NATs.
+    ///
+    /// The Offer carries no estimate, so the Responder rebuilds it with the
+    /// same function the Initiator used, which keeps both reports equal.
+    pub(crate) fn fill_estimate(&mut self, mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) {
+        if self.strategy == StrategyId::SymProbe && self.estimate.is_none() {
+            self.estimate = Some(sym_probe_estimate(mine, peer, self, cfg));
+        }
+    }
 }
 
 /// The mapping class after confidence demotion.
@@ -70,12 +82,14 @@ pub(crate) fn select(
         } else {
             (1, shooter)
         };
-        return Ok(Selection {
+        let mut sel = Selection {
             strategy: StrategyId::SymProbe,
             initiator_sockets,
             responder_sockets,
             estimate: None,
-        });
+        };
+        sel.fill_estimate(mine, peer, cfg);
+        return Ok(sel);
     }
     if let (NatClass::EasySym { .. }, NatClass::EasySym { .. }) = (mine_class, peer_class) {
         Ok(Selection {
@@ -139,6 +153,17 @@ pub(crate) fn peer_space(peer: &NatInfo) -> usize {
 const DEFAULT_SPACE: usize = 32768;
 const SPACE_MARGIN: usize = 64;
 
+/// The port span the peer's NAT drew from, widened by a margin.
+pub(crate) fn observed_range(seq: &[u16]) -> (u16, u16) {
+    const MARGIN: u16 = 32;
+    if seq.len() < 2 {
+        return (32_768, u16::MAX);
+    }
+    let min = *seq.iter().min().expect("len checked");
+    let max = *seq.iter().max().expect("len checked");
+    (min.saturating_sub(MARGIN), max.saturating_add(MARGIN))
+}
+
 /// Chance that `n` sockets sending into `c` covered ports each hit any of `m`
 /// peer ports drawn at random from `space` values.
 pub(crate) fn collision_probability(n: usize, m: usize, c: usize, space: usize) -> f64 {
@@ -160,6 +185,42 @@ pub(crate) fn size_burst(space: usize, cfg: &PunchConfig) -> (usize, usize, usiz
     let per_side = (need.sqrt().ceil() as usize).clamp(1, max_by_sockets.min(max_by_budget));
     let coverage = (cfg.packet_budget as usize / (per_side * 2)).clamp(1, 64);
     (per_side, per_side, coverage)
+}
+
+/// Share of the packet budget a spray may spend. Retransmissions keep the
+/// rest.
+const SPRAY_BUDGET_SHARE: usize = 4;
+
+/// Candidate ports the cone side sprays at a HardSym peer.
+///
+/// Solves `P = 1 - exp(-m * c / space) = target_success` for `c`. The caps
+/// keep handshake retransmissions inside the packet budget and the spray
+/// inside the conntrack bound.
+pub(crate) fn spray_count(m: usize, space: usize, cfg: &PunchConfig) -> usize {
+    let budget_cap = (cfg.packet_budget as usize / SPRAY_BUDGET_SHARE).max(1);
+    // One destination slot stays free beyond the spray itself.
+    let dest_cap = cfg.max_destinations.saturating_sub(1).max(1);
+    let need = -((1.0 - cfg.target_success).ln()) * space as f64 / m.max(1) as f64;
+    (need.ceil() as usize).clamp(1, budget_cap.min(dest_cap))
+}
+
+/// SymProbe's hit chance from the one-directional spray model.
+///
+/// The cone side covers `c` candidate ports inside the symmetric peer's port
+/// space, where the peer holds `m` live mappings, so the birthday formula at
+/// `n = 1` gives the chance.
+fn sym_probe_estimate(mine: &NatInfo, peer: &NatInfo, sel: &Selection, cfg: &PunchConfig) -> f64 {
+    // Exactly one side is symmetric, and it holds the shooter count, which is
+    // the larger of the two socket counts.
+    let sym = if is_symmetric(effective_class(mine)) {
+        mine
+    } else {
+        peer
+    };
+    let m = sel.initiator_sockets.max(sel.responder_sockets) as usize;
+    let space = peer_space(sym);
+    let c = spray_count(m, space, cfg);
+    collision_probability(1, m, c, space)
 }
 
 /// How a side learns the fresh external port of its punch socket.
@@ -190,6 +251,9 @@ pub(crate) struct StageSpec {
     /// Sweeps wait for the peer's PortUpdate, because the built-in targets
     /// name the peer's dead probe socket.
     pub needs_peer_ports: bool,
+    /// Targets one sender covers per sweep, so a lone socket can spray many
+    /// ports per tick.
+    pub per_sweep: u16,
 }
 
 impl StageSpec {
@@ -208,6 +272,7 @@ impl StageSpec {
             targets,
             reply_only: false,
             needs_peer_ports,
+            per_sweep: 1,
         }
     }
 
@@ -220,6 +285,7 @@ impl StageSpec {
             targets: Vec::new(),
             reply_only: true,
             needs_peer_ports: false,
+            per_sweep: 1,
         }
     }
 }
@@ -257,7 +323,18 @@ pub(crate) fn build_plan(
         StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
         StrategyId::SymProbe => {
             let i_am_symmetric = is_symmetric(effective_class(mine));
-            stages.extend(sym_cone::stage(i_am_symmetric, my_sockets, peer, cfg));
+            let peer_sockets = match role {
+                crate::report::Role::Initiator => sel.responder_sockets,
+                crate::report::Role::Responder => sel.initiator_sockets,
+            };
+            stages.extend(sym_cone::stage(
+                i_am_symmetric,
+                my_sockets,
+                peer_sockets,
+                peer,
+                nonce,
+                cfg,
+            ));
         },
         StrategyId::PredictiveExchange => {
             let peer_sockets = match role {
@@ -769,16 +846,27 @@ impl<S: UdpIo> Engine<S> {
                 Family::V4 => &self.syn_bufs[0],
                 Family::V6 => &self.syn_bufs[1],
             };
+            // Peer traffic observed means handshake replies and event
+            // processing need the rate budget, so a multi-target spray backs
+            // off to one packet per sweep. Single-pulse stages stay as they
+            // are.
+            let per_sweep = if self.peer_addr.is_some() {
+                1
+            } else {
+                stage.per_sweep as usize
+            };
             let mut failure = None;
-            for i in 0..stage.senders.min(group.len() as u16) {
+            'senders: for i in 0..stage.senders.min(group.len() as u16) {
                 // Rotating by the sender count per sweep tracks the
                 // peer's allocation rate, which also grows by one per
                 // sending socket.
-                let index = i as usize + self.sweep * stage.senders as usize;
-                let target = targets[index % targets.len()];
-                if let Err(e) = pool.send(stage.family, i, &group[i as usize], target).await {
-                    failure = Some(e);
-                    break;
+                let base = i as usize * per_sweep + self.sweep * stage.senders as usize * per_sweep;
+                for k in 0..per_sweep {
+                    let target = targets[(base + k) % targets.len()];
+                    if let Err(e) = pool.send(stage.family, i, &group[i as usize], target).await {
+                        failure = Some(e);
+                        break 'senders;
+                    }
                 }
             }
             if let Some(e) = failure {
@@ -854,5 +942,74 @@ mod tests {
         let space = DEFAULT_SPACE;
         let (n, m, c) = size_burst(space, &cfg);
         assert!(collision_probability(n, m, c, space) < cfg.min_success);
+    }
+
+    #[test]
+    fn short_sequences_fall_back_to_the_upper_half() {
+        assert_eq!(observed_range(&[1234]), (32_768, u16::MAX));
+        assert_eq!(observed_range(&[]), (32_768, u16::MAX));
+    }
+
+    #[test]
+    fn observed_spans_widen_by_the_margin() {
+        assert_eq!(observed_range(&[30_000, 30_050, 30_100]), (29_968, 30_132));
+        assert_eq!(observed_range(&[10, 20]), (0, 52));
+        assert_eq!(observed_range(&[65_500, 65_530]), (65_468, 65_535));
+    }
+
+    #[test]
+    fn spray_count_reaches_the_target_when_unclamped() {
+        let cfg = PunchConfig::default();
+        let (m, space) = (16, 200);
+        let c = spray_count(m, space, &cfg);
+        // The default target is 0.5 and both caps stay far away.
+        assert!(collision_probability(1, m, c, space) >= cfg.target_success - 1e-9);
+    }
+
+    #[test]
+    fn spray_count_respects_budget_and_conntrack_caps() {
+        let cfg = PunchConfig {
+            packet_budget: 40,
+            target_success: 0.999,
+            ..PunchConfig::default()
+        };
+        // 40 / 4 = 10 by budget, 5 by the conntrack bound.
+        assert_eq!(spray_count(16, 30_000, &cfg), 10);
+        let cfg = PunchConfig {
+            max_destinations: 6,
+            ..cfg
+        };
+        assert_eq!(spray_count(16, 30_000, &cfg), 5);
+    }
+
+    #[test]
+    fn sym_probe_estimate_is_role_symmetric() {
+        let sym = sample_info(NatClass::HardSym, &[31_000, 33_000, 35_000, 37_000]);
+        let cone = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        let cfg = PunchConfig::default();
+        let sel = Selection {
+            strategy: StrategyId::SymProbe,
+            initiator_sockets: 16,
+            responder_sockets: 1,
+            estimate: None,
+        };
+        // Swapping the two views swaps the roles and nothing else.
+        assert_eq!(
+            sym_probe_estimate(&sym, &cone, &sel, &cfg),
+            sym_probe_estimate(&cone, &sym, &sel, &cfg)
+        );
+    }
+
+    fn sample_info(class: NatClass, seq: &[u16]) -> NatInfo {
+        use std::net::SocketAddrV4;
+        NatInfo {
+            v4: Some(crate::nat::V4Nat {
+                class,
+                reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), seq[0]),
+                alloc_seq: seq.to_vec(),
+                filtering: crate::nat::FilterClass::Unknown,
+            }),
+            v6: None,
+        }
     }
 }

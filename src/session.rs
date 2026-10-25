@@ -122,7 +122,7 @@ impl<F: UdpFactory> PunchSession<F> {
         let t = Instant::now();
         let (nonce, sel, engine_start) = match role {
             Role::Initiator => self.negotiate_initiator(&mine, &peer, overall).await?,
-            Role::Responder => self.negotiate_responder(overall).await?,
+            Role::Responder => self.negotiate_responder(&mine, &peer, overall).await?,
         };
         let negotiate_ms = elapsed_ms(t);
 
@@ -280,18 +280,23 @@ impl<F: UdpFactory> PunchSession<F> {
     /// Waits for `Offer`, answers `Accept`, and schedules the start.
     async fn negotiate_responder(
         &mut self,
+        mine: &NatInfo,
+        peer: &NatInfo,
         deadline: Instant,
     ) -> Result<(Nonce, Selection, Instant), PunchError> {
         loop {
             tokio::select! {
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Offer(offer) => {
-                        let sel = Selection {
+                        let mut sel = Selection {
                             strategy: offer.strategy,
                             initiator_sockets: offer.local_sockets,
                             responder_sockets: offer.peer_sockets,
                             estimate: None,
                         };
+                        // The Offer carries no estimate, so the report
+                        // rebuilds it over the local view.
+                        sel.fill_estimate(mine, peer, &self.config);
                         self.sig.send(Frame::Accept).await?;
                         // The shared event is this send; count from here.
                         let start = Instant::now() + Duration::from_millis(u64::from(offer.start_delay_ms));
