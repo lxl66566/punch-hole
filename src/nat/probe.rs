@@ -65,24 +65,11 @@ pub(crate) async fn probe<F: UdpFactory>(
     let observed = round.observed();
     let public = is_public(&socket, round.dest(first_idx), &reflexive);
 
-    // A second socket to the first answered destination confirms socket
-    // independence: one shared external port for two local sockets outranks
-    // the sequence.
-    let same_port = match factory.bind(Family::V4.any_addr()).await {
-        Ok(second) => {
-            // The confirmation waits at most half the budget and never past
-            // the phase deadline.
-            let until = (Instant::now() + cfg.probe_timeout / 2).min(deadline);
-            stun_query(&second, round.dest(first_idx), until)
-                .await
-                .is_some_and(|addr| addr.port() == reflexive.port())
-        },
-        Err(_) => false,
-    };
-    let mut class = classify::classify(public, &observed);
-    if same_port && matches!(class, NatClass::EasySym { .. } | NatClass::HardSym) {
-        class = NatClass::Cone;
-    }
+    // The one-socket fan-out settles the class on its own: differing ports
+    // across destinations already rule out a cone, while a port shared by two
+    // sockets can still be coincidence inside a narrow allocation range, so
+    // no socket-independence check overrides the sequence.
+    let class = classify::classify(public, &observed);
 
     let filtering = if class == NatClass::Cone && observed.len() >= 2 {
         // Multiple destinations answered through one port: the mapping is
@@ -312,34 +299,6 @@ async fn resolve(cfg: &PunchConfig, want_v6: bool) -> Vec<SocketAddr> {
         }
     }
     out
-}
-
-/// Queries one server from one socket until an answer or `until`.
-///
-/// Two attempts split the remaining budget, so the pair ends by `until`.
-/// The second-socket confirmation runs on this helper.
-async fn stun_query<S: UdpIo>(
-    socket: &S,
-    server: SocketAddr,
-    until: Instant,
-) -> Option<SocketAddr> {
-    let txid: [u8; 12] = rand::random();
-    let request = binding_request(&txid);
-    let now = Instant::now();
-    // The first attempt waits half of what is left, the second the rest.
-    let first_until = now + until.saturating_duration_since(now) / 2;
-    let mut buf = [0u8; 128];
-    for attempt_until in [first_until, until] {
-        socket.send_to(&request, server).await.ok()?;
-        if let Ok(Ok((len, _))) =
-            tokio::time::timeout_at(attempt_until, socket.recv_from(&mut buf)).await
-        {
-            if let Some(addr) = parse_mapped(&buf[..len], &txid) {
-                return Some(addr);
-            }
-        }
-    }
-    None
 }
 
 pub(crate) fn binding_request(txid: &[u8; 12]) -> Vec<u8> {
