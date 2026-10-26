@@ -408,7 +408,7 @@ pub(crate) fn build_plan(
 ) -> ExecPlan {
     let mut stages = Vec::new();
     if direct_first(mine, peer, cfg) {
-        stages.push(direct::stage(mine, peer, cfg));
+        stages.extend(direct::stage(mine, peer, cfg));
     }
     match sel.strategy {
         StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
@@ -1137,6 +1137,30 @@ mod tests {
         assert_eq!(
             sym_probe_estimate(&sym, &cone, &sel, &cfg),
             sym_probe_estimate(&cone, &sym, &sel, &cfg)
+        );
+    }
+
+    #[test]
+    fn peer_without_v4_skips_the_direct_stage() {
+        use crate::report::Role;
+        let cfg = PunchConfig::default();
+        // A public local side against a peer that reported no v4 and no v6:
+        // both classes read Public, so Direct qualifies but has no target.
+        let mine = sample_info(NatClass::Public, &[5000, 5000]);
+        let peer = NatInfo { v4: None, v6: None };
+        assert!(direct_first(&mine, &peer, &cfg));
+        let sel = select(&mine, &peer, &cfg).expect("both public select");
+        let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert!(
+            plan.stages.iter().all(|s| s.duration != cfg.direct_window),
+            "no Direct stage without a peer address"
+        );
+        // The same peer with a reflexive address gets the Direct stage.
+        let peer = sample_info(NatClass::Public, &[6000, 6000]);
+        let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert!(
+            plan.stages.iter().any(|s| s.duration == cfg.direct_window),
+            "a public pair runs Direct"
         );
     }
 
