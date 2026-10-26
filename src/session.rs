@@ -88,6 +88,10 @@ impl<S> std::fmt::Debug for Punched<S> {
 }
 
 impl<F: UdpFactory> PunchSession<F> {
+    /// Largest start delay the Responder honors. A larger value would park
+    /// the session far past every deadline.
+    const MAX_START_DELAY_MS: u64 = 10_000;
+
     /// Drives the session as the Initiator.
     pub async fn initiator(self) -> Result<Punched<F::Socket>, PunchError> {
         self.run(Role::Initiator).await
@@ -300,10 +304,20 @@ impl<F: UdpFactory> PunchSession<F> {
             tokio::select! {
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Offer(offer) => {
+                        // The Offer crosses an untrusted wire with no
+                        // send-side caps, so both fields are bounded before
+                        // they reach the plan: socket counts are clamped,
+                        // and a start beyond the cap aborts instead of
+                        // sleeping past every deadline.
+                        if u64::from(offer.start_delay_ms) > Self::MAX_START_DELAY_MS {
+                            let _ = self.sig.send(Frame::Abort(AbortReason::Internal)).await;
+                            return Err(PunchError::PeerAborted(AbortReason::Internal));
+                        }
+                        let clamp = |sockets: u16| sockets.min(self.config.max_sockets);
                         let mut sel = Selection {
                             strategy: offer.strategy,
-                            initiator_sockets: offer.local_sockets,
-                            responder_sockets: offer.peer_sockets,
+                            initiator_sockets: clamp(offer.local_sockets),
+                            responder_sockets: clamp(offer.peer_sockets),
                             estimate: None,
                         };
                         // The Offer carries no estimate, so the report

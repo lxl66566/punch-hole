@@ -8,9 +8,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use common::config;
 use punch_hole::{
-    FilterClass, PunchConfig, Puncher,
+    AbortReason, FilterClass, PunchConfig, Puncher,
     error::{Phase, PunchError},
-    msg::{DataPacket, Frame, encode_packet},
+    msg::{DataPacket, Frame, Offer, SigFrame, decode_sig, encode_packet, encode_sig},
     sim::{Mapping, NatSpec, Net},
     socket::{UdpFactory, UdpIo},
 };
@@ -147,8 +147,7 @@ async fn negotiate_deadline_is_not_the_overall_wall() {
     // Hellos cross so Exchange completes; every later frame is dropped, so
     // both sides wait for a peer that never confirms.
     punch_hole::sim::connect_with(ha, hb, |frame| {
-        let hello =
-            punch_hole::msg::decode_sig(frame).is_ok_and(|f| matches!(f.body, Frame::Hello(_)));
+        let hello = decode_sig(frame).is_ok_and(|f| matches!(f.body, Frame::Hello(_)));
         hello.then(|| frame.to_vec())
     });
 
@@ -173,6 +172,105 @@ async fn negotiate_deadline_is_not_the_overall_wall() {
     assert!(
         t0.elapsed() < Duration::from_secs(5),
         "negotiate ends on its own deadline, not the overall wall"
+    );
+}
+
+/// Rewrites the first Offer that crosses the bridge with a per-test edit.
+///
+/// Later Offers pass through untouched, which matches a peer that keeps its
+/// inflated values in every retransmission only on the frame the responder
+/// acts on first.
+fn rewrite_first_offer(
+    a: punch_hole::signaling::HostEnd,
+    b: punch_hole::signaling::HostEnd,
+    edit: impl Fn(&mut Offer) + Send + Sync + 'static,
+) {
+    let edited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    punch_hole::sim::connect_with(a, b, move |frame| {
+        if edited.load(std::sync::atomic::Ordering::SeqCst) {
+            return Some(frame.to_vec());
+        }
+        let Ok(sig) = decode_sig(frame) else {
+            return Some(frame.to_vec());
+        };
+        let (ts, echo, body) = (sig.ts, sig.echo, sig.body);
+        let Frame::Offer(mut offer) = body else {
+            return Some(frame.to_vec());
+        };
+        edit(&mut offer);
+        edited.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(encode_sig(&SigFrame {
+            ts,
+            echo,
+            body: Frame::Offer(offer),
+        }))
+    });
+}
+
+/// A start delay beyond the responder's cap aborts the attempt instead of
+/// parking both sides far past every deadline, and no socket fan-out runs.
+#[tokio::test(start_paused = true)]
+async fn oversized_offer_start_delay_aborts() {
+    let net = Net::seeded("offer_start_delay");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_eif());
+    let b = net.host(NatSpec::cone_eif());
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    rewrite_first_offer(ha, hb, |offer| {
+        offer.start_delay_ms = u32::MAX;
+    });
+
+    let t0 = tokio::time::Instant::now();
+    let a = tokio::spawn(common::run_initiator(a, config(&stun), la));
+    let b = tokio::spawn(common::run_responder(b, config(&stun), lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+
+    for r in [ra, rb] {
+        assert!(
+            matches!(r, Err(PunchError::PeerAborted(AbortReason::Internal))),
+            "got {r:?}"
+        );
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "the abort is immediate"
+    );
+    assert!(
+        net.peak_mappings() < 256,
+        "no punch sockets opened, peak {}",
+        net.peak_mappings()
+    );
+}
+
+/// Socket counts in an Offer are clamped to the local cap, so an oversized
+/// count drives no bind fan-out and the attempt still completes.
+#[tokio::test(start_paused = true)]
+async fn oversized_offer_socket_counts_are_clamped() {
+    let net = Net::seeded("offer_socket_clamp");
+    let stun = net.stun_server();
+    // Cone initiator against a symmetric responder, so the responder holds
+    // the shooter sockets the Offer's peer_sockets field names.
+    let a = net.host(NatSpec::cone_eif());
+    let b = net.host(NatSpec::random(30000..60000));
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    rewrite_first_offer(ha, hb, |offer| {
+        offer.peer_sockets = 60_000;
+    });
+
+    let mut cfg = config(&stun);
+    cfg.assistant_sockets = 16;
+    cfg.max_sockets = 16;
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    ra.expect("initiator completes over the clamped plan");
+    rb.expect("responder completes over the clamped plan");
+    assert!(
+        net.peak_mappings() < 256,
+        "the clamp holds the bind count down, peak {}",
+        net.peak_mappings()
     );
 }
 
@@ -373,7 +471,7 @@ fn gate_port_updates(
             tokio::select! {
                 frame = b_to_a.recv() => {
                     let Some(frame) = frame else { break };
-                    let update = punch_hole::msg::decode_sig(&frame).ok().filter(|f| {
+                    let update = decode_sig(&frame).ok().filter(|f| {
                         matches!(f.body, Frame::PortUpdate { .. })
                     });
                     match update {
