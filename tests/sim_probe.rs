@@ -232,6 +232,28 @@ async fn address_dependent_nat_reads_as_cone() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn random_mappings_hold_distinct_ports() {
+    use std::collections::HashSet;
+
+    use punch_hole::socket::{UdpFactory, UdpIo};
+
+    let net = Net::seeded("random_unique_ports");
+    let host = net.host(NatSpec::random(30000..30010));
+    let sock = host.bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
+    // Ten live mappings in a ten-port range: every port serves exactly one.
+    for i in 0..10u16 {
+        let dst = std::net::SocketAddr::V4(SocketAddrV4::new([9, 9, 9, 9].into(), 1000 + i));
+        sock.send_to(b"x", dst).await.unwrap();
+    }
+    let ports: HashSet<u16> = net
+        .mappings_snapshot()
+        .into_iter()
+        .map(|(_, ext)| ext.port())
+        .collect();
+    assert_eq!(ports.len(), 10, "every mapping holds its own port");
+}
+
+#[tokio::test(start_paused = true)]
 async fn two_stun_servers_double_the_samples() {
     // One sim server owns four ports, so two servers feed the fan-out eight
     // destinations and the probe collects eight ports instead of four.

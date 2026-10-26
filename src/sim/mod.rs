@@ -151,6 +151,13 @@ impl NatShared {
         let symmetric = !matches!(self.spec.mapping, Mapping::Cone);
         let mut cone = self.cone.lock().expect("cone lock");
         let mut sym = self.sym.lock().expect("sym lock");
+        // External ports of the live mappings, which a fresh allocation
+        // avoids.
+        let used: Vec<u16> = cone
+            .values()
+            .chain(sym.values())
+            .map(|e| e.ext_port)
+            .collect();
         if symmetric {
             // Symmetric mappings key on the destination. An address
             // dependent NAT keys on the destination address alone, so the
@@ -162,7 +169,7 @@ impl NatShared {
             if let std::collections::hash_map::Entry::Vacant(e) = sym.entry(key) {
                 let entry = MappingEntry {
                     local,
-                    ext_port: self.alloc_port(rng),
+                    ext_port: self.alloc_port(rng, &used),
                     dests: HashSet::new(),
                 };
                 e.insert(entry);
@@ -176,7 +183,7 @@ impl NatShared {
             if let std::collections::hash_map::Entry::Vacant(e) = cone.entry(key) {
                 let entry = MappingEntry {
                     local,
-                    ext_port: self.alloc_port(rng),
+                    ext_port: self.alloc_port(rng, &used),
                     dests: HashSet::new(),
                 };
                 e.insert(entry);
@@ -192,7 +199,7 @@ impl NatShared {
         self.peak.fetch_max(current as u32, Ordering::Relaxed);
     }
 
-    fn alloc_port(&self, rng: &StdMutex<StdRng>) -> u16 {
+    fn alloc_port(&self, rng: &StdMutex<StdRng>, used: &[u16]) -> u16 {
         let start = self.spec.port_range.start;
         let end = self.spec.port_range.end;
         let len = u64::from(end - start);
@@ -208,7 +215,17 @@ impl NatShared {
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },
-            Mapping::Random => rng.lock().expect("rng lock").random_range(start..end),
+            Mapping::Random => {
+                let mut rng = rng.lock().expect("rng lock");
+                // A real NAT never hands two live mappings the same port,
+                // so the draw comes from the ports no live mapping holds.
+                let free: Vec<u16> = (start..end).filter(|p| !used.contains(p)).collect();
+                if free.is_empty() {
+                    // Every port is taken, so the duplicate is unavoidable.
+                    return rng.random_range(start..end);
+                }
+                free[rng.random_range(0..free.len())]
+            },
         }
     }
 
