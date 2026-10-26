@@ -2,9 +2,13 @@
 //!
 //! The library ships no signaling, so this binary carries the smallest
 //! possible rendezvous: a `relay` subcommand that pairs the first two UDP
-//! addresses that register and forwards every later datagram between them.
-//! A registration is the single byte `R`. Library frames are never one byte,
-//! so the relay never mistakes a frame for a registration.
+//! addresses that complete a registration and forwards every later datagram
+//! between them. A registration is the byte `R`, answered with `A` plus a
+//! random token; echoing the token back as `V` plus the same bytes proves
+//! the address receives its own datagrams. Library frames never start with
+//! `R`, `A`, or `V`, so the relay never mistakes a frame for control.
+//! Unpaired slots free after 60 seconds. The relay authenticates nobody and
+//! belongs on a trusted network.
 //!
 //! Three terminals, two of them on different networks for a real NAT path:
 //!
@@ -18,7 +22,12 @@
 //! side prints its NAT class, the chosen strategy, and the estimate, then
 //! exchanges one business datagram over the punched socket.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use punch_hole::{PunchConfig, Puncher};
@@ -46,27 +55,66 @@ async fn main() {
     }
 }
 
-/// Forwards datagrams between the first two addresses that register.
+/// Forwards datagrams between the first two addresses that complete a
+/// token-verified registration.
 ///
-/// A third address is ignored until a slot frees, which keeps a demo run
-/// from pairing strangers.
+/// A registration is `R`, answered with `A` plus a random token; the echo
+/// `V` plus the same bytes proves the address receives its own datagrams.
+/// An unpaired slot frees after 60 seconds, so a stray terminal cannot hold
+/// one forever. This relay authenticates nobody and must stay on a trusted
+/// network.
 async fn relay(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// How long an unpaired slot waits for its peer before it frees.
+    const SLOT_TTL: Duration = Duration::from_secs(60);
     let sock = UdpSocket::bind(bind).await?;
     println!("relay listening on {}", sock.local_addr()?);
-    let mut slots: [Option<SocketAddr>; 2] = [None, None];
+    println!("demo relay: unauthenticated, keep it on a trusted network");
+    // Verified addresses with the instant they joined; a filled pair forwards.
+    let mut slots: [Option<(SocketAddr, Instant)>; 2] = [None, None];
+    // Tokens handed out, keyed by the address that asked.
+    let mut pending: HashMap<SocketAddr, [u8; 8]> = HashMap::new();
     let mut buf = [0u8; 2048];
     loop {
-        let (n, from) = sock.recv_from(&mut buf).await?;
-        match slots.iter().position(|s| *s == Some(from)) {
+        let received = timeout(Duration::from_secs(1), sock.recv_from(&mut buf)).await;
+        let (n, from) = if let Ok(received) = received {
+            received?
+        } else {
+            for i in 0..2 {
+                // Only an unpaired slot ages out; a running pair stays.
+                if slots[1 - i].is_none()
+                    && slots[i].is_some_and(|(_, at)| at.elapsed() >= SLOT_TTL)
+                {
+                    println!("slot {i}: expired");
+                    slots[i] = None;
+                }
+            }
+            continue;
+        };
+        let member = slots
+            .iter()
+            .position(|s| s.is_some_and(|(addr, _)| addr == from));
+        match member {
             Some(i) => {
-                if let Some(peer) = slots[1 - i] {
+                if let Some((peer, _)) = &slots[1 - i] {
                     sock.send_to(&buf[..n], peer).await?;
                 }
             },
-            None if n == 1 && buf[0] == b'R' => {
-                if let Some(free) = (0..2).find(|i| slots[*i].is_none()) {
-                    slots[free] = Some(from);
-                    println!("slot {free}: {from}");
+            None if n == 1 && buf[0] == b'R' && pending.len() < 4 => {
+                let token: [u8; 8] = rand::random();
+                pending.insert(from, token);
+                let mut ack = Vec::with_capacity(9);
+                ack.push(b'A');
+                ack.extend_from_slice(&token);
+                sock.send_to(&ack, from).await?;
+            },
+            None if n == 9 && buf[0] == b'V' => {
+                // The echo proves the token reached its address.
+                if pending.get(&from).is_some_and(|t| *t == buf[1..9]) {
+                    pending.remove(&from);
+                    if let Some(free) = (0..2).find(|i| slots[*i].is_none()) {
+                        slots[free] = Some((from, Instant::now()));
+                        println!("slot {free}: {from}");
+                    }
                 }
             },
             None => {},
@@ -153,8 +201,22 @@ async fn punch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let sock = UdpSocket::bind(any).await?;
     sock.connect(a.relay).await?;
-    // Register so the relay learns this address before frames flow.
+    // Register so the relay learns this address before frames flow: it
+    // answers a random token, and echoing it back proves this address
+    // receives its own datagrams.
     sock.send(b"R").await?;
+    let mut ack = [0u8; 16];
+    let n = timeout(Duration::from_secs(5), sock.recv(&mut ack))
+        .await
+        .map_err(|_| "no registration answer within 5 s".to_owned())?
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if n != 9 || ack[0] != b'A' {
+        return Err("unexpected registration answer from the relay".into());
+    }
+    let mut verify = Vec::with_capacity(9);
+    verify.push(b'V');
+    verify.extend_from_slice(&ack[1..9]);
+    sock.send(&verify).await?;
     println!("signaling through {} from {}", a.relay, sock.local_addr()?);
 
     let (host_end, lib_end) = punch_hole::signaling::bridge(64);
