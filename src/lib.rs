@@ -8,7 +8,8 @@
 //!
 //! The layers, the session lifecycle, and the strategy matrix are specified
 //! in `ARCHITECTURE.md`; the wire formats live in `PROTOCOL.md`; the test
-//! architecture lives in `TESTING.md`.
+//! architecture lives in `TESTING.md`. A runnable two-terminal demo lives in
+//! `examples/punch-demo.rs`.
 //!
 //! # Example
 //!

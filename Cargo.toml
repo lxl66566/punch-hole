@@ -8,7 +8,7 @@ repository   = "https://github.com/lxl66566/punch-hole"
 license      = "MIT OR Apache-2.0"
 keywords     = ["udp", "hole-punching", "nat", "p2p", "stun"]
 categories   = ["network-programming"]
-include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
+include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/examples/**", "/src/**", "/tests/**"]
 
 [features]
 default = []
