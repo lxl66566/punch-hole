@@ -140,7 +140,8 @@ pub fn encode_sig(frame: &SigFrame) -> Vec<u8> {
 }
 
 /// Decodes a signaling frame. Garbage on this plane fails the session, so the
-/// error distinguishes version mismatches from broken bytes.
+/// error distinguishes version mismatches from broken bytes. Peer-supplied
+/// vectors are truncated to the wire limits on the way out.
 pub fn decode_sig(bytes: &[u8]) -> Result<SigFrame, DecodeError> {
     if bytes.len() > MAX_SIG_FRAME || bytes.is_empty() {
         return Err(DecodeError::BadFrame);
@@ -151,7 +152,14 @@ pub fn decode_sig(bytes: &[u8]) -> Result<SigFrame, DecodeError> {
             peer: bytes[0],
         });
     }
-    postcard::from_bytes(&bytes[1..]).map_err(|_| DecodeError::BadFrame)
+    let mut frame: SigFrame =
+        postcard::from_bytes(&bytes[1..]).map_err(|_| DecodeError::BadFrame)?;
+    if let Frame::Hello(info) = &mut frame.body
+        && let Some(v4) = &mut info.v4
+    {
+        v4.alloc_seq.truncate(MAX_ALLOC_SEQ);
+    }
+    Ok(frame)
 }
 
 /// Encodes a data-plane packet with its magic and version prefix.
@@ -331,5 +339,23 @@ mod tests {
                 peer: 9
             })
         );
+    }
+
+    #[test]
+    fn oversized_peer_alloc_seq_is_truncated() {
+        let mut info = sample_nat_info();
+        info.v4.as_mut().unwrap().alloc_seq = vec![40001; MAX_ALLOC_SEQ * 3];
+        let frame = SigFrame {
+            ts: 0,
+            echo: 0,
+            body: Frame::Hello(info),
+        };
+        let decoded = decode_sig(&encode_sig(&frame)).expect("frame fits the size cap");
+        let Frame::Hello(info) = decoded.body else {
+            panic!("body survives the round trip");
+        };
+        // A peer that ignored the send-side cap cannot push an unbounded
+        // sequence into the session.
+        assert_eq!(info.v4.expect("v4 survives").alloc_seq.len(), MAX_ALLOC_SEQ);
     }
 }
