@@ -23,12 +23,18 @@ pub enum NatClass {
 }
 
 /// Behavior of a NAT's inbound filtering.
+///
+/// Mapping and filtering are separate axes. One external port across
+/// destinations proves endpoint-independent mapping, while the filtering
+/// class needs a change-port or third-party echo test, which the prober
+/// does not run. The simulator sets these variants to model a NAT; probe
+/// results always carry `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterClass {
     EndpointIndependent,
     AddressDependent,
     AddressPortDependent,
-    /// The probe servers could not answer the filtering tests.
+    /// The filtering behavior was not measured.
     Unknown,
 }
 
@@ -51,6 +57,8 @@ pub struct V4Nat {
     pub pub_ips: Vec<Ipv4Addr>,
     /// External ports observed at the NAT, in send order. Capped at 64 entries.
     pub alloc_seq: Vec<u16>,
+    /// Inbound filtering evidence. A probe runs no filtering test, so its
+    /// value is always `Unknown`.
     pub filtering: FilterClass,
 }
 

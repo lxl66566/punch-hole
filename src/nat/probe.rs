@@ -17,7 +17,7 @@ use crate::{
     config::PunchConfig,
     error::{Phase, PunchError},
     msg::{MAX_ALLOC_SEQ, MAX_PUB_IPS, MAX_V6_ADDRS},
-    nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat, classify},
+    nat::{FilterClass, NatInfo, V4Nat, V6Nat, classify},
     socket::{Family, UdpFactory, UdpIo},
 };
 
@@ -71,14 +71,10 @@ pub(crate) async fn probe<F: UdpFactory>(
     // no socket-independence check overrides the sequence.
     let class = classify::classify(public, &observed);
 
-    let filtering = if class == NatClass::Cone && observed.len() >= 2 {
-        // Multiple destinations answered through one port: the mapping is
-        // endpoint independent, and precise filtering needs a third-party
-        // echo the prober does not have.
-        FilterClass::EndpointIndependent
-    } else {
-        FilterClass::Unknown
-    };
+    // One port shared across destinations proves endpoint-independent
+    // mapping. Filtering is a separate axis that only a change-port or
+    // third-party echo test measures, and the prober runs neither.
+    let filtering = FilterClass::Unknown;
 
     let v4 = V4Nat {
         class,

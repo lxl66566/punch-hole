@@ -131,17 +131,17 @@ async fn cached_nat_info_skips_probe() {
     let _ = Mapping::Cone;
 }
 
-/// Runs one easy-symmetric pair against `servers` sim STUN servers and
+/// Runs one pair of `spec` hosts against `servers` sim STUN servers and
 /// returns every `Hello` the pair exchanged, seen through a tap on the
 /// signaling bridge.
-async fn easy_pair_hellos(name: &str, servers: usize) -> Vec<NatInfo> {
+async fn pair_hellos(name: &str, spec: NatSpec, servers: usize) -> Vec<NatInfo> {
     let net = Net::seeded(name);
     let mut addrs = Vec::new();
     for _ in 0..servers {
         addrs.extend(net.stun_server().addrs);
     }
-    let a = net.host(NatSpec::sequential(1));
-    let b = net.host(NatSpec::sequential(1));
+    let a = net.host(spec.clone());
+    let b = net.host(spec);
     let mut cfg = punch_hole::PunchConfig::default();
     cfg.stun_servers = addrs;
 
@@ -174,11 +174,24 @@ fn max_seq_len(infos: &[NatInfo]) -> usize {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cone_filtering_stays_unknown() {
+    // Four destinations answered through one port, the case an
+    // endpoint-independent mapping used to be reported as. Filtering is a
+    // separate axis the probe runs no test for, so it stays Unknown.
+    let hellos = pair_hellos("cone_filtering", NatSpec::cone_eif(), 1).await;
+    for info in &hellos {
+        let v4 = info.v4.as_ref().expect("v4 evidence");
+        assert_eq!(v4.class, NatClass::Cone);
+        assert_eq!(v4.filtering, punch_hole::FilterClass::Unknown);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn two_stun_servers_double_the_samples() {
     // One sim server owns four ports, so two servers feed the fan-out eight
     // destinations and the probe collects eight ports instead of four.
-    let one = easy_pair_hellos("two_servers_one", 1).await;
-    let two = easy_pair_hellos("two_servers_two", 2).await;
+    let one = pair_hellos("two_servers_one", NatSpec::sequential(1), 1).await;
+    let two = pair_hellos("two_servers_two", NatSpec::sequential(1), 2).await;
     assert_eq!(max_seq_len(&one), 4);
     assert_eq!(max_seq_len(&two), 8);
     for info in &two {
