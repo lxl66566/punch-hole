@@ -163,9 +163,11 @@ impl<S: UdpIo> SocketPool<S> {
                     r = recv_sock.recv_from(&mut buf) => match r {
                         Ok((len, from)) => {
                             let event = RecvEvent { family, socket: idx, from, len, buf };
-                            if tx.send(event).await.is_err() {
-                                break;
-                            }
+                            // A full or closed channel drops the event: every
+                            // event is a handshake packet covered by
+                            // retransmission, and blocking here would keep
+                            // the task away from the cancel wait point.
+                            let _ = tx.try_send(event);
                         }
                         Err(_) => break,
                     }
@@ -287,5 +289,51 @@ impl<S: UdpIo> Drop for SocketPool<S> {
     /// socket references on their next poll.
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Electing the winner must return while the events channel is stuffed
+    /// and undrained: the receive task drops events instead of blocking in
+    /// send, so cancellation always reaches it.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn elect_returns_with_a_full_event_channel() {
+        use std::time::Duration;
+
+        let net = crate::sim::Net::seeded("pool_full_channel");
+        let cfg = PunchConfig::default();
+        let pool_host = net.public_host();
+        let (pool, rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+
+        // More packets than the channel capacity, pumped while nobody drains.
+        let sender_host = net.public_host();
+        let sender = sender_host
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("sender binds");
+        for _ in 0..100 {
+            sender.send_to(b"stuff", target).await.expect("send");
+        }
+        // Let the router and the receive task deliver the burst.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The receiver stays alive through the election, which rules out a
+        // closed channel as the reason the task finishes.
+        let elected = tokio::time::timeout(Duration::from_secs(1), pool.elect(Family::V4, 0)).await;
+        drop(rx);
+        elected
+            .expect("elect returns despite the stuffed channel")
+            .expect("winner socket hands over");
     }
 }

@@ -625,6 +625,10 @@ impl<S: UdpIo> Engine<S> {
         }
         self.start_refresh(&pool);
         let result = self.drive(&pool, &mut events, sig).await;
+        // The receiver must leave before the pool awaits its tasks, so a
+        // receive task never sees a live channel while the engine stops
+        // draining it.
+        drop(events);
         match result {
             Ok(outcome) => {
                 let socket = pool.elect(outcome.family, outcome.winner).await?;
