@@ -254,6 +254,28 @@ async fn random_mappings_hold_distinct_ports() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn mappings_survive_close_until_the_expiry_passes() {
+    use punch_hole::socket::{UdpFactory, UdpIo};
+
+    let net = Net::seeded("mapping_expiry");
+    net.set_mapping_expiry(std::time::Duration::from_secs(30));
+    let host = net.host(NatSpec::cone_eif());
+    let sock = host.bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
+    let dst = std::net::SocketAddr::V4(SocketAddrV4::new([9, 9, 9, 9].into(), 9));
+    sock.send_to(b"x", dst).await.unwrap();
+    assert_eq!(net.mapping_count(), 1);
+
+    // The loser socket goes away; the expiry window keeps the mapping in
+    // the table, which is what translates a late peer retransmit.
+    drop(sock);
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    assert_eq!(net.mapping_count(), 1, "mapping outlives the socket");
+
+    tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+    assert_eq!(net.mapping_count(), 0, "expiry releases the mapping");
+}
+
+#[tokio::test(start_paused = true)]
 async fn two_stun_servers_double_the_samples() {
     // One sim server owns four ports, so two servers feed the fan-out eight
     // destinations and the probe collects eight ports instead of four.

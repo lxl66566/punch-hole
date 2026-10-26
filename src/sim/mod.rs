@@ -308,6 +308,8 @@ struct Inner {
     dropped: AtomicU32,
     port_counter: AtomicU32,
     subnet_counter: AtomicU32,
+    /// Delay between a socket closing and its mappings going away.
+    mapping_expiry: StdMutex<std::time::Duration>,
 }
 
 /// One virtual network. Create with [`Net::seeded`].
@@ -339,6 +341,7 @@ impl Net {
             dropped: AtomicU32::new(0),
             port_counter: AtomicU32::new(20_000),
             subnet_counter: AtomicU32::new(1),
+            mapping_expiry: StdMutex::new(std::time::Duration::ZERO),
         });
         let router_inner = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -351,8 +354,22 @@ impl Net {
                     },
                     Msg::Unregister { addr } => {
                         registry.remove(&addr);
-                        for nat in router_inner.nats.lock().expect("nat list lock").iter() {
-                            nat.forget_local(addr);
+                        let nats: Vec<_> = router_inner.nats.lock().expect("nat list lock").clone();
+                        let expiry = *router_inner.mapping_expiry.lock().expect("expiry lock");
+                        if expiry.is_zero() {
+                            for nat in &nats {
+                                nat.forget_local(addr);
+                            }
+                        } else {
+                            // The mappings stay translated for the expiry
+                            // window, like a router honoring its timer after
+                            // the socket closed.
+                            tokio::spawn(async move {
+                                tokio::time::sleep(expiry).await;
+                                for nat in &nats {
+                                    nat.forget_local(addr);
+                                }
+                            });
                         }
                     },
                     Msg::Packet { src, dst, payload } => {
@@ -452,6 +469,15 @@ impl Net {
     /// Sets data-plane loss in permille, applied by the router.
     pub fn set_loss(&self, permille: u32) {
         self.inner.loss_permille.store(permille, Ordering::Relaxed);
+    }
+
+    /// Sets how long mappings survive the close of their socket.
+    ///
+    /// The default of zero releases mappings at close. A nonzero delay
+    /// models the tens of seconds a real NAT keeps translating after the
+    /// loser socket of a punch went away.
+    pub fn set_mapping_expiry(&self, expiry: std::time::Duration) {
+        *self.inner.mapping_expiry.lock().expect("expiry lock") = expiry;
     }
 
     /// Packets the router forwarded.
@@ -595,7 +621,8 @@ impl UdpIo for SimSocket {
 
 impl Drop for SimSocket {
     fn drop(&mut self) {
-        // Releasing the socket releases its mappings, like a NAT expiry.
+        // The router releases the mappings, at close by default or after
+        // the configured expiry.
         let _ = self.inner.tx.send(Msg::Unregister { addr: self.local });
     }
 }
