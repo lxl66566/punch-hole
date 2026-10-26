@@ -328,6 +328,12 @@ pub(crate) enum Refresh {
     Stun,
 }
 
+/// Fresh own ports to announce over signaling, one slot per family.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PortAnnounce {
+    pub v4: Option<u16>,
+    pub v6: Option<u16>,
+}
 /// One execution stage on one family.
 pub(crate) struct StageSpec {
     pub family: Family,
@@ -384,9 +390,11 @@ impl StageSpec {
 /// The full stage list one side executes.
 pub(crate) struct ExecPlan {
     pub stages: Vec<StageSpec>,
-    pub refresh: Refresh,
-    /// Family of the socket whose port gets announced.
-    pub refresh_family: Family,
+    /// How the announced V4 socket-0 port is learned.
+    pub refresh_v4: Refresh,
+    /// Whether a non-reply V6 stage runs, whose socket-0 port gets
+    /// announced as its own address.
+    pub announce_v6: bool,
     /// Resolved STUN server for a `Refresh::Stun` plan.
     pub refresh_server: Option<SocketAddr>,
     /// The peer's IPv4 address behind its NAT, from its Hello.
@@ -454,41 +462,30 @@ pub(crate) fn build_plan(
         stages.push(StageSpec::reply(Family::V4, cfg.punch_timeout));
     }
 
-    // A public address or a v6 pair knows its own socket address; a cone
-    // mapping needs a STUN query. Symmetric strategies have nothing stable
-    // to announce.
-    let refresh = if stages
+    // The announced ports are per family, so a plan that runs both a V6
+    // Direct stage and a V4 matrix stage publishes both socket-0 ports. A
+    // public address knows its own socket address, a v6 address needs no
+    // NAT cooperation, and a cone mapping needs a STUN query. Symmetric
+    // strategies have nothing stable to announce.
+    let announce_v6 = stages
         .iter()
-        .any(|s| s.family == Family::V6 && !s.reply_only)
-    {
-        Refresh::Local
-    } else {
-        match sel.strategy {
-            StrategyId::ConeExchange => {
-                if effective_class(mine) == NatClass::Public {
-                    Refresh::Local
-                } else {
-                    Refresh::Stun
-                }
-            },
-            StrategyId::SymProbe if !is_symmetric(effective_class(mine)) => Refresh::Stun,
-            _ => Refresh::None,
-        }
-    };
-    let refresh_family = if refresh == Refresh::Local
-        && stages
-            .iter()
-            .any(|s| s.family == Family::V6 && !s.reply_only)
-    {
-        Family::V6
-    } else {
-        Family::V4
+        .any(|s| s.family == Family::V6 && !s.reply_only);
+    let refresh_v4 = match sel.strategy {
+        StrategyId::ConeExchange => {
+            if effective_class(mine) == NatClass::Public {
+                Refresh::Local
+            } else {
+                Refresh::Stun
+            }
+        },
+        StrategyId::SymProbe if !is_symmetric(effective_class(mine)) => Refresh::Stun,
+        _ => Refresh::None,
     };
 
     ExecPlan {
         stages,
-        refresh,
-        refresh_family,
+        refresh_v4,
+        announce_v6,
         refresh_server,
         peer_ip: peer
             .reflexive_v4()
@@ -541,11 +538,11 @@ pub(crate) struct Engine<S: UdpIo> {
     /// Winner index to announce over signaling before the loop exits.
     announce: Option<u16>,
     /// Fresh own ports to announce, or fresh peer ports to target.
-    announce_ports: Option<Vec<u16>>,
+    announce_ports: Option<PortAnnounce>,
     /// Ports announced so far, kept for the periodic retransmission.
-    own_ports: Option<Vec<u16>>,
+    own_ports: Option<PortAnnounce>,
     next_announce: tokio::time::Instant,
-    fresh_peer_ports: Option<Vec<u16>>,
+    fresh_peer: Option<PortAnnounce>,
     stun: Option<StunPending>,
     finish_now: bool,
     peer_confirmed: bool,
@@ -576,7 +573,7 @@ impl<S: UdpIo> Engine<S> {
             announce_ports: None,
             own_ports: None,
             next_announce: tokio::time::Instant::now(),
-            fresh_peer_ports: None,
+            fresh_peer: None,
             stun: None,
             finish_now: false,
             peer_confirmed: false,
@@ -641,27 +638,31 @@ impl<S: UdpIo> Engine<S> {
         }
     }
 
-    /// Announces the fresh own port of the punch socket.
+    /// Announces the fresh own ports of the punch sockets.
     ///
     /// A local refresh knows the port immediately; a STUN refresh fires the
     /// query and waits for the answer among the pool events.
     fn start_refresh(&mut self, pool: &SocketPool<S>) {
-        let family = self.plan.refresh_family;
-        match self.plan.refresh {
+        let mut announce = PortAnnounce::default();
+        // A V6 stage runs on global addresses, so the socket's own port is
+        // the fact the peer needs.
+        if self.plan.announce_v6
+            && let Some(port) = pool.socket(Family::V6, 0).and_then(|s| s.local_addr().ok())
+        {
+            announce.v6 = Some(port.port());
+        }
+        match self.plan.refresh_v4 {
             Refresh::None => {},
             Refresh::Local => {
-                if let Some(port) = pool.socket(family, 0).and_then(|s| s.local_addr().ok()) {
-                    let ports = vec![port.port()];
-                    self.own_ports = Some(ports.clone());
-                    self.next_announce = tokio::time::Instant::now();
-                    self.announce_ports = Some(ports);
+                if let Some(port) = pool.socket(Family::V4, 0).and_then(|s| s.local_addr().ok()) {
+                    announce.v4 = Some(port.port());
                 }
             },
             Refresh::Stun => {
                 let Some(server) = self.plan.refresh_server else {
                     return
                 };
-                if pool.bound(family) == 0 {
+                if pool.bound(Family::V4) == 0 {
                     return;
                 }
                 let txid: [u8; 12] = rand::random();
@@ -675,14 +676,20 @@ impl<S: UdpIo> Engine<S> {
                 });
             },
         }
+        if announce.v4.is_some() || announce.v6.is_some() {
+            self.own_ports = Some(announce);
+            self.next_announce = tokio::time::Instant::now();
+            self.announce_ports = Some(announce);
+        }
     }
 
-    /// Marks the refresh answer as announced and arms the retransmission.
+    /// Marks the STUN answer as announced and arms the retransmission.
     fn refresh_answered(&mut self, port: u16) {
-        let ports = vec![port];
-        self.own_ports = Some(ports.clone());
+        let mut announce = self.own_ports.unwrap_or_default();
+        announce.v4 = Some(port);
+        self.own_ports = Some(announce);
         self.next_announce = tokio::time::Instant::now();
-        self.announce_ports = Some(ports);
+        self.announce_ports = Some(announce);
     }
 
     async fn drive(
@@ -694,6 +701,13 @@ impl<S: UdpIo> Engine<S> {
         let start = tokio::time::Instant::now();
         self.start = Some(start);
         self.punch_deadline = start + self.cfg.punch_timeout;
+        // A STUN refresh that never started has no server or no bound
+        // socket, so the V4 port can never be announced.
+        if self.plan.refresh_v4 == Refresh::Stun && self.stun.is_none() {
+            return Err(PunchError::Io(std::io::Error::other(
+                "stun refresh has no server or bound socket",
+            )));
+        }
         let mut ticker = tokio::time::interval_at(start + self.cfg.tick, self.cfg.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -719,7 +733,7 @@ impl<S: UdpIo> Engine<S> {
                 }
                 frame = sig.recv() => {
                     match frame {
-                        Ok(frame) => self.on_signaling(frame)?,
+                        Ok(frame) => self.on_signaling(&frame.body)?,
                         // A closed bridge during grace means the peer went
                         // home after its handshake finished; that is a
                         // success on this side.
@@ -737,7 +751,12 @@ impl<S: UdpIo> Engine<S> {
                 let _ = sig.send(Frame::Confirmed { socket }).await;
             }
             if let Some(ports) = self.announce_ports.take() {
-                let _ = sig.send(Frame::PortUpdate { ports }).await;
+                let _ = sig
+                    .send(Frame::PortUpdate {
+                        v4: ports.v4,
+                        v6: ports.v6,
+                    })
+                    .await;
             }
         }
         let end = tokio::time::Instant::now();
@@ -849,17 +868,23 @@ impl<S: UdpIo> Engine<S> {
         self.peer_addr = Some(from);
     }
 
-    fn on_signaling(&mut self, frame: crate::msg::SigFrame) -> Result<(), PunchError> {
-        match frame.body {
+    fn on_signaling(&mut self, body: &Frame) -> Result<(), PunchError> {
+        match *body {
             Frame::Abort(reason) => Err(PunchError::PeerAborted(reason)),
             Frame::Confirmed { socket } => {
                 self.peer_confirmed = true;
                 self.peer_socket = Some(socket);
                 Ok(())
             },
-            Frame::PortUpdate { ports } => {
-                if !ports.is_empty() {
-                    self.fresh_peer_ports = Some(ports);
+            Frame::PortUpdate { v4, v6 } => {
+                // Retransmissions repeat the same values, so each family
+                // slot overwrites with a stable port.
+                let fresh = self.fresh_peer.get_or_insert_with(PortAnnounce::default);
+                if v4.is_some() {
+                    fresh.v4 = v4;
+                }
+                if v6.is_some() {
+                    fresh.v6 = v6;
                 }
                 Ok(())
             },
@@ -874,30 +899,29 @@ impl<S: UdpIo> Engine<S> {
         start + elapsed
     }
 
-    /// Targets for the active stage, honoring fresh peer ports.
+    /// Targets for the active stage, honoring the fresh peer port of the
+    /// stage's own family.
     fn live_targets(&self, stage: &StageSpec) -> Option<Vec<SocketAddr>> {
         if !stage.needs_peer_ports {
             return Some(stage.targets.clone());
         }
-        let ports = self.fresh_peer_ports.as_ref()?;
+        let port = match stage.family {
+            Family::V4 => self.fresh_peer?.v4?,
+            Family::V6 => self.fresh_peer?.v6?,
+        };
         let targets = match stage.family {
-            Family::V4 => ports
-                .iter()
-                .map(|p| SocketAddr::from((self.plan.peer_ip, *p)))
-                .collect(),
+            Family::V4 => vec![SocketAddr::from((self.plan.peer_ip, port))],
             Family::V6 => self
                 .plan
                 .peer_v6
                 .iter()
-                .flat_map(|addr| {
-                    ports.iter().map(move |p| {
-                        SocketAddr::V6(SocketAddrV6::new(
-                            *addr.ip(),
-                            *p,
-                            addr.flowinfo(),
-                            addr.scope_id(),
-                        ))
-                    })
+                .map(|addr| {
+                    SocketAddr::V6(SocketAddrV6::new(
+                        *addr.ip(),
+                        port,
+                        addr.flowinfo(),
+                        addr.scope_id(),
+                    ))
                 })
                 .collect(),
         };
@@ -912,24 +936,32 @@ impl<S: UdpIo> Engine<S> {
         }
 
         // Refresh retries.
-        if let Some(pending) = &mut self.stun {
-            if now >= pending.next_retry {
-                if pending.attempts_left == 0 {
-                    self.stun = None;
-                } else {
-                    let family = self.plan.refresh_family;
-                    if let Some(sock) = pool.socket(family, pending.socket) {
-                        let _ = sock.send_to(&pending.request, pending.server).await;
-                        pending.attempts_left -= 1;
-                    }
-                    pending.next_retry = now + self.cfg.confirm_retry;
-                }
+        if let Some(pending) = &self.stun
+            && now >= pending.next_retry
+            && pending.attempts_left == 0
+        {
+            // Without the announced port the peer has nothing to aim at.
+            // With handshake traffic already flowing, the grace path
+            // decides instead of the refresh.
+            if self.first_handshake.is_none() {
+                return Err(PunchError::Io(std::io::Error::other(
+                    "stun refresh retries exhausted",
+                )));
             }
+            self.stun = None;
+        } else if let Some(pending) = &mut self.stun
+            && now >= pending.next_retry
+        {
+            if let Some(sock) = pool.socket(Family::V4, pending.socket) {
+                let _ = sock.send_to(&pending.request, pending.server).await;
+                pending.attempts_left -= 1;
+            }
+            pending.next_retry = now + self.cfg.confirm_retry;
         }
 
         // PortUpdate retransmits on the signaling retry cadence until the
         // handshake completes, because the frame carries no acknowledgement.
-        if let Some(ports) = self.own_ports.clone()
+        if let Some(ports) = self.own_ports
             && self.confirmed.is_none()
             && now >= self.next_announce
         {
@@ -1142,6 +1174,101 @@ mod tests {
             sym_probe_estimate(&sym, &cone, &sel, &cfg),
             sym_probe_estimate(&cone, &sym, &sel, &cfg)
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn v6_fallback_aims_the_v4_stage_at_the_v4_port() {
+        // A plan whose V6 Direct stage is followed by a V4 Cone stage, the
+        // shape a dual-stack cone pair produces.
+        let cfg = PunchConfig::default();
+        let peer_v6 = SocketAddrV6::new([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(), 9999, 0, 0);
+        let plan = ExecPlan {
+            stages: vec![
+                StageSpec::send(
+                    Family::V6,
+                    1,
+                    vec![SocketAddr::V6(peer_v6)],
+                    true,
+                    cfg.direct_window,
+                ),
+                StageSpec::send(
+                    Family::V4,
+                    1,
+                    vec![SocketAddr::from(([203, 0, 113, 9], 40000))],
+                    true,
+                    cfg.punch_timeout,
+                ),
+            ],
+            refresh_v4: Refresh::Stun,
+            announce_v6: true,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: vec![peer_v6],
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(plan, cfg, [0; 16]);
+        // Minimal stand-ins for the plan stages; target resolution reads
+        // only the family and the peer-port wait flag.
+        let v6_probe = StageSpec::send(Family::V6, 1, Vec::new(), true, Duration::ZERO);
+        let v4_probe = StageSpec::send(Family::V4, 1, Vec::new(), true, Duration::ZERO);
+        // One PortUpdate now carries both families' fresh ports.
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(41000),
+                v6: Some(51000),
+            })
+            .expect("update applies");
+        let v6 = engine.live_targets(&v6_probe).expect("v6 targets resolve");
+        assert_eq!(v6, vec![SocketAddr::V6(SocketAddrV6::new(
+            [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+            51000,
+            0,
+            0
+        ))]);
+        // The V4 stage aims at the peer's V4 port, not its V6 port.
+        let v4 = engine.live_targets(&v4_probe).expect("v4 targets resolve");
+        assert_eq!(v4, vec![SocketAddr::from(([203, 0, 113, 9], 41000))]);
+    }
+
+    #[test]
+    fn dual_stack_cone_plan_announces_both_families() {
+        use crate::report::Role;
+        let cfg = PunchConfig::default();
+        let mut mine = sample_info(NatClass::Cone, &[5000, 5000]);
+        let mut peer = sample_info(NatClass::Cone, &[6000, 6000]);
+        let v6 = |port: u16| {
+            Some(crate::nat::V6Nat {
+                addrs: vec![SocketAddrV6::new(
+                    [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+                    port,
+                    0,
+                    0,
+                )],
+            })
+        };
+        mine.v6 = v6(1);
+        peer.v6 = v6(1);
+        let sel = select(&mine, &peer, &cfg).expect("cone pair selects");
+        let plan = build_plan(
+            &mine,
+            &peer,
+            &sel,
+            1,
+            [0; 16],
+            Role::Initiator,
+            Some(SocketAddr::from(([203, 0, 113, 1], 3478))),
+            &cfg,
+        );
+        // The V6 stage publishes its own port; the cone V4 stage needs the
+        // STUN refresh for its mapped port.
+        assert!(plan.announce_v6);
+        assert_eq!(plan.refresh_v4, Refresh::Stun);
+        // The same pair without v6 keeps the single V4 refresh.
+        mine.v6 = None;
+        peer.v6 = None;
+        let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert!(!plan.announce_v6);
+        assert_eq!(plan.refresh_v4, Refresh::Stun);
     }
 
     #[test]

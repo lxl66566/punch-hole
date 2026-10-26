@@ -506,12 +506,13 @@ fn gate_port_updates(
                     });
                     match update {
                         Some(f) if !opened => {
-                            if let Frame::PortUpdate { ports: fresh } = f.body {
-                                if let Some(port) = fresh.first() && !reported {
-                                    // The test waits for this before injecting.
-                                    let _ = port_tx.send(*port).await;
-                                    reported = true;
-                                }
+                            if let Frame::PortUpdate { v4: fresh, .. } = f.body
+                                && let Some(port) = fresh
+                                && !reported
+                            {
+                                // The test waits for this before injecting.
+                                let _ = port_tx.send(port).await;
+                                reported = true;
                             }
                             held.push(frame);
                         },

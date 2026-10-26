@@ -71,9 +71,11 @@ pub enum Frame {
     Hello(NatInfo),
     Offer(Offer),
     Accept,
-    /// Fresh peer ports the sender observed during Punch.
+    /// Fresh socket-0 ports of the sender, one slot per family it punches
+    /// over. A family the plan leaves out carries None.
     PortUpdate {
-        ports: Vec<u16>,
+        v4: Option<u16>,
+        v6: Option<u16>,
     },
     /// The sender finished the handshake on its winning socket.
     Confirmed {
@@ -236,7 +238,8 @@ mod tests {
                 ts: 4,
                 echo: 0,
                 body: Frame::PortUpdate {
-                    ports: vec![5000, 5002],
+                    v4: Some(5000),
+                    v6: None,
                 },
             },
             SigFrame {
