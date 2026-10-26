@@ -71,24 +71,35 @@ impl SigIo {
     }
 
     /// Sends one frame, stamped with the local clock and the last peer
-    /// timestamp as its echo.
-    pub(crate) async fn send(&mut self, body: Frame) -> Result<(), PunchError> {
+    /// timestamp as its echo, and returns the encoded bytes for later raw
+    /// resends.
+    pub(crate) async fn send(&mut self, body: Frame) -> Result<Bytes, PunchError> {
         let ts = self.now_ms();
-        let bytes = encode_sig(&SigFrame {
+        let raw = Bytes::from(encode_sig(&SigFrame {
             ts,
             echo: self.last_peer_ts,
             body,
-        });
-        self.out
-            .send(Bytes::from(bytes))
-            .await
-            .map_err(|_| PunchError::SignalingClosed)?;
+        }));
         self.in_flight.push_back((ts, tokio::time::Instant::now()));
-        // Retransmissions keep the queue short by refreshing matching stamps.
+        // The queue holds the newest stamps only; older entries lose their
+        // RTT relevance long before they leave through this cap.
         while self.in_flight.len() > 8 {
             self.in_flight.pop_front();
         }
-        Ok(())
+        self.send_raw(raw.clone()).await?;
+        Ok(raw)
+    }
+
+    /// Sends previously encoded bytes unchanged, which retransmissions use to
+    /// skip a second encode.
+    ///
+    /// A raw resend carries the stamp of its original send, so an echo it
+    /// triggers closes the RTT measurement against that original entry.
+    pub(crate) async fn send_raw(&mut self, raw: Bytes) -> Result<(), PunchError> {
+        self.out
+            .send(raw)
+            .await
+            .map_err(|_| PunchError::SignalingClosed)
     }
 
     /// Receives the next frame from the host channel.

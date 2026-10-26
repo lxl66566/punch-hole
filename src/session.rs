@@ -205,13 +205,12 @@ impl<F: UdpFactory> PunchSession<F> {
         mine: &NatInfo,
         deadline: Instant,
     ) -> Result<NatInfo, PunchError> {
-        let hello = Frame::Hello(mine.clone());
-        self.sig.send(hello.clone()).await?;
+        let hello = self.sig.send(Frame::Hello(mine.clone())).await?;
         let mut retry = tokio::time::interval(self.config.signaling_retry);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = retry.tick() => self.sig.send(hello.clone()).await?,
+                _ = retry.tick() => self.sig.send_raw(hello.clone()).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Hello(peer) => return Ok(peer),
                     // An Offer while we are ourselves the Initiator means
@@ -262,12 +261,12 @@ impl<F: UdpFactory> PunchSession<F> {
             peer_sockets: sel.responder_sockets,
             start_delay_ms: delay.as_millis() as u32,
         });
-        self.sig.send(offer.clone()).await?;
+        let offer = self.sig.send(offer).await?;
         let mut retry = tokio::time::interval(self.config.signaling_retry);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = retry.tick() => self.sig.send(offer.clone()).await?,
+                _ = retry.tick() => self.sig.send_raw(offer.clone()).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Accept => {
                         // The Accept left the peer about half an RTT before
