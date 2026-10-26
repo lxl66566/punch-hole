@@ -14,7 +14,10 @@ use crate::nat::NatInfo;
 use crate::nat::{FilterClass, NatClass};
 
 /// Wire protocol version shared by both planes.
-pub const VERSION: u8 = 1;
+///
+/// Version 2 added `pub_ips` to `V4Nat`; a postcard struct with a new field
+/// rejects the bytes of version 1, which the bump makes explicit.
+pub const VERSION: u8 = 2;
 /// First byte of every data-plane packet.
 pub const DATA_MAGIC: u8 = 0x70;
 /// Signaling frames longer than this are rejected.
@@ -23,6 +26,8 @@ pub const MAX_SIG_FRAME: usize = 1024;
 pub const MAX_DATA_PACKET: usize = 64;
 /// Upper bound on `alloc_seq` entries.
 pub const MAX_ALLOC_SEQ: usize = 64;
+/// Upper bound on reported public IPv4 addresses.
+pub const MAX_PUB_IPS: usize = 4;
 /// Upper bound on collected IPv6 addresses.
 pub const MAX_V6_ADDRS: usize = 8;
 
@@ -180,6 +185,7 @@ fn sample_nat_info() -> NatInfo {
         v4: Some(crate::nat::V4Nat {
             class: NatClass::EasySym { step: 2 },
             reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 40001),
+            pub_ips: vec![[203, 0, 113, 7].into(), [198, 51, 100, 4].into()],
             alloc_seq: vec![40001, 40003, 40005, 40007],
             filtering: FilterClass::AddressPortDependent,
         }),
@@ -269,6 +275,9 @@ mod tests {
         let mut info = sample_nat_info();
         info.v4.as_mut().unwrap().alloc_seq =
             (0..MAX_ALLOC_SEQ as u16).map(|p| 30000 + p).collect();
+        info.v4.as_mut().unwrap().pub_ips = (0..MAX_PUB_IPS)
+            .map(|i| [203, 0, 113, i as u8].into())
+            .collect();
         info.v6.as_mut().unwrap().addrs = (0..MAX_V6_ADDRS)
             .map(|_| SocketAddrV6::new([1; 8].into(), 0, 0, 0))
             .collect();
