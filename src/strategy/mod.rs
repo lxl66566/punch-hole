@@ -795,10 +795,34 @@ impl<S: UdpIo> Engine<S> {
             && (self.finish_now || self.peer_confirmed || self.grace_end.is_some_and(|g| now >= g))
     }
 
-    fn observe_peer(&mut self, peer_socket: u16, from: SocketAddr, now: tokio::time::Instant) {
+    /// Records the peer's data-plane address from a Syn or SynAck.
+    ///
+    /// After a winner is elected, only its own handshake may move the
+    /// delivered address: the peer's other sockets keep pulsing during
+    /// grace, and their packets must not poison the winner's address.
+    fn observe_peer(
+        &mut self,
+        peer_socket: u16,
+        from: SocketAddr,
+        now: tokio::time::Instant,
+        family: Family,
+        socket: u16,
+    ) {
+        self.first_handshake.get_or_insert(now);
+        let tied_to_winner = match self.confirmed {
+            Some((f, i)) => f == family && i == socket && self.peer_socket == Some(peer_socket),
+            None => true,
+        };
+        if tied_to_winner {
+            self.peer_addr = Some(from);
+            self.peer_socket = Some(peer_socket);
+        }
+    }
+
+    /// Records the peer's address from an Ack on an open or winning path.
+    fn observe_addr(&mut self, from: SocketAddr, now: tokio::time::Instant) {
         self.first_handshake.get_or_insert(now);
         self.peer_addr = Some(from);
-        self.peer_socket = Some(peer_socket);
     }
 
     async fn on_data(
@@ -828,7 +852,7 @@ impl<S: UdpIo> Engine<S> {
         match pkt {
             DataPacket::Keepalive { .. } => {},
             DataPacket::Syn { socket, .. } => {
-                self.observe_peer(socket, ev.from, now);
+                self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
                 self.candidate.get_or_insert((ev.family, ev.socket));
                 let buf = encode_packet(&DataPacket::SynAck {
                     nonce,
@@ -838,7 +862,7 @@ impl<S: UdpIo> Engine<S> {
                 self.next_reply = now + self.cfg.confirm_retry;
             },
             DataPacket::SynAck { socket, .. } => {
-                self.observe_peer(socket, ev.from, now);
+                self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
                 let resend_ack = if let Some((family, idx)) = self.confirmed {
                     // The peer missed our Ack; answer again while grace runs.
                     family == ev.family && idx == ev.socket
@@ -854,28 +878,29 @@ impl<S: UdpIo> Engine<S> {
                     self.next_reply = now + self.cfg.confirm_retry;
                 }
             },
-            DataPacket::Ack { .. } => {
-                if self.confirmed.is_none() {
-                    if let Some((family, idx)) = self.candidate {
-                        self.observe_peer_from(ev.from, now);
-                        self.confirmed = Some((family, idx));
-                        self.announce = Some(idx);
-                        // The final Ack proves both directions, so no grace
-                        // wait applies on this path.
-                        self.finish_now = true;
-                    }
-                } else {
-                    self.observe_peer_from(ev.from, now);
-                    self.finish_now = true;
-                }
-            },
+            DataPacket::Ack { .. } => self.on_ack(ev.from, ev.family, ev.socket, now),
         }
         Ok(())
     }
 
-    fn observe_peer_from(&mut self, from: SocketAddr, now: tokio::time::Instant) {
-        self.first_handshake.get_or_insert(now);
-        self.peer_addr = Some(from);
+    /// Completes the handshake from the peer's Ack.
+    ///
+    /// An Ack that lands on a socket other than the winner answers a
+    /// handshake this side never elected, so it moves nothing.
+    fn on_ack(&mut self, from: SocketAddr, family: Family, socket: u16, now: tokio::time::Instant) {
+        if self.confirmed.is_none() {
+            if let Some((f, i)) = self.candidate {
+                self.observe_addr(from, now);
+                self.confirmed = Some((f, i));
+                self.announce = Some(i);
+                // The final Ack proves both directions, so no grace wait
+                // applies on this path.
+                self.finish_now = true;
+            }
+        } else if self.confirmed == Some((family, socket)) {
+            self.observe_addr(from, now);
+            self.finish_now = true;
+        }
     }
 
     fn on_signaling(&mut self, body: &Frame) -> Result<(), PunchError> {
@@ -1280,6 +1305,56 @@ mod tests {
         let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
         assert!(!plan.announce_v6);
         assert_eq!(plan.refresh_v4, Refresh::Stun);
+    }
+
+    #[test]
+    fn stray_packets_after_confirm_keep_the_winning_address() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let addr =
+            |port: u16| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), port));
+        let cfg = PunchConfig::default();
+        // A multi-socket plan, the shape a SymProbe shooter runs.
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                4,
+                vec![addr(40000)],
+                true,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+        let now = tokio::time::Instant::now();
+
+        // Handshake traffic from two peer sockets on two local sockets.
+        engine.observe_peer(5, addr(50_001), now, Family::V4, 1);
+        engine.candidate = Some((Family::V4, 1));
+        // The first complete handshake elects local socket 0 with peer
+        // socket 2, mirroring the SynAck confirm path.
+        engine.observe_peer(2, addr(50_002), now, Family::V4, 0);
+        engine.confirmed = Some((Family::V4, 0));
+
+        // Late Syn pulses from the peer's other sockets during grace.
+        engine.observe_peer(9, addr(50_009), now, Family::V4, 3);
+        engine.observe_peer(9, addr(50_009), now, Family::V4, 0);
+        assert_eq!(engine.peer_addr, Some(addr(50_002)));
+        assert_eq!(engine.peer_socket, Some(2));
+
+        // A stray Ack for another local socket finishes nothing.
+        engine.on_ack(addr(50_009), Family::V4, 3, now);
+        assert!(!engine.finish_now);
+        assert_eq!(engine.peer_addr, Some(addr(50_002)));
+
+        // The winner's own handshake still refreshes and finishes.
+        engine.on_ack(addr(50_002), Family::V4, 0, now);
+        assert!(engine.finish_now);
+        assert_eq!(engine.peer_addr, Some(addr(50_002)));
     }
 
     #[test]
