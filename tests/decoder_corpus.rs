@@ -22,7 +22,8 @@ fn hello_frame() -> SigFrame {
         v4: Some(V4Nat {
             class: NatClass::EasySym { step: 2 },
             reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 40001),
-            // Both vectors sit at their caps, so the encoding is maximal.
+            // Every vector sits at its cap, so the encoding is maximal.
+            pub_ips: (0..4u8).map(|i| [203, 0, 113, i].into()).collect(),
             alloc_seq: (0..64u16).map(|p| 30000 + p).collect(),
             filtering: FilterClass::AddressPortDependent,
         }),

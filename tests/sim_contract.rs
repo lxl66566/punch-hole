@@ -88,9 +88,10 @@ async fn malformed_frame_fails_one_side() {
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tap_seen = Arc::clone(&seen);
     punch_hole::sim::connect_with(ha, hb, move |frame| {
-        // Replace the second frame that crosses in either direction.
+        // Replace the second frame that crosses in either direction. The
+        // version byte stays valid so the garbage reaches the body decoder.
         if tap_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            Some(vec![1, 0xff, 0xfe])
+            Some(vec![punch_hole::msg::VERSION, 0xff, 0xfe])
         } else {
             Some(frame.to_vec())
         }

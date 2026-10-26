@@ -1146,6 +1146,7 @@ mod tests {
             v4: Some(crate::nat::V4Nat {
                 class,
                 reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), seq[0]),
+                pub_ips: Vec::new(),
                 alloc_seq: seq.to_vec(),
                 filtering: crate::nat::FilterClass::Unknown,
             }),
