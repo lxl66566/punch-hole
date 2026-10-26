@@ -187,6 +187,51 @@ async fn cone_filtering_stays_unknown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn address_dependent_mapping_keys_on_ip() {
+    use punch_hole::socket::{UdpFactory, UdpIo};
+
+    let net = Net::seeded("adm_mapping");
+    let host = net.host(NatSpec::address_sequential(2));
+    let sock = host.bind("0.0.0.0:0".parse().unwrap()).await.unwrap();
+    let dst = |ip: [u8; 4], port: u16| std::net::SocketAddr::V4(SocketAddrV4::new(ip.into(), port));
+
+    // Two ports of one address share one mapping.
+    sock.send_to(b"x", dst([9, 9, 9, 9], 100)).await.unwrap();
+    sock.send_to(b"x", dst([9, 9, 9, 9], 200)).await.unwrap();
+    assert_eq!(net.mapping_count(), 1);
+
+    // A second address opens its own mapping, two steps ahead whatever
+    // the snapshot order is.
+    sock.send_to(b"x", dst([8, 8, 8, 8], 100)).await.unwrap();
+    let ext: Vec<u16> = net
+        .mappings_snapshot()
+        .into_iter()
+        .map(|(_, ext)| ext.port())
+        .collect();
+    assert_eq!(ext.len(), 2);
+    assert_eq!((i32::from(ext[1]) - i32::from(ext[0])).abs(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn address_dependent_nat_reads_as_cone() {
+    // The sim server puts all four ports on one address, so an ADM NAT
+    // answers the whole fan-out through one mapping and the probe reports
+    // the cone it cannot distinguish from address dependence.
+    let spec = NatSpec {
+        mapping: Mapping::AddressSequential { step: 2 },
+        filtering: punch_hole::FilterClass::EndpointIndependent,
+        port_range: 30000..40000,
+    };
+    let hellos = pair_hellos("adm_reads_cone", spec, 1).await;
+    for info in &hellos {
+        let v4 = info.v4.as_ref().expect("v4 evidence");
+        assert_eq!(v4.class, NatClass::Cone);
+        // One mapping means one port across all four samples.
+        assert!(v4.alloc_seq.windows(2).all(|w| w[0] == w[1]));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn two_stun_servers_double_the_samples() {
     // One sim server owns four ports, so two servers feed the fan-out eight
     // destinations and the probe collects eight ports instead of four.

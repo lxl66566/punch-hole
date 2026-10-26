@@ -33,8 +33,13 @@ use crate::{
 pub enum Mapping {
     /// One external port per internal socket.
     Cone,
-    /// A new port per destination, walking a constant step.
+    /// A new port per destination address and port, walking a constant step.
     Sequential { step: i16 },
+    /// A new port per destination address, walking a constant step.
+    ///
+    /// Common CGNAT shape: the ports of one server share a mapping, and a
+    /// second server address opens its own.
+    AddressSequential { step: i16 },
     /// A new port per destination, drawn at random.
     Random,
 }
@@ -77,6 +82,19 @@ impl NatSpec {
     pub fn sequential(step: i16) -> Self {
         Self {
             mapping: Mapping::Sequential { step },
+            filtering: FilterClass::AddressDependent,
+            port_range: 30000..40000,
+        }
+    }
+
+    /// An address-dependent sequential symmetric NAT with the given step.
+    ///
+    /// One mapping covers every port of one destination address, so a
+    /// fan-out over several ports of one server reads as a cone.
+    #[must_use]
+    pub fn address_sequential(step: i16) -> Self {
+        Self {
+            mapping: Mapping::AddressSequential { step },
             filtering: FilterClass::AddressDependent,
             port_range: 30000..40000,
         }
@@ -134,8 +152,13 @@ impl NatShared {
         let mut cone = self.cone.lock().expect("cone lock");
         let mut sym = self.sym.lock().expect("sym lock");
         if symmetric {
-            // Symmetric mappings key on the destination too.
-            let key = (local.port(), dst);
+            // Symmetric mappings key on the destination. An address
+            // dependent NAT keys on the destination address alone, so the
+            // ports of one server share one mapping.
+            let key = match self.spec.mapping {
+                Mapping::AddressSequential { .. } => (local.port(), SocketAddr::new(dst.ip(), 0)),
+                _ => (local.port(), dst),
+            };
             if let std::collections::hash_map::Entry::Vacant(e) = sym.entry(key) {
                 let entry = MappingEntry {
                     local,
@@ -174,11 +197,13 @@ impl NatShared {
         let end = self.spec.port_range.end;
         let len = u64::from(end - start);
         match self.spec.mapping {
-            Mapping::Cone | Mapping::Sequential { step: 1 } => {
+            Mapping::Cone
+            | Mapping::Sequential { step: 1 }
+            | Mapping::AddressSequential { step: 1 } => {
                 let n = u64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
                 start + (n % len) as u16
             },
-            Mapping::Sequential { step } => {
+            Mapping::Sequential { step } | Mapping::AddressSequential { step } => {
                 let n = i64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
