@@ -105,21 +105,29 @@ impl SigIo {
     /// Receives the next frame from the host channel.
     ///
     /// A frame that echoes one of our in-flight timestamps closes an RTT
-    /// measurement on the local clock.
+    /// measurement on the local clock. Undecodable frames are skipped, so a
+    /// stray datagram on a shared host channel costs one frame and the
+    /// session keeps receiving; a version mismatch stays fatal because no
+    /// productive exchange can follow it.
     pub(crate) async fn recv(&mut self) -> Result<SigFrame, PunchError> {
-        let bytes = self.inn.recv().await.ok_or(PunchError::SignalingClosed)?;
-        let frame = decode_sig(&bytes).map_err(|e| match e {
-            DecodeError::Version { local, peer } => PunchError::VersionMismatch { local, peer },
-            DecodeError::BadFrame => PunchError::BadFrame,
-        })?;
-        if frame.echo != 0 {
-            if let Some(pos) = self.in_flight.iter().rposition(|(ts, _)| *ts == frame.echo) {
-                let (_, sent) = self.in_flight.remove(pos).expect("position just found");
-                self.rtt = Some(sent.elapsed());
+        loop {
+            let bytes = self.inn.recv().await.ok_or(PunchError::SignalingClosed)?;
+            let frame = match decode_sig(&bytes) {
+                Ok(frame) => frame,
+                Err(DecodeError::BadFrame) => continue,
+                Err(DecodeError::Version { local, peer }) => {
+                    return Err(PunchError::VersionMismatch { local, peer })
+                },
+            };
+            if frame.echo != 0 {
+                if let Some(pos) = self.in_flight.iter().rposition(|(ts, _)| *ts == frame.echo) {
+                    let (_, sent) = self.in_flight.remove(pos).expect("position just found");
+                    self.rtt = Some(sent.elapsed());
+                }
             }
+            self.last_peer_ts = frame.ts;
+            return Ok(frame);
         }
-        self.last_peer_ts = frame.ts;
-        Ok(frame)
     }
 
     /// The latest signaling round-trip estimate, or a small default before

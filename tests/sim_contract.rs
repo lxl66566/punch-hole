@@ -77,8 +77,10 @@ async fn version_mismatch_fails_both_sides() {
     );
 }
 
+/// One undecodable frame costs one frame and nothing else: the receiver
+/// skips it and the session still completes.
 #[tokio::test(start_paused = true)]
-async fn malformed_frame_fails_one_side() {
+async fn garbage_frame_is_ignored() {
     let net = Net::seeded("malformed_frame");
     let stun = net.stun_server();
     let a = net.host(NatSpec::cone_eif());
@@ -100,12 +102,9 @@ async fn malformed_frame_fails_one_side() {
     let a = tokio::spawn(common::run_initiator(a, config(&stun), la));
     let b = tokio::spawn(common::run_responder(b, config(&stun), lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-
-    // Exactly one side received the garbage; the other lost its peer.
-    let a_bad = matches!(ra, Err(PunchError::BadFrame));
-    let b_bad = matches!(rb, Err(PunchError::BadFrame));
-    assert!(a_bad ^ b_bad, "got {ra:?} / {rb:?}");
-    assert!(ra.is_err() && rb.is_err());
+    let pa = ra.expect("garbage frame does not end the initiator");
+    let pb = rb.expect("garbage frame does not end the responder");
+    common::assert_business_traffic(&pa, &pb).await;
 }
 
 #[tokio::test(start_paused = true)]

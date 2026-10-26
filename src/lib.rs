@@ -11,6 +11,21 @@
 //! architecture lives in `TESTING.md`. A runnable two-terminal demo lives in
 //! `examples/punch-demo.rs`.
 //!
+//! # Trust model
+//!
+//! The signaling plane carries no authentication of its own. The host must
+//! authenticate the peer and reject replayed bytes on its own transport
+//! before it pushes anything into `HostEnd::from_peer`; frames from the
+//! authenticated peer are then trusted as peer input.
+//!
+//! The data plane tags every packet with the 128-bit attempt nonce, so a
+//! third party cannot inject packets into a live attempt.
+//!
+//! Undecodable signaling frames are dropped and reception continues, which
+//! keeps a stray datagram on a shared host channel from ending the session.
+//! A signaling version mismatch aborts the session, because no productive
+//! exchange can follow it.
+//!
 //! # Example
 //!
 //! One side of a session, with the host's own transport already in place:
