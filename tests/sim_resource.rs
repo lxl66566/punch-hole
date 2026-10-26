@@ -33,9 +33,14 @@ async fn conntrack_bound_stops_the_burst() {
     let net = Net::seeded("conntrack_bound");
     let stun = net.stun_server();
     let mut cfg = config(&stun);
-    cfg.max_destinations = 8;
-    let a = net.host(NatSpec::random(30000..30100));
-    let b = net.host(NatSpec::random(30000..30100));
+    // PredictiveExchange sizes its window from the socket counts alone, so
+    // the mapping cap can bite: 8 bound sockets reach a footprint of 16 on
+    // their second distinct destination, past a cap of 8. The birthday burst
+    // and the SymProbe spray derive their coverage from the cap itself, so
+    // they stay inside it by construction.
+    cfg.max_mappings = 8;
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::sequential(2));
 
     let (ra, rb) = common::punch_pair(a, cfg, b, config(&stun)).await;
     assert!(

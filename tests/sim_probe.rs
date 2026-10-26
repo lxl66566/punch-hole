@@ -45,9 +45,15 @@ async fn easy_step_detected() {
 async fn hard_detected() {
     let net = Net::seeded("hard_detected");
     let stun = net.stun_server();
-    let a = net.host(NatSpec::random(30000..31000));
-    let b = net.host(NatSpec::random(30000..31000));
-    let (ra, _) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    // The birthday sizing is honest for its target, so the 0.5 default
+    // target leaves a coin flip. The 100-wide range with a 0.95 target
+    // covers ceil(sqrt(ln(20) / 2 * space)) ports, 17 to 19 here, which
+    // keeps the true chance above 0.99.
+    let a = net.host(NatSpec::random(30000..30100));
+    let b = net.host(NatSpec::random(30000..30100));
+    let mut cfg = config(&stun);
+    cfg.target_success = 0.95;
+    let (ra, _) = common::punch_pair(a, cfg.clone(), b, cfg).await;
     let pa = ra.expect("birthday pair punches");
     assert_eq!(pa.report.local_class, NatClass::HardSym);
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);

@@ -1,4 +1,6 @@
 #![allow(clippy::field_reassign_with_default)]
+// Success rates divide run counts in floating point.
+#![allow(clippy::cast_precision_loss)]
 
 //! One suite per punch strategy.
 
@@ -109,13 +111,60 @@ async fn birthday_burst_narrow_range() {
     let stun = net.stun_server();
     let a = net.host(NatSpec::random(30000..30100));
     let b = net.host(NatSpec::random(30000..30100));
-    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let mut cfg = config(&stun);
+    // The sizing is honest for its target, so the 0.5 default target leaves
+    // a coin flip. At 0.95 the sizing covers ceil(sqrt(ln(20) / 2 * space))
+    // ports, 18 on a typical 200-wide space estimate, which keeps the true
+    // chance above 0.99 on the 100-wide range.
+    cfg.target_success = 0.95;
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
     let pa = ra.expect("birthday punches");
     let pb = rb.expect("birthday punches");
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);
-    assert!(pa.report.success_estimate.unwrap_or(0.0) > 0.5);
+    // The sizing solves 2 * n * c^2 / space = ln(1 / (1 - target)), so the
+    // estimate lands at or slightly above the target.
+    assert!(pa.report.success_estimate.unwrap_or(0.0) >= 0.95 - 1e-9);
+    // The burst space is symmetric in the two views, so both roles report
+    // the same estimate.
+    assert_eq!(pb.report.success_estimate, pa.report.success_estimate);
     common::assert_business_traffic(&pa, &pb).await;
     let _ = net.mapping_count();
+}
+
+/// Birthday bursts across independent seeds: the measured success rate must
+/// track the model's estimate.
+#[tokio::test(start_paused = true)]
+async fn birthday_measured_rate_tracks_the_estimate() {
+    const RUNS: usize = 64;
+    let mut wins = 0usize;
+    for i in 0..RUNS as u64 {
+        let net = Net::from_seed_u64(0x5eed_0000 + i);
+        let stun = net.stun_server();
+        // A 400-wide range keeps every run on BirthdayBurst: the sizing
+        // solves for coverage around 13 ports, far under every cap, so each
+        // run's estimate sits at the 0.5 default target up to ceil rounding.
+        let a = net.host(NatSpec::random(30000..30400));
+        let b = net.host(NatSpec::random(30000..30400));
+        let (ra, _rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+        if let Ok(pa) = &ra {
+            assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);
+            assert!(pa.report.success_estimate.unwrap_or(0.0) >= 0.5 - 1e-9);
+        }
+        wins += usize::from(ra.is_ok());
+    }
+    let rate = wins as f64 / RUNS as f64;
+    // Bound rationale: every estimate sits just above 0.5, so a true model
+    // measures a rate near 0.5. The per-run outcomes vary with the attempt
+    // nonce even at a fixed seed, which makes the count binomial: 64 runs
+    // give a standard deviation near 0.06, and 0.25 covers more than four
+    // standard deviations. The margin also absorbs the span estimation
+    // slack: the model sizes against the observed span plus a 128 margin
+    // while the real range is 400 wide, a bias of a few hundredths in
+    // probability at this width.
+    assert!(
+        (rate - 0.5).abs() <= 0.25,
+        "measured rate {rate} drifted from the estimated 0.5"
+    );
 }
 
 #[tokio::test(start_paused = true)]

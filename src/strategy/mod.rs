@@ -33,11 +33,20 @@ impl Selection {
     /// Fills the model estimate over the local view of both NATs.
     ///
     /// The Offer carries no estimate, so the Responder rebuilds it with the
-    /// same function the Initiator used, which keeps both reports equal.
+    /// same functions the Initiator used, which keeps both reports equal.
     pub(crate) fn fill_estimate(&mut self, mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) {
-        if self.strategy == StrategyId::SymProbe && self.estimate.is_none() {
-            self.estimate = Some(sym_probe_estimate(mine, peer, self, cfg));
+        if self.estimate.is_some() {
+            return;
         }
+        self.estimate = match self.strategy {
+            StrategyId::SymProbe => Some(sym_probe_estimate(mine, peer, self, cfg)),
+            StrategyId::BirthdayBurst => {
+                let space = burst_space(mine, peer);
+                let (n, _m, c) = size_burst(space, cfg);
+                Some(burst_hit_chance(n, c, n, c, space))
+            },
+            _ => None,
+        };
     }
 }
 
@@ -99,9 +108,12 @@ pub(crate) fn select(
             estimate: None,
         })
     } else {
-        let space = peer_space(peer);
+        // The probe cannot read a symmetric peer's filtering class, so the
+        // estimate assumes address-dependent filtering, the common CGNAT
+        // shape; `burst_hit_chance` states what that costs.
+        let space = burst_space(mine, peer);
         let (n, m, c) = size_burst(space, cfg);
-        let estimate = collision_probability(n, m, c, space);
+        let estimate = burst_hit_chance(n, c, m, c, space);
         if estimate < cfg.min_success {
             return Err(PunchError::Unpunchable {
                 local: mine_class,
@@ -164,32 +176,92 @@ pub(crate) fn observed_range(seq: &[u16]) -> (u16, u16) {
     (min.saturating_sub(MARGIN), max.saturating_add(MARGIN))
 }
 
-/// Chance that `n` sockets sending into `c` covered ports each hit any of `m`
-/// peer ports drawn at random from `space` values.
-pub(crate) fn collision_probability(n: usize, m: usize, c: usize, space: usize) -> f64 {
+/// The port span a birthday burst is sized against.
+///
+/// Each direction's hit chance scales with the span of the side being
+/// sprayed, so the wider of the two observed spans governs the pair. Both
+/// roles compute the same value from their pair of views, which keeps the
+/// sizing and the estimate equal on both sides.
+pub(crate) fn burst_space(mine: &NatInfo, peer: &NatInfo) -> usize {
+    peer_space(mine).max(peer_space(peer))
+}
+
+/// Chance that a one-directional spray hits: `c` covered distinct ports
+/// against `m` live mappings drawn at random from `space` values.
+pub(crate) fn spray_hit_chance(m: usize, c: usize, space: usize) -> f64 {
     if space == 0 {
         return 1.0;
     }
-    let lambda = (n as f64) * (m as f64) * (c as f64) / space as f64;
+    let lambda = m as f64 * c as f64 / space as f64;
     1.0 - (-lambda).exp()
 }
 
+/// Chance that two synchronized bursts pair up under address-dependent
+/// filtering, the regime selection assumes for a symmetric pair.
+///
+/// Side X holds `n_X * c_X` live mappings, one per sender and covered port,
+/// and covers `c_X` distinct ports of the peer's space. One directional hit
+/// completes the handshake, so the two expected-hit terms add up to
+/// `(n_A * c_A * c_B + n_B * c_B * c_A) / space`. A probe cannot read a
+/// symmetric peer's filtering class, so the estimate states this regime
+/// instead of measuring it. Port-strict filtering needs both directions to
+/// pair exactly, which lands near `n_A * c_A * n_B * c_B / space^2` and
+/// stays negligible at any bounded budget.
+pub(crate) fn burst_hit_chance(
+    n_a: usize,
+    c_a: usize,
+    n_b: usize,
+    c_b: usize,
+    space: usize,
+) -> f64 {
+    if space == 0 {
+        return 1.0;
+    }
+    let hits_a = (n_a * c_a) as f64 * c_b as f64;
+    let hits_b = (n_b * c_b) as f64 * c_a as f64;
+    1.0 - (-(hits_a + hits_b) / space as f64).exp()
+}
+
+/// Headroom between the sized burst and the conntrack bound: the peer's
+/// replies arrive from a fresh mapping port outside the target list.
+const BURST_MAPPING_HEADROOM: usize = 2;
+
 /// Sockets and coverage per side for a target success rate.
 ///
-/// The budget bounds the sockets first, because sockets that cannot pulse
-/// lower the real chance below the model.
+/// Under the address-dependent model the expected hits are `2 * n * c^2 /
+/// space`, so coverage is the leverage: a mapping spent on a wider covered
+/// set buys more hit chance than the same mapping spent on another socket.
+/// The derivation therefore opens one socket per side and raises the socket
+/// count only once coverage sits at a cap. The caps: the peer's drawable port
+/// window, the conntrack bound minus reply headroom, a packet budget share
+/// because every mapping costs one packet per rotation, and `max_sockets`.
 pub(crate) fn size_burst(space: usize, cfg: &PunchConfig) -> (usize, usize, usize) {
-    let need = -((1.0 - cfg.target_success).ln()) * space as f64;
-    let max_by_sockets = cfg.max_sockets as usize;
-    let max_by_budget = (cfg.packet_budget as usize / 2).max(2);
-    let per_side = (need.sqrt().ceil() as usize).clamp(1, max_by_sockets.min(max_by_budget));
-    let coverage = (cfg.packet_budget as usize / (per_side * 2)).clamp(1, 64);
-    (per_side, per_side, coverage)
+    // Reaching the target needs n * c^2 >= ln(1 / (1 - target)) * space / 2
+    // expected-hit products.
+    let required = -(1.0 - cfg.target_success).ln() * space as f64 / 2.0;
+    // The drawable window is the modeled space without its two margins.
+    let span_cap = space.saturating_sub(2 * SPACE_MARGIN).max(1);
+    let mapping_cap = cfg
+        .max_mappings
+        .saturating_sub(BURST_MAPPING_HEADROOM)
+        .min(cfg.packet_budget as usize / SPRAY_BUDGET_SHARE)
+        .max(1);
+    let coverage = (required.sqrt().ceil() as usize).clamp(1, span_cap.min(mapping_cap));
+    // Sockets make up the remaining hit rate once coverage is capped.
+    let max_sockets = (cfg.max_sockets as usize)
+        .min(mapping_cap / coverage)
+        .max(1);
+    let sockets =
+        ((required / (coverage as f64 * coverage as f64)).ceil() as usize).clamp(1, max_sockets);
+    (sockets, sockets, coverage)
 }
 
 /// Share of the packet budget a spray may spend. Retransmissions keep the
 /// rest.
 const SPRAY_BUDGET_SHARE: usize = 4;
+
+/// Upper bound on one sender's per-sweep burst.
+const MAX_BURST: u16 = 32;
 
 /// Candidate ports the cone side sprays at a HardSym peer.
 ///
@@ -198,17 +270,36 @@ const SPRAY_BUDGET_SHARE: usize = 4;
 /// inside the conntrack bound.
 pub(crate) fn spray_count(m: usize, space: usize, cfg: &PunchConfig) -> usize {
     let budget_cap = (cfg.packet_budget as usize / SPRAY_BUDGET_SHARE).max(1);
-    // One destination slot stays free beyond the spray itself.
-    let dest_cap = cfg.max_destinations.saturating_sub(1).max(1);
+    // The spray socket is the pool's only socket, so every candidate is one
+    // mapping. One slot stays free for the peer's fresh reply port.
+    let dest_cap = cfg.max_mappings.saturating_sub(1).max(1);
     let need = -((1.0 - cfg.target_success).ln()) * space as f64 / m.max(1) as f64;
     (need.ceil() as usize).clamp(1, budget_cap.min(dest_cap))
+}
+
+/// Packets one sender emits per sweep, so a lone socket runs at the rate cap.
+pub(crate) fn burst_len(cfg: &PunchConfig) -> u16 {
+    let per_tick = f64::from(cfg.packets_per_sec) * cfg.tick.as_secs_f64();
+    per_tick.ceil().clamp(1.0, f64::from(MAX_BURST)) as u16
+}
+
+/// Distinct random ports over a span, drawn from a shuffled window.
+///
+/// Distinct draws carry a model's coverage exactly, so the span is shuffled
+/// and truncated instead of sampled with replacement.
+pub(crate) fn distinct_ports(seed: u64, lo: u16, hi: u16, count: usize) -> Vec<u16> {
+    use rand::{prelude::*, rngs::StdRng};
+    let mut ports: Vec<u16> = (lo..=hi).collect();
+    ports.shuffle(&mut StdRng::seed_from_u64(seed));
+    ports.truncate(count);
+    ports
 }
 
 /// SymProbe's hit chance from the one-directional spray model.
 ///
 /// The cone side covers `c` candidate ports inside the symmetric peer's port
-/// space, where the peer holds `m` live mappings, so the birthday formula at
-/// `n = 1` gives the chance.
+/// space, where the peer holds `m` live mappings, so the one-directional
+/// formula gives the chance.
 fn sym_probe_estimate(mine: &NatInfo, peer: &NatInfo, sel: &Selection, cfg: &PunchConfig) -> f64 {
     // Exactly one side is symmetric, and it holds the shooter count, which is
     // the larger of the two socket counts.
@@ -220,7 +311,7 @@ fn sym_probe_estimate(mine: &NatInfo, peer: &NatInfo, sel: &Selection, cfg: &Pun
     let m = sel.initiator_sockets.max(sel.responder_sockets) as usize;
     let space = peer_space(sym);
     let c = spray_count(m, space, cfg);
-    collision_probability(1, m, c, space)
+    spray_hit_chance(m, c, space)
 }
 
 /// How a side learns the fresh external port of its punch socket.
@@ -345,7 +436,15 @@ pub(crate) fn build_plan(
             stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
         },
         StrategyId::BirthdayBurst => {
-            stages.extend(birthday::stage(my_sockets, peer, nonce, role as u64, cfg));
+            let space = burst_space(mine, peer);
+            stages.extend(birthday::stage(
+                my_sockets,
+                peer,
+                space,
+                nonce,
+                role as u64,
+                cfg,
+            ));
         },
         StrategyId::Direct => {},
     }
@@ -912,14 +1011,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collision_model_is_monotonic() {
-        let base = collision_probability(4, 4, 2, 1000);
+    fn spray_model_is_monotonic() {
+        let base = spray_hit_chance(4, 8, 1000);
         assert!(base > 0.0);
-        assert!(collision_probability(8, 4, 2, 1000) > base);
-        assert!(collision_probability(4, 4, 4, 1000) > base);
-        assert!(collision_probability(4, 4, 2, 500) > base);
-        // Dense coverage saturates toward certainty.
-        assert!(collision_probability(64, 64, 4, 16) > 0.999);
+        assert!(spray_hit_chance(8, 8, 1000) > base);
+        assert!(spray_hit_chance(4, 16, 1000) > base);
+        assert!(spray_hit_chance(4, 8, 500) > base);
+    }
+
+    #[test]
+    fn burst_model_prefers_coverage_and_saturates() {
+        // Every row holds 16 mappings per side; only the split differs.
+        // Lambda is 2*n*c^2/space, so 1 socket over 16 ports buys four
+        // times the hits of 4 sockets over 4 ports.
+        let narrow = burst_hit_chance(4, 4, 4, 4, 1000);
+        let wide = burst_hit_chance(1, 16, 1, 16, 1000);
+        assert!(wide > narrow);
+        // Sockets still add hits once coverage is fixed.
+        assert!(burst_hit_chance(2, 16, 2, 16, 1000) > wide);
+        // Dense bursts saturate toward certainty.
+        assert!(burst_hit_chance(64, 64, 64, 64, 16) > 0.999);
     }
 
     #[test]
@@ -929,8 +1040,11 @@ mod tests {
             packet_budget: 4096,
             ..PunchConfig::default()
         };
-        let (n, m, c) = size_burst(100, &cfg);
-        assert!(collision_probability(n, m, c, 100) >= cfg.target_success - 1e-9);
+        // Required products are ln(2) * 1000 / 2 = 347, solved by one socket
+        // per side covering ceil(sqrt(347)) = 19 ports (19^2 = 361).
+        let (n, m, c) = size_burst(1000, &cfg);
+        assert_eq!((n, m, c), (1, 1, 19));
+        assert!(burst_hit_chance(n, c, m, c, 1000) >= cfg.target_success - 1e-9);
     }
 
     #[test]
@@ -939,9 +1053,22 @@ mod tests {
             packet_budget: 100,
             ..PunchConfig::default()
         };
+        // The budget share caps the mappings at 25, so coverage clamps to 25
+        // and one socket stays under it: lambda = 2 * 25^2 / 32768 = 0.038.
         let space = DEFAULT_SPACE;
         let (n, m, c) = size_burst(space, &cfg);
-        assert!(collision_probability(n, m, c, space) < cfg.min_success);
+        assert_eq!((n, m, c), (1, 1, 25));
+        assert!(burst_hit_chance(n, c, m, c, space) < cfg.min_success);
+    }
+
+    #[test]
+    fn tiny_spaces_raise_the_socket_count() {
+        let cfg = PunchConfig::default();
+        // A 132-wide space leaves a 4-port drawable window, so coverage
+        // clamps and sockets make up the rate: n * 4^2 >= ln(2) * 132 / 2.
+        let (n, _m, c) = size_burst(132, &cfg);
+        assert_eq!((n, c), (3, 4));
+        assert!(burst_hit_chance(n, c, n, c, 132) >= cfg.target_success - 1e-9);
     }
 
     #[test]
@@ -958,12 +1085,25 @@ mod tests {
     }
 
     #[test]
+    fn distinct_ports_stay_inside_the_span() {
+        let ports = distinct_ports(7, 100, 108, 5);
+        assert_eq!(ports.len(), 5);
+        assert!(ports.iter().all(|p| (100..=108).contains(p)));
+        // A shuffle of one span never repeats a port.
+        let unique = distinct_ports(7, 100, 108, 9);
+        let mut sorted = unique.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), unique.len());
+    }
+
+    #[test]
     fn spray_count_reaches_the_target_when_unclamped() {
         let cfg = PunchConfig::default();
         let (m, space) = (16, 200);
         let c = spray_count(m, space, &cfg);
         // The default target is 0.5 and both caps stay far away.
-        assert!(collision_probability(1, m, c, space) >= cfg.target_success - 1e-9);
+        assert!(spray_hit_chance(m, c, space) >= cfg.target_success - 1e-9);
     }
 
     #[test]
@@ -976,7 +1116,7 @@ mod tests {
         // 40 / 4 = 10 by budget, 5 by the conntrack bound.
         assert_eq!(spray_count(16, 30_000, &cfg), 10);
         let cfg = PunchConfig {
-            max_destinations: 6,
+            max_mappings: 6,
             ..cfg
         };
         assert_eq!(spray_count(16, 30_000, &cfg), 5);

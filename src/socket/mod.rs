@@ -100,7 +100,8 @@ pub(crate) struct RecvEvent {
 /// Owns every socket a session opens. Only the pool closes them.
 ///
 /// Every outbound packet passes the rate limiter and the session budget, and
-/// the pool tracks distinct destinations to bound the conntrack footprint.
+/// the pool bounds live sockets times distinct destinations, which is the
+/// conntrack footprint the session leaves on its NAT.
 pub(crate) struct SocketPool<S: UdpIo> {
     groups: [Vec<Arc<S>>; 2],
     cancel: CancellationToken,
@@ -108,7 +109,7 @@ pub(crate) struct SocketPool<S: UdpIo> {
     limiter: rate::RateLimiter,
     budget: AtomicU32,
     dests: Mutex<HashSet<SocketAddr>>,
-    max_dests: usize,
+    max_mappings: usize,
     sent: AtomicU32,
 }
 
@@ -132,7 +133,7 @@ impl<S: UdpIo> SocketPool<S> {
             limiter: rate::RateLimiter::new(cfg.packets_per_sec),
             budget: AtomicU32::new(cfg.packet_budget),
             dests: Mutex::new(HashSet::new()),
-            max_dests: cfg.max_destinations,
+            max_mappings: cfg.max_mappings,
             sent: AtomicU32::new(0),
         };
         for (family, count) in [(Family::V4, v4), (Family::V6, v6)] {
@@ -210,7 +211,10 @@ impl<S: UdpIo> SocketPool<S> {
         {
             let mut dests = self.dests.lock().expect("dest set lock");
             if !dests.contains(&target) {
-                if dests.len() >= self.max_dests {
+                // A new destination costs one mapping per live socket, so
+                // the bound scales the destination count with the pool.
+                let sockets = self.groups[0].len() + self.groups[1].len();
+                if sockets * (dests.len() + 1) > self.max_mappings {
                     return Err(PunchError::ConntrackExhausted);
                 }
                 dests.insert(target);

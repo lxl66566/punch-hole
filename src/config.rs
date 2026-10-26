@@ -22,8 +22,9 @@ pub struct PunchConfig {
     pub packets_per_sec: u32,
     /// Total packets one session may send on the data plane.
     pub packet_budget: u32,
-    /// Cap on distinct destinations, which bounds the conntrack footprint.
-    pub max_destinations: usize,
+    /// Cap on live sockets times distinct destinations, which bounds the
+    /// NAT conntrack footprint of the session.
+    pub max_mappings: usize,
     pub signaling_retry: Duration,
     pub exchange_timeout: Duration,
     pub negotiate_timeout: Duration,
@@ -66,7 +67,7 @@ impl Default for PunchConfig {
             max_sockets: 256,
             packets_per_sec: 400,
             packet_budget: 4096,
-            max_destinations: 2048,
+            max_mappings: 4096,
             signaling_retry: Duration::from_millis(500),
             exchange_timeout: Duration::from_secs(10),
             negotiate_timeout: Duration::from_secs(10),

@@ -2,9 +2,9 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use rand::{prelude::*, rngs::StdRng};
-
-use super::{StageSpec, effective_class, observed_range, peer_space, spray_count};
+use super::{
+    StageSpec, burst_len, distinct_ports, effective_class, observed_range, peer_space, spray_count,
+};
 use crate::{
     config::PunchConfig,
     msg::Nonce,
@@ -15,9 +15,6 @@ use crate::{
 /// Unrelated allocations the prediction window tolerates besides the peer's
 /// own punch sockets.
 const PREDICTION_SLACK: usize = 16;
-
-/// Upper bound on one sender's per-sweep burst.
-const MAX_BURST: u16 = 32;
 
 /// The symmetric side shoots from many sockets at the cone side's announced
 /// port. The cone side answers every Syn it sees and additionally sprays
@@ -90,20 +87,9 @@ fn random_spray(
     let (lo, hi) = observed_range(seq);
     let span = usize::from(hi - lo) + 1;
     let count = spray_count(peer_sockets as usize, peer_space(peer), cfg).min(span);
-    // Distinct candidates carry the model's coverage, so the span is shuffled
-    // and truncated rather than sampled with replacement.
     let seed = u64::from_be_bytes(nonce[..8].try_into().expect("nonce is 16 bytes"));
-    let mut ports: Vec<u16> = (lo..=hi).collect();
-    ports.shuffle(&mut StdRng::seed_from_u64(seed));
-    ports.truncate(count);
-    ports
+    distinct_ports(seed, lo, hi, count)
         .into_iter()
         .map(|port| SocketAddr::V4(SocketAddrV4::new(ip, port)))
         .collect()
-}
-
-/// Packets one sender emits per sweep, so a spray socket runs at the rate cap.
-fn burst_len(cfg: &PunchConfig) -> u16 {
-    let per_tick = f64::from(cfg.packets_per_sec) * cfg.tick.as_secs_f64();
-    per_tick.ceil().clamp(1.0, f64::from(MAX_BURST)) as u16
 }
