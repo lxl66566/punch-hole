@@ -533,6 +533,8 @@ pub(crate) struct Engine<S: UdpIo> {
     /// Set when budget or conntrack errors stopped the sweeps; the confirm
     /// path keeps running because replies matter more than new pulses.
     sweep_stalled: bool,
+    /// The session's wall-clock deadline, from the session start.
+    overall: tokio::time::Instant,
     candidate: Option<(Family, u16)>,
     confirmed: Option<(Family, u16)>,
     /// Winner index to announce over signaling before the loop exits.
@@ -556,14 +558,22 @@ pub(crate) struct Engine<S: UdpIo> {
 }
 
 impl<S: UdpIo> Engine<S> {
-    pub(crate) fn new(plan: ExecPlan, cfg: PunchConfig, nonce: Nonce) -> Self {
+    /// `overall` is the session's wall-clock deadline; every engine
+    /// deadline stays at or before it.
+    pub(crate) fn new(
+        plan: ExecPlan,
+        cfg: PunchConfig,
+        nonce: Nonce,
+        overall: tokio::time::Instant,
+    ) -> Self {
         Self {
             cfg,
             plan,
             nonce,
+            overall,
             syn_bufs: [Vec::new(), Vec::new()],
             start: None,
-            punch_deadline: tokio::time::Instant::now(),
+            punch_deadline: overall,
             stage_idx: 0,
             sweep: 0,
             sweep_stalled: false,
@@ -700,7 +710,7 @@ impl<S: UdpIo> Engine<S> {
     ) -> Result<Outcome, PunchError> {
         let start = tokio::time::Instant::now();
         self.start = Some(start);
-        self.punch_deadline = start + self.cfg.punch_timeout;
+        self.punch_deadline = (start + self.cfg.punch_timeout).min(self.overall);
         // A STUN refresh that never started has no server or no bound
         // socket, so the V4 port can never be announced.
         if self.plan.refresh_v4 == Refresh::Stun && self.stun.is_none() {
@@ -835,7 +845,7 @@ impl<S: UdpIo> Engine<S> {
                 } else {
                     self.confirmed = Some((ev.family, ev.socket));
                     self.announce = Some(ev.socket);
-                    self.grace_end = Some(now + self.cfg.grace);
+                    self.grace_end = Some((now + self.cfg.grace).min(self.overall));
                     true
                 };
                 if resend_ack {
@@ -1206,7 +1216,8 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: vec![peer_v6],
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(plan, cfg, [0; 16]);
+        let mut engine: Engine<crate::sim::SimSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
         // Minimal stand-ins for the plan stages; target resolution reads
         // only the family and the peer-port wait flag.
         let v6_probe = StageSpec::send(Family::V6, 1, Vec::new(), true, Duration::ZERO);

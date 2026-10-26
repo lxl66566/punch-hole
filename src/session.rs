@@ -164,7 +164,7 @@ impl<F: UdpFactory> PunchSession<F> {
             refresh_server,
             &self.config,
         );
-        let engine = Engine::new(plan, self.config.clone(), nonce);
+        let engine = Engine::new(plan, self.config.clone(), nonce, overall);
         let engine_result = engine.run(&self.factory, &mut self.sig).await;
         if let Err(e) = &engine_result {
             // The peer learns the failure instead of draining its deadline.

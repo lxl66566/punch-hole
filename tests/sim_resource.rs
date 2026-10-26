@@ -122,6 +122,42 @@ async fn blackholed_signaling_times_out_and_releases() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn overall_deadline_bounds_the_engine() {
+    let (net, stun, a, b) = common::cone_net("overall_bounds");
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // PortUpdate never crosses, so both engines would otherwise idle to
+    // their 15 second punch timeout.
+    common::connect_then_blackhole(ha, hb);
+    let mut cfg = config(&stun);
+    cfg.punch_timeout = std::time::Duration::from_secs(15);
+    cfg.overall_deadline = std::time::Duration::from_secs(3);
+
+    let start = tokio::time::Instant::now();
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+        matches!(
+            r,
+            Err(PunchError::Timeout { .. }
+                | PunchError::SignalingClosed
+                | PunchError::PeerAborted(_))
+        )
+    };
+    assert!(bounded(&ra), "got {ra:?}");
+    assert!(bounded(&rb), "got {rb:?}");
+    // The session ends on its wall-clock limit, far under the punch timeout.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(6),
+        "session ran {} ms",
+        start.elapsed().as_millis()
+    );
+    net.wait_mappings_drained().await;
+    assert_eq!(net.mapping_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropping_the_future_releases_sockets() {
     let (net, stun, a, b) = common::cone_net("drop_future");
     let (ha, la) = punch_hole::signaling::bridge(64);
