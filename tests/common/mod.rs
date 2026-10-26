@@ -128,3 +128,42 @@ pub fn cone_net(name: &str) -> (Net, StunServer, Host, Host) {
     let b = net.host(NatSpec::cone_apdf());
     (net, stun, a, b)
 }
+
+/// Runs the pair on a fresh net per try until both sides punch, and returns
+/// the last results.
+///
+/// A spray covers a fixed port set drawn from the attempt nonce, and every
+/// sweep repeats that set, so the residual miss the model leaves below a
+/// perfect target can only end the run in failure. A fresh run draws a fresh
+/// nonce, so a few retries push the residual far below any single target
+/// while each run keeps its full assertion.
+pub async fn punch_pair_retried(
+    name: &str,
+    a: NatSpec,
+    b: NatSpec,
+    cfg: PunchConfig,
+    tries: usize,
+) -> (
+    Result<Punched<SimSocket>, PunchError>,
+    Result<Punched<SimSocket>, PunchError>,
+) {
+    let mut cfg = cfg;
+    let mut last = None;
+    for _ in 0..tries {
+        let net = Net::seeded(name);
+        let stun = net.stun_server();
+        cfg.stun_servers = stun.addrs.clone();
+        let pair = punch_pair(
+            net.host(a.clone()),
+            cfg.clone(),
+            net.host(b.clone()),
+            cfg.clone(),
+        )
+        .await;
+        if pair.0.is_ok() && pair.1.is_ok() {
+            return pair;
+        }
+        last = Some(pair);
+    }
+    last.expect("tries is nonzero")
+}

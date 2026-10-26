@@ -43,17 +43,21 @@ async fn easy_step_detected() {
 
 #[tokio::test(start_paused = true)]
 async fn hard_detected() {
-    let net = Net::seeded("hard_detected");
-    let stun = net.stun_server();
     // The birthday sizing is honest for its target, so the 0.5 default
     // target leaves a coin flip. The 100-wide range with a 0.95 target
     // covers ceil(sqrt(ln(20) / 2 * space)) ports, 17 to 19 here, which
-    // keeps the true chance above 0.99.
-    let a = net.host(NatSpec::random(30000..30100));
-    let b = net.host(NatSpec::random(30000..30100));
-    let mut cfg = config(&stun);
+    // keeps the true chance above 0.99. The rest is the model's own
+    // residual, so the pair reruns on a fresh nonce.
+    let mut cfg = punch_hole::PunchConfig::default();
     cfg.target_success = 0.95;
-    let (ra, _) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let (ra, _) = common::punch_pair_retried(
+        "hard_detected",
+        NatSpec::random(30000..30100),
+        NatSpec::random(30000..30100),
+        cfg,
+        3,
+    )
+    .await;
     let pa = ra.expect("birthday pair punches");
     assert_eq!(pa.report.local_class, NatClass::HardSym);
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);

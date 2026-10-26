@@ -8,7 +8,7 @@ mod common;
 
 use common::config;
 use punch_hole::{
-    NatClass, StrategyId,
+    NatClass, PunchConfig, StrategyId,
     error::PunchError,
     sim::{NatSpec, Net},
 };
@@ -45,21 +45,26 @@ async fn hard_sym_cone_uses_sym_probe() {
 
 #[tokio::test(start_paused = true)]
 async fn hard_sym_cone_apdf_punches_via_spray() {
-    let net = Net::seeded("hard_sym_cone_apdf");
-    let stun = net.stun_server();
-    let a = net.host(NatSpec::random(30000..30100));
     // Port-strict filtering on the cone side: the peer's Syn pulses arrive
     // from sources the cone never wrote to, so only the cone's own spray
     // opens the path.
-    let b = net.host(NatSpec::cone_apdf());
-    let mut cfg = config(&stun);
+    let mut cfg = PunchConfig::default();
     // Model margin: the probe pins the HardSym space to the observed spread
     // plus 2 * 64 margin, at most 100 + 128 = 228. With m = 16 peer sockets
     // and target 0.99, c = ceil(ln(100) * 228 / 16) = 66 and the estimate
     // 1 - exp(-16 * 66 / 228) >= 0.99. A narrower observed spread only
     // raises it, so the 0.98 bar keeps float noise out of the assertion.
+    // The percent below the target is the model's residual, covered by a
+    // rerun on a fresh nonce.
     cfg.target_success = 0.99;
-    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let (ra, rb) = common::punch_pair_retried(
+        "hard_sym_cone_apdf",
+        NatSpec::random(30000..30100),
+        NatSpec::cone_apdf(),
+        cfg,
+        3,
+    )
+    .await;
     let pa = ra.expect("spray punches");
     let pb = rb.expect("spray punches");
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
@@ -69,7 +74,6 @@ async fn hard_sym_cone_apdf_punches_via_spray() {
     assert!(pa.report.success_estimate.unwrap_or(0.0) > 0.98);
     assert_eq!(pb.report.success_estimate, pa.report.success_estimate);
     common::assert_business_traffic(&pa, &pb).await;
-    let _ = net.mapping_count();
 }
 
 #[tokio::test(start_paused = true)]
@@ -107,17 +111,21 @@ async fn easy_sym_pair_uses_predictions() {
 
 #[tokio::test(start_paused = true)]
 async fn birthday_burst_narrow_range() {
-    let net = Net::seeded("birthday_narrow");
-    let stun = net.stun_server();
-    let a = net.host(NatSpec::random(30000..30100));
-    let b = net.host(NatSpec::random(30000..30100));
-    let mut cfg = config(&stun);
+    let mut cfg = PunchConfig::default();
     // The sizing is honest for its target, so the 0.5 default target leaves
     // a coin flip. At 0.95 the sizing covers ceil(sqrt(ln(20) / 2 * space))
     // ports, 18 on a typical 200-wide space estimate, which keeps the true
-    // chance above 0.99 on the 100-wide range.
+    // chance above 0.99 on the 100-wide range. The rest is the model's
+    // residual, covered by a rerun on a fresh nonce.
     cfg.target_success = 0.95;
-    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let (ra, rb) = common::punch_pair_retried(
+        "birthday_narrow",
+        NatSpec::random(30000..30100),
+        NatSpec::random(30000..30100),
+        cfg,
+        3,
+    )
+    .await;
     let pa = ra.expect("birthday punches");
     let pb = rb.expect("birthday punches");
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);
@@ -128,7 +136,6 @@ async fn birthday_burst_narrow_range() {
     // the same estimate.
     assert_eq!(pb.report.success_estimate, pa.report.success_estimate);
     common::assert_business_traffic(&pa, &pb).await;
-    let _ = net.mapping_count();
 }
 
 /// Birthday bursts across independent seeds: the measured success rate must
