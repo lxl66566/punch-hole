@@ -34,7 +34,9 @@ pub struct PunchConfig {
     /// How long a confirmed side answers repeated handshake packets before
     /// handing the winner socket to the host.
     pub grace: Duration,
-    /// Time the optional Direct stage gets before the matrix strategy runs.
+    /// Time the optional Direct stage gets before the matrix strategy
+    /// runs, counted inside `punch_timeout`: the matrix stages spend
+    /// whatever of it remains.
     pub direct_window: Duration,
     /// Success rate the birthday model aims for when sizing a burst.
     pub target_success: f64,
@@ -48,6 +50,9 @@ pub struct PunchConfig {
     /// on this cadence.
     pub tick: Duration,
 }
+
+/// Upper bound `validate` enforces on `max_sockets`.
+pub const MAX_SOCKETS_LIMIT: u16 = 4096;
 
 impl Default for PunchConfig {
     fn default() -> Self {
@@ -94,6 +99,14 @@ impl PunchConfig {
         if self.max_sockets == 0 || self.packets_per_sec == 0 || self.packet_budget == 0 {
             return Err(bad("socket counts, rate, and budget must be positive"));
         }
+        // A plan above this bound would strain descriptor limits and the NAT
+        // conntrack table long before the session finishes.
+        if self.max_sockets > MAX_SOCKETS_LIMIT {
+            return Err(bad("max_sockets must not exceed 4096"));
+        }
+        if self.max_mappings == 0 {
+            return Err(bad("max_mappings must be positive"));
+        }
         if self.assistant_sockets == 0
             || self.assistant_sockets > self.max_sockets
             || self.predictive_sockets == 0
@@ -112,6 +125,7 @@ impl PunchConfig {
             || self.grace.is_zero()
             || self.signaling_retry.is_zero()
             || self.overall_deadline.is_zero()
+            || self.direct_window.is_zero()
         {
             return Err(bad("durations must be positive"));
         }
@@ -156,6 +170,33 @@ mod tests {
     fn zero_sockets_are_rejected() {
         let cfg = PunchConfig {
             assistant_sockets: 0,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn zero_direct_window_is_rejected() {
+        let cfg = PunchConfig {
+            direct_window: Duration::ZERO,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn zero_max_mappings_is_rejected() {
+        let cfg = PunchConfig {
+            max_mappings: 0,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn oversized_max_sockets_is_rejected() {
+        let cfg = PunchConfig {
+            max_sockets: MAX_SOCKETS_LIMIT + 1,
             ..PunchConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
