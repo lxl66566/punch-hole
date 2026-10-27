@@ -38,8 +38,9 @@ pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
 [lints.rust]
-unsafe_code           = "allow"
 unused_qualifications = "warn"
+# The single FFI call in socket/sys.rs carries a scoped exemption.
+unsafe_code            = "deny"
 # cargo-fuzz builds the library with --cfg fuzzing.
 unexpected_cfgs       = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 

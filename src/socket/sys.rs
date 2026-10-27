@@ -24,8 +24,6 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     }
     // The option must sit on the socket before bind, like SO_REUSEADDR.
     #[cfg(windows)]
-    // The option must sit on the socket before bind, like SO_REUSEADDR.
-    #[cfg(windows)]
     set_exclusive_addr_use(&sock)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
@@ -40,6 +38,8 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
 /// carries no setter for the option, so the call goes to ws2_32, which the
 /// standard library already links.
 #[cfg(windows)]
+// The crate denies unsafe code; this one ws2_32 call is the sole exemption.
+#[expect(unsafe_code)]
 fn set_exclusive_addr_use(sock: &socket2::Socket) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
 
