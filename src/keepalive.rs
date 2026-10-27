@@ -7,7 +7,7 @@ use crate::{
     socket::UdpIo,
 };
 
-/// Default heartbeat interval, matching PROTOCOL.md.
+/// Default heartbeat interval.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Stops the heartbeat task when dropped.

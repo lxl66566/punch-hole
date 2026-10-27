@@ -6,10 +6,10 @@
 //! back. A successful session returns a plain `tokio::net::UdpSocket` with no
 //! wrapper and no library state.
 //!
-//! The layers, the session lifecycle, and the strategy matrix are specified
-//! in `ARCHITECTURE.md`; the wire formats live in `PROTOCOL.md`; the test
-//! architecture lives in `TESTING.md`. A runnable two-terminal demo lives in
-//! `examples/punch-demo.rs`.
+//! The book under `docs/` carries the full tutorial and reference, in
+//! English and Chinese: the UDP hole punching primer, the strategy
+//! walkthrough, the architecture, the wire protocol, and the test system.
+//! A runnable two-terminal demo lives in `examples/punch-demo.rs`.
 //!
 //! # Trust model
 //!

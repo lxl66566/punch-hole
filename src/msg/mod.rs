@@ -1,8 +1,8 @@
 //! Wire messages for both planes and their codecs.
 //!
 //! The signaling plane wraps frames in a version byte, the data plane in a
-//! magic byte plus a version byte. Both bodies are postcard encoded, as
-//! specified in PROTOCOL.md.
+//! magic byte plus a version byte. The book under `docs/` specifies both
+//! planes; the struct definitions here are the source of truth.
 
 #[cfg(test)]
 use std::net::{SocketAddrV4, SocketAddrV6};

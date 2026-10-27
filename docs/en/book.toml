@@ -1,0 +1,22 @@
+[book]
+title = "punch-hole"
+authors = ["lxl66566"]
+description = "A UDP hole punching primer and the guide to the punch-hole library"
+src = "src"
+language = "en"
+
+[build]
+build-dir = "../../target/book/en"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+smart-punctuation = true
+additional-css = ["shared.css"]
+additional-js = ["lang-switcher.js"]
+git-repository-url = "https://github.com/lxl66566/punch-hole"
+edit-url-template = "https://github.com/lxl66566/punch-hole/edit/main/docs/en/src/{path}"
+
+[output.html.search]
+enable = true

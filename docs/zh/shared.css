@@ -1,0 +1,7 @@
+/* Shared between the English and the Chinese book build. */
+.lang-switch {
+    padding: 0 0.6em;
+    font-size: 0.9em;
+    cursor: pointer;
+    white-space: nowrap;
+}

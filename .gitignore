@@ -1,4 +1,2 @@
 /target
-AGENTS.md
-*.md
-!README.md
+/target-msrv

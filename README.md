@@ -58,7 +58,8 @@ sent. A burst stays probabilistic, so a hard against hard pair may need a
 second attempt.
 
 Two symmetric NATs that both filter on address and port are the one hard
-case; the estimate states its filtering assumption. See PROTOCOL section 11.
+case. The strategies chapter of the book covers the filtering assumption
+the estimate states.
 
 ## Using the library
 
@@ -72,10 +73,20 @@ let punched = puncher.with_signaling(lib_end).initiator().await?;
 // punched.socket is a raw UDP socket; punched.peer_addr is the confirmed path.
 ```
 
-The full walkthrough lives in the crate documentation
-(`cargo doc --open`); the layered design in
-[ARCHITECTURE.md](ARCHITECTURE.md), the wire formats in
-[PROTOCOL.md](PROTOCOL.md), and the test rings in
-[TESTING.md](TESTING.md).
+The full walkthrough lives in the crate documentation (`cargo doc --open`).
+The project book carries the UDP hole punching primer, the API guide, and
+the architecture and protocol reference, in English and Chinese:
+
+```sh
+mdbook build docs/en && mdbook build docs/zh
+```
+
+Open `target/book/en/index.html` (English) or `target/book/zh/index.html`
+(中文), or read the chapter sources under `docs/en/src/` and `docs/zh/src/`.
+
+CI builds and deploys the book on every push to main, at
+<https://lxl66566.github.io/punch-hole/>. The landing page picks the
+language by browser locale, and the toolbar button switches languages
+chapter for chapter.
 
 License: MIT OR Apache-2.0.

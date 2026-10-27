@@ -1,0 +1,57 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cargo-bins/cargo-binstall@main
+      # mdBook ships prebuilt binaries per release, so binstall skips a
+      # compile. The version pins the tool the two book.toml files target.
+      - name: Install mdbook
+        run: cargo binstall -y --no-symlinks --locked mdbook@0.5.4
+      - name: Build both editions
+        run: |
+          mdbook build docs/en
+          mdbook build docs/zh
+          cp docs/landing.html target/book/index.html
+          touch target/book/.nojekyll
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/book
+
+  deploy:
+    name: deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # enablement covers the first run on a repository where Pages is
+      # still switched off in the settings.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - id: deployment
+        uses: actions/deploy-pages@v4

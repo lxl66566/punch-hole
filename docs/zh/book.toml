@@ -1,0 +1,21 @@
+[book]
+title = "punch-hole 手册"
+authors = ["lxl66566"]
+description = "UDP 打洞教程与 punch-hole 库指南"
+src = "src"
+language = "zh-CN"
+
+[build]
+build-dir = "../../target/book/zh"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+additional-css = ["shared.css"]
+additional-js = ["lang-switcher.js"]
+git-repository-url = "https://github.com/lxl66566/punch-hole"
+edit-url-template = "https://github.com/lxl66566/punch-hole/edit/main/docs/zh/src/{path}"
+
+[output.html.search]
+enable = true
