@@ -76,3 +76,11 @@ impl NatInfo {
         self.v4.as_ref().map(|v4| v4.reflexive)
     }
 }
+
+/// Fuzzing entry to the STUN binding response parser, the one parser that
+/// consumes raw network bytes outside the wire codecs.
+#[cfg(fuzzing)]
+#[must_use]
+pub fn parse_stun_response(buf: &[u8], txid: &[u8; 12]) -> Option<std::net::SocketAddr> {
+    probe::parse_mapped(buf, txid)
+}

@@ -187,14 +187,17 @@ impl Fanout {
     /// Collects answers until no destination pends or `until` passes.
     async fn collect<S: UdpIo>(&mut self, socket: &S, until: Instant) {
         while self.pending() > 0 {
-            let mut buf = [0u8; 128];
+            // Servers prepend their own attributes ahead of XOR-MAPPED, so
+            // the buffer leaves room beyond the minimal binding response.
+            let mut buf = [0u8; 1024];
             // A deadline miss or a socket error ends the round; whatever
             // answered so far stands.
-            let Ok(Ok((len, _))) = tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
+            let Ok(Ok((len, from))) =
+                tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
             else {
                 break;
             };
-            self.absorb(&buf[..len]);
+            self.absorb(&buf[..len], from);
         }
     }
 
@@ -202,10 +205,13 @@ impl Fanout {
     ///
     /// Answers overtake each other; the transaction id selects the slot, so
     /// the slots keep send order whatever the arrival order is. A duplicate
-    /// of an answered slot matches no pending slot and is dropped.
-    fn absorb(&mut self, buf: &[u8]) {
-        for (slot, txid) in self.slots.iter_mut().zip(&self.txids) {
-            if slot.is_none() {
+    /// of an answered slot matches no pending slot and is dropped. RFC 5389
+    /// section 7.1 requires the response source to equal the request
+    /// destination, so a matching transaction id from any other source is
+    /// dropped too.
+    fn absorb(&mut self, buf: &[u8], from: SocketAddr) {
+        for (idx, (slot, txid)) in self.slots.iter_mut().zip(&self.txids).enumerate() {
+            if slot.is_none() && from == self.dests[idx] {
                 if let Some(addr) = parse_mapped(buf, txid) {
                     *slot = Some(addr);
                     break;
@@ -319,11 +325,19 @@ pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
     if msg_type != BINDING_RESPONSE || buf[4..8] != COOKIE || buf[8..20] != *txid {
         return None;
     }
+    // The message length bounds the attribute area; datagram bytes past it
+    // belong to no attribute and are never scanned.
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let end = (20 + msg_len).min(buf.len());
     let mut i = 20;
-    while i + 4 <= buf.len() {
+    while i + 4 <= end {
         let attr = u16::from_be_bytes([buf[i], buf[i + 1]]);
         let len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
-        let body = buf.get(i + 4..i + 4 + len)?;
+        // An attribute overrunning the declared message ends the scan.
+        if i + 4 + len > end {
+            return None;
+        }
+        let body = &buf[i + 4..i + 4 + len];
         if attr == ATTR_XOR_MAPPED && len >= 8 {
             let family = body[1];
             let xport = u16::from_be_bytes([body[2], body[3]]) ^ 0x2112;
@@ -386,7 +400,8 @@ mod tests {
 
         let mut resp = Vec::new();
         resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        resp.extend_from_slice(&8u16.to_be_bytes());
+        // Four attribute header bytes plus the eight-byte body.
+        resp.extend_from_slice(&12u16.to_be_bytes());
         resp.extend_from_slice(&COOKIE);
         resp.extend_from_slice(&txid);
         resp.extend_from_slice(&ATTR_XOR_MAPPED.to_be_bytes());
@@ -413,7 +428,8 @@ mod tests {
 
         let mut resp = Vec::new();
         resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-        resp.extend_from_slice(&8u16.to_be_bytes());
+        // Four attribute header bytes plus the eight-byte body.
+        resp.extend_from_slice(&12u16.to_be_bytes());
         resp.extend_from_slice(&COOKIE);
         resp.extend_from_slice(txid);
         resp.extend_from_slice(&ATTR_XOR_MAPPED.to_be_bytes());
@@ -429,9 +445,9 @@ mod tests {
             .collect();
         let mut round = Fanout::new(dests);
         // Destination 2 answers first and destination 1 last.
-        round.absorb(&binding_response(&round.txids[2], 5012));
-        round.absorb(&binding_response(&round.txids[0], 5010));
-        round.absorb(&binding_response(&round.txids[1], 5011));
+        round.absorb(&binding_response(&round.txids[2], 5012), round.dest(2));
+        round.absorb(&binding_response(&round.txids[0], 5010), round.dest(0));
+        round.absorb(&binding_response(&round.txids[1], 5011), round.dest(1));
         // Ports sit at their send indexes, whatever the arrival order was.
         assert_eq!(round.observed(), vec![(0, 5010), (1, 5011), (2, 5012)]);
         assert_eq!(
@@ -444,12 +460,61 @@ mod tests {
     fn duplicate_and_foreign_answers_are_dropped() {
         let dest = vec![SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478))];
         let mut round = Fanout::new(dest);
-        round.absorb(&binding_response(&round.txids[0], 5010));
+        round.absorb(&binding_response(&round.txids[0], 5010), round.dest(0));
         // A retransmitted answer and a foreign transaction change nothing.
-        round.absorb(&binding_response(&round.txids[0], 5099));
-        round.absorb(&binding_response(&[9u8; 12], 5000));
+        round.absorb(&binding_response(&round.txids[0], 5099), round.dest(0));
+        round.absorb(&binding_response(&[9u8; 12], 5000), round.dest(0));
         assert_eq!(round.observed(), vec![(0, 5010)]);
         assert_eq!(round.pending(), 0);
+    }
+
+    #[test]
+    fn answers_from_other_sources_are_dropped() {
+        let dest = vec![SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478))];
+        let mut round = Fanout::new(dest);
+        // Same transaction id, but the datagram left a different server; a
+        // spoofed response has to come from the requested address.
+        let other = SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 9999));
+        round.absorb(&binding_response(&round.txids[0], 5010), other);
+        assert_eq!(round.pending(), 1);
+    }
+
+    #[test]
+    fn attributes_past_the_declared_length_are_ignored() {
+        let txid = [3u8; 12];
+        let mapped = binding_response(&txid, 5010);
+        // The message length declares one four-byte attribute only; the
+        // XOR-MAPPED bytes appended after it belong to no attribute.
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&COOKIE);
+        resp.extend_from_slice(&txid);
+        resp.extend_from_slice(&0x8028u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&mapped[20..]);
+        assert!(parse_mapped(&resp, &txid).is_none());
+    }
+
+    #[test]
+    fn leading_server_attributes_still_parse() {
+        // A server that prepends a padded 200-byte attribute keeps
+        // XOR-MAPPED well past a minimal response.
+        let txid = [4u8; 12];
+        let mapped = binding_response(&txid, 5010);
+        let mut resp = Vec::with_capacity(256);
+        resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&COOKIE);
+        resp.extend_from_slice(&txid);
+        resp.extend_from_slice(&0x8028u16.to_be_bytes());
+        resp.extend_from_slice(&200u16.to_be_bytes());
+        resp.resize(resp.len() + 200, 0);
+        resp.extend_from_slice(&mapped[20..]);
+        let msg_len = (resp.len() - 20) as u16;
+        resp[2..4].copy_from_slice(&msg_len.to_be_bytes());
+        let parsed = parse_mapped(&resp, &txid).expect("trailing attribute parses");
+        assert_eq!(parsed.port(), 5010);
     }
 
     #[test]

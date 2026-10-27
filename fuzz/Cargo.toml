@@ -29,3 +29,10 @@ path = "fuzz_targets/fuzz_data_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_stun"
+path = "fuzz_targets/fuzz_stun.rs"
+test = false
+doc = false
+bench = false

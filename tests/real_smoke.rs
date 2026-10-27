@@ -86,7 +86,8 @@ fn binding_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
     };
     let mut out = Vec::with_capacity(48);
     out.extend_from_slice(&0x0101u16.to_be_bytes());
-    out.extend_from_slice(&attr_len.to_be_bytes());
+    // The message length covers the attribute header plus the body.
+    out.extend_from_slice(&(4 + attr_len).to_be_bytes());
     out.extend_from_slice(&COOKIE);
     out.extend_from_slice(&request[8..20]);
     out.extend_from_slice(&0x0020u16.to_be_bytes());
