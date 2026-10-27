@@ -274,6 +274,37 @@ async fn oversized_offer_socket_counts_are_clamped() {
     );
 }
 
+/// A lost Accept must not strand the pair: the responder re-sends it until
+/// the punch window opens, and the session still completes.
+#[tokio::test(start_paused = true)]
+async fn first_accept_lost_still_completes() {
+    let net = Net::seeded("accept_retry");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_eif());
+    let b = net.host(NatSpec::cone_eif());
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // The default signaling retry of 500 ms exceeds the roughly 300 ms start
+    // window; the Accept re-send cadence stays capped, so a re-send fits
+    // without any configuration change.
+    let cfg = config(&stun);
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    punch_hole::sim::connect_with(ha, hb, move |frame| {
+        let accept = decode_sig(frame).is_ok_and(|f| f.body == Frame::Accept);
+        // Only the very first Accept is lost; every re-send crosses.
+        if accept && !dropped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        Some(frame.to_vec())
+    });
+
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    ra.expect("initiator recovers the lost accept");
+    rb.expect("responder completes after re-sending the accept");
+}
+
 #[tokio::test(start_paused = true)]
 async fn duplicated_frames_run_one_attempt() {
     let net = Net::seeded("duplicated_frames");

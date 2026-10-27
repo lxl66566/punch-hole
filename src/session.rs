@@ -88,6 +88,9 @@ impl<S> std::fmt::Debug for Punched<S> {
 }
 
 impl<F: UdpFactory> PunchSession<F> {
+    /// Tail of the start window kept free of Accept re-sends, so the caller
+    /// gets uninterrupted time to build its plan before the shared start.
+    const ACCEPT_RESEND_MARGIN: Duration = Duration::from_millis(100);
     /// Largest start delay the Responder honors. A larger value would park
     /// the session far past every deadline.
     const MAX_START_DELAY_MS: u64 = 10_000;
@@ -323,10 +326,39 @@ impl<F: UdpFactory> PunchSession<F> {
                         // The Offer carries no estimate, so the report
                         // rebuilds it over the local view.
                         sel.fill_estimate(mine, peer, &self.config);
-                        self.sig.send(Frame::Accept).await?;
+                        let accept = self.sig.send(Frame::Accept).await?;
                         // The shared event is this send; count from here.
                         let start = Instant::now() + Duration::from_millis(u64::from(offer.start_delay_ms));
-                        return Ok((offer.nonce, sel, start));
+                        // The Accept carries no acknowledgement, so it is
+                        // re-sent until the punch window opens; a loss on the
+                        // host channel then costs one cadence, not the whole
+                        // attempt. The cadence is capped because the default
+                        // signaling retry of 500 ms exceeds the whole start
+                        // window, which would leave the re-sends no room.
+                        // The window answers nothing but a peer Abort.
+                        let resend_until = start
+                            .checked_sub(Self::ACCEPT_RESEND_MARGIN)
+                            .unwrap_or_else(Instant::now)
+                            .min(deadline);
+                        let cadence =
+                            self.config.signaling_retry.min(Duration::from_millis(150));
+                        let mut retry =
+                            tokio::time::interval_at(Instant::now() + cadence, cadence);
+                        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tokio::select! {
+                                _ = retry.tick() => self.sig.send_raw(accept.clone()).await?,
+                                frame = self.sig.recv() => {
+                                    // Only a peer Abort ends the window early.
+                                    if let Frame::Abort(reason) = frame?.body {
+                                        return Err(PunchError::PeerAborted(reason));
+                                    }
+                                }
+                                () = tokio::time::sleep_until(resend_until) => {
+                                    return Ok((offer.nonce, sel, start));
+                                }
+                            }
+                        }
                     }
                     Frame::Abort(reason) => return Err(PunchError::PeerAborted(reason)),
                     // Duplicates of the Exchange phase carry no action.
