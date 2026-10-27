@@ -109,6 +109,36 @@ async fn easy_sym_pair_uses_predictions() {
     let _ = net.mapping_count();
 }
 
+/// Two silent STUN destinations interleave with answering ones, so each side
+/// classifies over a gap-compressed sequence: the adjacent deltas read two
+/// strides while the classifier step carries the true one. The pair must
+/// still punch on predictions at the true step.
+#[tokio::test(start_paused = true)]
+async fn easy_sym_pair_with_gapped_allocations_punches() {
+    let net = Net::seeded("easy_sym_gapped");
+    let stun = net.stun_server();
+    // Distinct literals, because the resolver drops duplicate destinations.
+    let mut cfg = config(&stun);
+    cfg.stun_servers = vec![
+        stun.addrs[0].clone(),
+        "203.0.113.77:3478".to_owned(),
+        stun.addrs[1].clone(),
+        "203.0.113.78:3478".to_owned(),
+        stun.addrs[2].clone(),
+        stun.addrs[3].clone(),
+    ];
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::sequential(2));
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("gapped easy pair punches");
+    let pb = rb.expect("gapped easy pair punches");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
+    assert_eq!(pb.report.strategy, StrategyId::PredictiveExchange);
+    assert_eq!(pa.report.peer_class, NatClass::EasySym { step: 2 });
+    common::assert_business_traffic(&pa, &pb).await;
+    let _ = net.mapping_count();
+}
+
 #[tokio::test(start_paused = true)]
 async fn birthday_burst_narrow_range() {
     let mut cfg = PunchConfig::default();

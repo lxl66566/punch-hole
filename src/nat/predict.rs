@@ -28,6 +28,21 @@ impl PortPredictor {
         })
     }
 
+    /// Continues `seq` from its last port with a step derived outside the
+    /// observed deltas, such as the classifier's send-index distance, which
+    /// a silent probe destination cannot compress. Returns `None` when the
+    /// sequence carries no base or the step is zero.
+    #[must_use]
+    pub fn with_step(seq: &[u16], step: i16) -> Option<Self> {
+        if seq.is_empty() || step == 0 {
+            return None;
+        }
+        Some(Self {
+            base: seq[seq.len() - 1],
+            step,
+        })
+    }
+
     #[must_use]
     pub fn step(&self) -> i16 {
         self.step
@@ -50,12 +65,18 @@ impl PortPredictor {
 
 /// The median delta, which tolerates outliers better than any single delta.
 fn median_delta(seq: &[u16]) -> i16 {
-    let mut deltas: Vec<i32> = seq
+    let mut deltas: Vec<i16> = seq
         .windows(2)
-        .map(|w| i32::from(w[1]) - i32::from(w[0]))
+        // Each delta lands in the signed 16-bit wrap domain before the
+        // sort, so a jump across the port boundary ranks as the signed
+        // step it represents instead of a large positive value.
+        .map(|w| {
+            let d = i32::from(w[1]) - i32::from(w[0]);
+            ((d + 32_768).rem_euclid(65_536) - 32_768) as i16
+        })
         .collect();
     deltas.sort_unstable();
-    deltas[deltas.len() / 2] as i16
+    deltas[deltas.len() / 2]
 }
 
 #[cfg(test)]
@@ -98,5 +119,40 @@ mod tests {
         assert_eq!(p.at(10), 65535);
         let p = PortPredictor::fit(&[4, 2]).unwrap();
         assert_eq!(p.at(10), 0);
+    }
+
+    #[test]
+    fn wrap_around_deltas_yield_the_signed_step() {
+        // Raw deltas 2, 2, -2, 2 with the wrap written as 65534: the median
+        // of the normalized deltas stays -2 and the fit continues below the
+        // last observed port.
+        let p = PortPredictor::fit(&[5, 3, 1, 65535, 65533]).unwrap();
+        assert_eq!(p.step(), -2);
+        assert_eq!(p.at(1), 65531);
+    }
+
+    #[test]
+    fn wrap_deltas_sort_in_the_signed_domain() {
+        // Raw deltas 100, 65300, 30: the wrap delta is -236 once normalized,
+        // so it ranks below the small deltas and the median is 30 instead of
+        // the pre-normalization median 100.
+        let p = PortPredictor::fit(&[100, 200, 65500, 65530]).unwrap();
+        assert_eq!(p.step(), 30);
+    }
+
+    #[test]
+    fn with_step_continues_from_the_last_port() {
+        // The classifier fit a step of 2 over send-index distances, while
+        // the adjacent deltas over this gapped sequence are 4, 4, 2.
+        let p = PortPredictor::with_step(&[5000, 5004, 5008, 5010], 2).unwrap();
+        assert_eq!(p.step(), 2);
+        assert_eq!(p.at(1), 5012);
+        assert_eq!(p.window(3), vec![5012, 5014, 5016]);
+    }
+
+    #[test]
+    fn with_step_rejects_empty_sequences_and_zero_steps() {
+        assert!(PortPredictor::with_step(&[], 2).is_none());
+        assert!(PortPredictor::with_step(&[5000, 5002], 0).is_none());
     }
 }
