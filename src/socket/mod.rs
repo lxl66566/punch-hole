@@ -11,7 +11,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, RwLock,
         atomic::{AtomicU32, Ordering},
     },
 };
@@ -108,7 +108,7 @@ pub(crate) struct SocketPool<S: UdpIo> {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     limiter: rate::RateLimiter,
     budget: AtomicU32,
-    dests: Mutex<HashSet<SocketAddr>>,
+    dests: RwLock<HashSet<SocketAddr>>,
     max_mappings: usize,
     sent: AtomicU32,
 }
@@ -125,14 +125,16 @@ impl<S: UdpIo> SocketPool<S> {
         v4: usize,
         v6: usize,
     ) -> Result<(Self, mpsc::Receiver<RecvEvent>), PunchError> {
-        let (tx, rx) = mpsc::channel(64);
+        // The capacity must absorb one full sweep burst, so it scales with the pool.
+        let capacity = usize::from(cfg.max_sockets).clamp(64, 1024);
+        let (tx, rx) = mpsc::channel(capacity);
         let mut pool = Self {
             groups: [Vec::new(), Vec::new()],
             cancel: CancellationToken::new(),
             tasks: Vec::new(),
             limiter: rate::RateLimiter::new(cfg.packets_per_sec),
             budget: AtomicU32::new(cfg.packet_budget),
-            dests: Mutex::new(HashSet::new()),
+            dests: RwLock::new(HashSet::new()),
             max_mappings: cfg.max_mappings,
             sent: AtomicU32::new(0),
         };
@@ -210,8 +212,14 @@ impl<S: UdpIo> SocketPool<S> {
         buf: &[u8],
         target: SocketAddr,
     ) -> Result<(), PunchError> {
+        if !self
+            .dests
+            .read()
+            .expect("dest set read lock")
+            .contains(&target)
         {
-            let mut dests = self.dests.lock().expect("dest set lock");
+            let mut dests = self.dests.write().expect("dest set write lock");
+            // Re-check: a racing sender may have inserted this destination.
             if !dests.contains(&target) {
                 // A new destination costs one mapping per live socket, so
                 // the bound scales the destination count with the pool.
@@ -222,26 +230,25 @@ impl<S: UdpIo> SocketPool<S> {
                 dests.insert(target);
             }
         }
-        let mut remaining = self.budget.load(Ordering::Relaxed);
-        loop {
-            if remaining == 0 {
-                return Err(PunchError::BudgetExhausted);
-            }
-            match self.budget.compare_exchange_weak(
-                remaining,
-                remaining - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => remaining = current,
-            }
+        // Subtraction on an empty budget wraps the counter, so roll the unit back.
+        if self.budget.fetch_sub(1, Ordering::Relaxed) == 0 {
+            self.budget.fetch_add(1, Ordering::Relaxed);
+            return Err(PunchError::BudgetExhausted);
         }
         self.limiter.acquire().await;
-        let sock = self.group_ref(family).get(idx as usize).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "pool index out of range")
-        })?;
-        sock.send_to(buf, target).await?;
+        let sent = match self.group_ref(family).get(idx as usize) {
+            Some(sock) => sock.send_to(buf, target).await,
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pool index out of range",
+            )),
+        };
+        if let Err(err) = sent {
+            // No packet left the host, so the reserved budget unit goes back.
+            self.budget.fetch_add(1, Ordering::Relaxed);
+            // The rate slot stays spent: a token cannot return to the limiter.
+            return Err(PunchError::Io(err));
+        }
         self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -305,7 +312,11 @@ mod tests {
         use std::time::Duration;
 
         let net = crate::sim::Net::seeded("pool_full_channel");
-        let cfg = PunchConfig::default();
+        // The smallest max_sockets holds the scaled capacity at its floor.
+        let cfg = PunchConfig {
+            max_sockets: 64,
+            ..PunchConfig::default()
+        };
         let pool_host = net.public_host();
         let (pool, rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
             .await
@@ -335,5 +346,76 @@ mod tests {
         elected
             .expect("elect returns despite the stuffed channel")
             .expect("winner socket hands over");
+    }
+
+    /// Repeated sends past an exhausted budget must keep failing: a lost
+    /// rollback would wrap the counter to a huge positive value and let
+    /// every later send through.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_budget_stays_exhausted() {
+        let net = crate::sim::Net::seeded("pool_budget_stays_exhausted");
+        let cfg = PunchConfig {
+            packet_budget: 2,
+            ..PunchConfig::default()
+        };
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+
+        for _ in 0..2 {
+            pool.send(Family::V4, 0, b"x", target).await.expect("send");
+        }
+        for _ in 0..10 {
+            assert!(matches!(
+                pool.send(Family::V4, 0, b"x", target).await,
+                Err(PunchError::BudgetExhausted)
+            ));
+        }
+        assert_eq!(pool.sent(), 2);
+        pool.shutdown().await;
+    }
+
+    /// A send that fails after the budget reservation must return its unit,
+    /// so a follow-up valid send still goes out.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn failed_send_refunds_the_budget() {
+        let net = crate::sim::Net::seeded("pool_budget_refund");
+        let cfg = PunchConfig {
+            packet_budget: 1,
+            ..PunchConfig::default()
+        };
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+
+        // The out-of-range index fails after the reservation and refunds.
+        let err = pool.send(Family::V4, 9, b"x", target).await.unwrap_err();
+        assert!(matches!(err, PunchError::Io(_)));
+
+        pool.send(Family::V4, 0, b"x", target)
+            .await
+            .expect("valid send");
+        assert_eq!(pool.sent(), 1);
+
+        // The successful send spent the last unit.
+        assert!(matches!(
+            pool.send(Family::V4, 0, b"x", target).await,
+            Err(PunchError::BudgetExhausted)
+        ));
+        pool.shutdown().await;
     }
 }
