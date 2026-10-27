@@ -530,9 +530,10 @@ pub(crate) struct Engine<S: UdpIo> {
     punch_deadline: tokio::time::Instant,
     stage_idx: usize,
     sweep: usize,
-    /// Set when budget or conntrack errors stopped the sweeps; the confirm
-    /// path keeps running because replies matter more than new pulses.
-    sweep_stalled: bool,
+    /// Set when budget or conntrack errors stopped outbound sends; handshake
+    /// retransmissions keep retrying because replies matter more than new
+    /// pulses.
+    send_stalled: bool,
     /// The session's wall-clock deadline, from the session start.
     overall: tokio::time::Instant,
     candidate: Option<(Family, u16)>,
@@ -576,7 +577,7 @@ impl<S: UdpIo> Engine<S> {
             punch_deadline: overall,
             stage_idx: 0,
             sweep: 0,
-            sweep_stalled: false,
+            send_stalled: false,
             candidate: None,
             confirmed: None,
             announce: None,
@@ -795,6 +796,19 @@ impl<S: UdpIo> Engine<S> {
             && (self.finish_now || self.peer_confirmed || self.grace_end.is_some_and(|g| now >= g))
     }
 
+    /// Routes a handshake send failure.
+    ///
+    /// With no handshake traffic yet there is nothing to keep alive, so the
+    /// session fails fast. Afterwards a working path exists and the grace
+    /// mechanism decides the outcome, so the failure only stops new pulses.
+    fn send_failed(&mut self, err: PunchError) -> Option<PunchError> {
+        if self.first_handshake.is_none() {
+            return Some(err);
+        }
+        self.send_stalled = true;
+        None
+    }
+
     /// Records the peer's data-plane address from a Syn or SynAck.
     ///
     /// After a winner is elected, only its own handshake may move the
@@ -858,7 +872,11 @@ impl<S: UdpIo> Engine<S> {
                     nonce,
                     socket: ev.socket,
                 });
-                pool.send(ev.family, ev.socket, &buf, ev.from).await?;
+                if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
+                    && let Some(e) = self.send_failed(e)
+                {
+                    return Err(e);
+                }
                 self.next_reply = now + self.cfg.confirm_retry;
             },
             DataPacket::SynAck { socket, .. } => {
@@ -874,7 +892,11 @@ impl<S: UdpIo> Engine<S> {
                 };
                 if resend_ack {
                     let buf = encode_packet(&DataPacket::Ack { nonce });
-                    pool.send(ev.family, ev.socket, &buf, ev.from).await?;
+                    if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
+                        && let Some(e) = self.send_failed(e)
+                    {
+                        return Err(e);
+                    }
                     self.next_reply = now + self.cfg.confirm_retry;
                 }
             },
@@ -1008,7 +1030,7 @@ impl<S: UdpIo> Engine<S> {
         let stage = &self.plan.stages[self.stage_idx];
         if !stage.reply_only
             && self.confirmed.is_none()
-            && !self.sweep_stalled
+            && !self.send_stalled
             && let Some(targets) = self.live_targets(stage)
             && !targets.is_empty()
         {
@@ -1039,13 +1061,10 @@ impl<S: UdpIo> Engine<S> {
                     }
                 }
             }
-            if let Some(e) = failure {
-                // With no handshake traffic yet there is nothing to keep
-                // alive, so the session fails fast instead of idling.
-                if self.first_handshake.is_none() {
-                    return Err(e);
-                }
-                self.sweep_stalled = true;
+            if let Some(e) = failure
+                && let Some(e) = self.send_failed(e)
+            {
+                return Err(e);
             }
             self.sweep += 1;
         }
@@ -1060,8 +1079,12 @@ impl<S: UdpIo> Engine<S> {
                     nonce: self.nonce,
                     socket: idx,
                 });
-                pool.send(family, idx, &buf, peer).await?;
-                self.next_reply = now + self.cfg.confirm_retry;
+                // A handshake already ran on this path, so a failed
+                // retransmission waits for a later tick instead of failing
+                // the session.
+                if pool.send(family, idx, &buf, peer).await.is_ok() {
+                    self.next_reply = now + self.cfg.confirm_retry;
+                }
             }
             if let Some((family, idx)) = self.confirmed
                 && self.grace_end.is_some()
@@ -1069,8 +1092,9 @@ impl<S: UdpIo> Engine<S> {
                 && now >= self.next_reply
             {
                 let buf = encode_packet(&DataPacket::Ack { nonce: self.nonce });
-                pool.send(family, idx, &buf, peer).await?;
-                self.next_reply = now + self.cfg.confirm_retry;
+                if pool.send(family, idx, &buf, peer).await.is_ok() {
+                    self.next_reply = now + self.cfg.confirm_retry;
+                }
             }
         }
         Ok(())
@@ -1355,6 +1379,63 @@ mod tests {
         engine.on_ack(addr(50_002), Family::V4, 0, now);
         assert!(engine.finish_now);
         assert_eq!(engine.peer_addr, Some(addr(50_002)));
+    }
+
+    /// A budget that dies after the handshake started must stall the engine
+    /// instead of failing it: the retransmission tick keeps its error and
+    /// the grace mechanism decides the outcome.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn mid_handshake_budget_death_stalls_instead_of_failing() {
+        use std::net::Ipv4Addr;
+
+        use crate::socket::SocketPool;
+        let peer = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), 40000));
+        // Every pool send fails on the budget check before touching a
+        // socket.
+        let cfg = PunchConfig {
+            packet_budget: 0,
+            ..PunchConfig::default()
+        };
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![peer],
+                false,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = crate::sim::Net::seeded("stall_grace");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        // A handshake ran on socket 0 and its retransmission is due. The
+        // pulse buffers normally come from `run`, which this test bypasses.
+        engine.syn_bufs[0] = vec![encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 0,
+        })];
+        let now = tokio::time::Instant::now();
+        engine.observe_peer(3, peer, now, Family::V4, 0);
+        engine.candidate = Some((Family::V4, 0));
+        engine.start = Some(now);
+        engine.next_reply = now;
+
+        engine.on_tick(&pool).await.expect("stall, not an error");
+        assert!(engine.send_stalled, "sends stalled after the failure");
     }
 
     #[test]
