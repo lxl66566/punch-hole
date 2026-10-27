@@ -23,8 +23,9 @@ pub struct PunchReport {
     /// Local port of the winner socket.
     pub winner_local_port: u16,
     /// Pool index of the peer's winner socket, from its packets or its
-    /// Confirmed frame.
-    pub peer_socket: u16,
+    /// Confirmed frame. Engine-local diagnostic with no cross-process
+    /// meaning; `None` when the peer never reported one.
+    pub peer_socket: Option<u16>,
     pub packets_sent: u32,
     pub stale_packets: u32,
     /// The birthday model's estimate, when the strategy is a burst.

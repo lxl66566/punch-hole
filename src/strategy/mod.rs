@@ -498,7 +498,9 @@ pub(crate) struct Outcome {
     pub family: Family,
     pub winner: u16,
     pub peer_addr: SocketAddr,
-    pub peer_socket: u16,
+    /// Engine-local diagnostic index of the peer's winner socket; `None`
+    /// when the peer never reported one.
+    pub peer_socket: Option<u16>,
     pub packets_sent: u32,
     pub stale_packets: u32,
     pub punch_ms: u64,
@@ -778,7 +780,7 @@ impl<S: UdpIo> Engine<S> {
             family,
             winner,
             peer_addr: self.peer_addr.ok_or(PunchError::ConfirmFailed)?,
-            peer_socket: self.peer_socket.unwrap_or(0),
+            peer_socket: self.peer_socket,
             packets_sent: pool.sent(),
             stale_packets: self.stale_packets,
             punch_ms: self
