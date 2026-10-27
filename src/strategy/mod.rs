@@ -8,6 +8,7 @@ mod sym_cone;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV6},
+    sync::Arc,
     time::Duration,
 };
 
@@ -283,15 +284,41 @@ pub(crate) fn burst_len(cfg: &PunchConfig) -> u16 {
     per_tick.ceil().clamp(1.0, f64::from(MAX_BURST)) as u16
 }
 
-/// Distinct random ports over a span, drawn from a shuffled window.
+/// Spans at most this multiple of the count take the full shuffle. The
+/// multiple bounds the wasted allocation on the shuffle side, while past
+/// it the shuffle would pay the whole span for a few dozen ports.
+const SAMPLE_SPAN_MULTIPLE: usize = 8;
+
+/// Distinct random ports over a span.
 ///
-/// Distinct draws carry a model's coverage exactly, so the span is shuffled
-/// and truncated instead of sampled with replacement.
+/// Distinct draws carry a model's coverage exactly, so every path draws
+/// without replacement instead of sampling with replacement. Narrow
+/// spans shuffle the whole range and truncate. Wide spans rejection-
+/// sample straight into a set sized by the count, which drops the cost
+/// from the span, up to 32768, to roughly one draw per port.
 pub(crate) fn distinct_ports(seed: u64, lo: u16, hi: u16, count: usize) -> Vec<u16> {
     use rand::{prelude::*, rngs::StdRng};
-    let mut ports: Vec<u16> = (lo..=hi).collect();
-    ports.shuffle(&mut StdRng::seed_from_u64(seed));
-    ports.truncate(count);
+    if hi < lo || count == 0 {
+        return Vec::new();
+    }
+    let span = usize::from(hi - lo) + 1;
+    let mut rng = StdRng::seed_from_u64(seed);
+    if span <= count.saturating_mul(SAMPLE_SPAN_MULTIPLE) {
+        let mut ports: Vec<u16> = (lo..=hi).collect();
+        ports.shuffle(&mut rng);
+        ports.truncate(count);
+        return ports;
+    }
+    // A wide span redraws a taken port rarely, so rejection costs about
+    // one draw per port. The push order keeps the draw sequence, which
+    // preserves the shuffled path's uniform order.
+    let mut ports: Vec<u16> = Vec::with_capacity(count);
+    while ports.len() < count {
+        let port = rng.random_range(lo..=hi);
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
     ports
 }
 
@@ -556,6 +583,9 @@ pub(crate) struct Engine<S: UdpIo> {
     next_reply: tokio::time::Instant,
     first_handshake: Option<tokio::time::Instant>,
     stale_packets: u32,
+    /// Sweep targets for the active stage, cached with the key they were
+    /// built for: the stage index and the fresh peer port that shaped them.
+    target_cache: Option<(usize, Option<u16>, Arc<Vec<SocketAddr>>)>,
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -595,6 +625,7 @@ impl<S: UdpIo> Engine<S> {
             next_reply: tokio::time::Instant::now(),
             first_handshake: None,
             stale_packets: 0,
+            target_cache: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -961,30 +992,50 @@ impl<S: UdpIo> Engine<S> {
 
     /// Targets for the active stage, honoring the fresh peer port of the
     /// stage's own family.
-    fn live_targets(&self, stage: &StageSpec) -> Option<Vec<SocketAddr>> {
-        if !stage.needs_peer_ports {
-            return Some(stage.targets.clone());
-        }
+    ///
+    /// The vector is rebuilt only when the stage index or that port
+    /// changes, because a BirthdayBurst stage carries hundreds of
+    /// addresses that never move for the stage's lifetime. The shared
+    /// handle outlives the borrow, so the caller can keep sending through
+    /// `&mut self` while holding it.
+    fn live_targets(&mut self) -> Option<Arc<Vec<SocketAddr>>> {
+        let stage = &self.plan.stages[self.stage_idx];
         let port = match stage.family {
-            Family::V4 => self.fresh_peer?.v4?,
-            Family::V6 => self.fresh_peer?.v6?,
+            Family::V4 => self.fresh_peer.and_then(|p| p.v4),
+            Family::V6 => self.fresh_peer.and_then(|p| p.v6),
         };
-        let targets = match stage.family {
-            Family::V4 => vec![SocketAddr::from((self.plan.peer_ip, port))],
-            Family::V6 => self
-                .plan
-                .peer_v6
-                .iter()
-                .map(|addr| {
-                    SocketAddr::V6(SocketAddrV6::new(
-                        *addr.ip(),
-                        port,
-                        addr.flowinfo(),
-                        addr.scope_id(),
-                    ))
-                })
-                .collect(),
+        // Static stages carry no port dependency, so a `None` key covers
+        // them; a peer-port stage without its port never caches below.
+        let key = stage.needs_peer_ports.then_some(port).flatten();
+        if let Some((idx, cached_key, targets)) = &self.target_cache
+            && *idx == self.stage_idx
+            && *cached_key == key
+        {
+            return Some(Arc::clone(targets));
+        }
+        let targets = if stage.needs_peer_ports {
+            let port = port?;
+            match stage.family {
+                Family::V4 => vec![SocketAddr::from((self.plan.peer_ip, port))],
+                Family::V6 => self
+                    .plan
+                    .peer_v6
+                    .iter()
+                    .map(|addr| {
+                        SocketAddr::V6(SocketAddrV6::new(
+                            *addr.ip(),
+                            port,
+                            addr.flowinfo(),
+                            addr.scope_id(),
+                        ))
+                    })
+                    .collect(),
+            }
+        } else {
+            stage.targets.clone()
         };
+        let targets = Arc::new(targets);
+        self.target_cache = Some((self.stage_idx, key, Arc::clone(&targets)));
         Some(targets)
     }
 
@@ -1029,12 +1080,14 @@ impl<S: UdpIo> Engine<S> {
             self.next_announce = now + self.cfg.signaling_retry;
         }
 
-        // Syn pulses.
+        // Syn pulses. The handle is taken before the stage borrow, so the
+        // sends below can work on `&mut self` without fighting it.
+        let targets = self.live_targets();
         let stage = &self.plan.stages[self.stage_idx];
         if !stage.reply_only
             && self.confirmed.is_none()
             && !self.send_stalled
-            && let Some(targets) = self.live_targets(stage)
+            && let Some(targets) = targets
             && !targets.is_empty()
         {
             let group = match stage.family {
@@ -1196,6 +1249,21 @@ mod tests {
     }
 
     #[test]
+    fn wide_spans_sample_distinct_ports_deterministically() {
+        // A span far past the shuffle threshold takes the rejection path.
+        let drawn = distinct_ports(42, 30_000, 40_000, 40);
+        // The same seed repeats the exact sequence.
+        assert_eq!(drawn, distinct_ports(42, 30_000, 40_000, 40));
+        assert!(drawn.iter().all(|p| (30_000..=40_000).contains(p)));
+        let mut sorted = drawn.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), drawn.len());
+        // A count past the span returns the whole span, either path.
+        assert_eq!(distinct_ports(7, 100, 108, 20).len(), 9);
+    }
+
+    #[test]
     fn spray_count_reaches_the_target_when_unclamped() {
         let cfg = PunchConfig::default();
         let (m, space) = (16, 200);
@@ -1270,10 +1338,6 @@ mod tests {
         };
         let mut engine: Engine<crate::sim::SimSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
-        // Minimal stand-ins for the plan stages; target resolution reads
-        // only the family and the peer-port wait flag.
-        let v6_probe = StageSpec::send(Family::V6, 1, Vec::new(), true, Duration::ZERO);
-        let v4_probe = StageSpec::send(Family::V4, 1, Vec::new(), true, Duration::ZERO);
         // One PortUpdate now carries both families' fresh ports.
         engine
             .on_signaling(&Frame::PortUpdate {
@@ -1281,16 +1345,40 @@ mod tests {
                 v6: Some(51000),
             })
             .expect("update applies");
-        let v6 = engine.live_targets(&v6_probe).expect("v6 targets resolve");
-        assert_eq!(v6, vec![SocketAddr::V6(SocketAddrV6::new(
-            [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
-            51000,
-            0,
-            0
-        ))]);
+        engine.stage_idx = 0;
+        let v6 = engine.live_targets().expect("v6 targets resolve");
+        assert_eq!(
+            v6.as_slice(),
+            &[SocketAddr::V6(SocketAddrV6::new(
+                [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+                51000,
+                0,
+                0
+            ))][..]
+        );
         // The V4 stage aims at the peer's V4 port, not its V6 port.
-        let v4 = engine.live_targets(&v4_probe).expect("v4 targets resolve");
-        assert_eq!(v4, vec![SocketAddr::from(([203, 0, 113, 9], 41000))]);
+        engine.stage_idx = 1;
+        let v4 = engine.live_targets().expect("v4 targets resolve");
+        assert_eq!(
+            v4.as_slice(),
+            &[SocketAddr::from(([203, 0, 113, 9], 41000))][..]
+        );
+        // An unchanged key serves the cached vector again.
+        let cached = engine.live_targets().expect("cached targets resolve");
+        assert!(Arc::ptr_eq(&v4, &cached));
+        // A fresh V4 port rebuilds the stage's targets.
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(41_001),
+                v6: None,
+            })
+            .expect("update applies");
+        let rebuilt = engine.live_targets().expect("rebuilt targets resolve");
+        assert_eq!(
+            rebuilt.as_slice(),
+            &[SocketAddr::from(([203, 0, 113, 9], 41_001))][..]
+        );
+        assert!(!Arc::ptr_eq(&v4, &rebuilt));
     }
 
     #[test]
