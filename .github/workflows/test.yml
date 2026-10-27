@@ -36,3 +36,14 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: cargo test
         run: cargo nextest run --all-features --locked --no-tests pass && cargo test --all-features --locked --doc
+
+  msrv:
+    name: cargo check (msrv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      # Keep the pin in sync with rust-version in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.88
+      - name: cargo check
+        run: cargo check --all-targets --all-features --locked

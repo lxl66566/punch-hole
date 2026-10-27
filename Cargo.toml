@@ -2,7 +2,9 @@
 name         = "punch-hole"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+# Let chains in edition 2024 set the real floor; 1.85 cannot compile the
+# crate.
+rust-version = "1.88"
 description  = "Signaling-agnostic UDP hole punching primitives"
 repository   = "https://github.com/lxl66566/punch-hole"
 license      = "MIT OR Apache-2.0"

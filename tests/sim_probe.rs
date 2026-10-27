@@ -150,10 +150,10 @@ async fn pair_hellos(name: &str, spec: NatSpec, servers: usize) -> Vec<NatInfo> 
     let hellos: Arc<Mutex<Vec<NatInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&hellos);
     punch_hole::sim::connect_with(ha, hb, move |frame| {
-        if let Ok(sig) = decode_sig(frame) {
-            if let punch_hole::msg::Frame::Hello(info) = sig.body {
-                sink.lock().expect("hello tap lock").push(info);
-            }
+        if let Ok(sig) = decode_sig(frame)
+            && let punch_hole::msg::Frame::Hello(info) = sig.body
+        {
+            sink.lock().expect("hello tap lock").push(info);
         }
         Some(frame.to_vec())
     });

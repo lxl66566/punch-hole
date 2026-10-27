@@ -119,11 +119,11 @@ impl SigIo {
                     return Err(PunchError::VersionMismatch { local, peer })
                 },
             };
-            if frame.echo != 0 {
-                if let Some(pos) = self.in_flight.iter().rposition(|(ts, _)| *ts == frame.echo) {
-                    let (_, sent) = self.in_flight.remove(pos).expect("position just found");
-                    self.rtt = Some(sent.elapsed());
-                }
+            if frame.echo != 0
+                && let Some(pos) = self.in_flight.iter().rposition(|(ts, _)| *ts == frame.echo)
+            {
+                let (_, sent) = self.in_flight.remove(pos).expect("position just found");
+                self.rtt = Some(sent.elapsed());
             }
             self.last_peer_ts = frame.ts;
             return Ok(frame);
