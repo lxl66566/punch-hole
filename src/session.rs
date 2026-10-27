@@ -380,7 +380,6 @@ fn elapsed_ms(t: Instant) -> u64 {
 /// `Hello` always fits a signaling frame whatever the host cached.
 fn clamp_nat_info(mut nat: NatInfo) -> NatInfo {
     if let Some(v4) = &mut nat.v4 {
-        v4.pub_ips.truncate(crate::msg::MAX_PUB_IPS);
         v4.alloc_seq.truncate(crate::msg::MAX_ALLOC_SEQ);
     }
     if let Some(v6) = &mut nat.v6 {
@@ -424,7 +423,6 @@ mod tests {
             v4: Some(V4Nat {
                 class: NatClass::EasySym { step: 2 },
                 reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 40001),
-                pub_ips: vec![Ipv4Addr::LOCALHOST; crate::msg::MAX_PUB_IPS * 2],
                 alloc_seq: vec![40001; crate::msg::MAX_ALLOC_SEQ * 2],
                 filtering: FilterClass::Unknown,
             }),
@@ -437,7 +435,6 @@ mod tests {
         };
         let clamped = clamp_nat_info(nat);
         let v4 = clamped.v4.expect("v4 survives the clamp");
-        assert_eq!(v4.pub_ips.len(), crate::msg::MAX_PUB_IPS);
         assert_eq!(v4.alloc_seq.len(), crate::msg::MAX_ALLOC_SEQ);
         assert_eq!(
             clamped.v6.expect("v6 survives the clamp").addrs.len(),

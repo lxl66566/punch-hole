@@ -108,7 +108,6 @@ async fn cached_nat_info_skips_probe() {
         v4: Some(V4Nat {
             class: NatClass::Cone,
             reflexive: SocketAddrV4::new([100, 64, 2, 1].into(), 40000),
-            pub_ips: vec![[100, 64, 2, 1].into()],
             alloc_seq: vec![40000, 40000, 40000, 40000],
             filtering: punch_hole::FilterClass::Unknown,
         }),
@@ -288,10 +287,6 @@ async fn two_stun_servers_double_the_samples() {
         assert_eq!(v4.class, NatClass::EasySym { step: 1 });
         // Send order equals allocation order, so the ports walk +1.
         assert!(v4.alloc_seq.windows(2).all(|w| w[1] == w[0] + 1));
-        // One NAT means one public IP, and the first entry matches the
-        // reflexive address.
-        assert_eq!(v4.pub_ips.len(), 1);
-        assert_eq!(v4.pub_ips[0], *v4.reflexive.ip());
     }
 }
 

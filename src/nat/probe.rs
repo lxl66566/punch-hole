@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::{
     config::PunchConfig,
     error::{Phase, PunchError},
-    msg::{MAX_ALLOC_SEQ, MAX_PUB_IPS, MAX_V6_ADDRS},
+    msg::{MAX_ALLOC_SEQ, MAX_V6_ADDRS},
     nat::{FilterClass, NatInfo, V4Nat, V6Nat, classify},
     socket::{Family, UdpFactory, UdpIo},
 };
@@ -86,7 +86,6 @@ pub(crate) async fn probe<F: UdpFactory>(
             reflexive.port(),
         ),
         alloc_seq: observed.iter().map(|&(_, port)| port).collect(),
-        pub_ips: collect_pub_ips(&round.slots),
         filtering,
     };
 
@@ -207,11 +206,12 @@ impl Fanout {
     /// dropped too.
     fn absorb(&mut self, buf: &[u8], from: SocketAddr) {
         for (idx, (slot, txid)) in self.slots.iter_mut().zip(&self.txids).enumerate() {
-            if slot.is_none() && from == self.dests[idx] {
-                if let Some(addr) = parse_mapped(buf, txid) {
-                    *slot = Some(addr);
-                    break;
-                }
+            if slot.is_none()
+                && from == self.dests[idx]
+                && let Some(addr) = parse_mapped(buf, txid)
+            {
+                *slot = Some(addr);
+                break;
             }
         }
     }
@@ -233,26 +233,6 @@ impl Fanout {
             .filter_map(|(idx, slot)| slot.map(|addr| (idx, addr.port())))
             .collect()
     }
-}
-
-/// Collects the distinct public IPv4 addresses of the answers, in send
-/// order, capped at `MAX_PUB_IPS`.
-///
-/// The first answered sample leads, so the first entry is the address the
-/// reflexive field reports.
-fn collect_pub_ips(slots: &[Option<SocketAddr>]) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    for addr in slots.iter().flatten() {
-        if let IpAddr::V4(ip) = addr.ip()
-            && !out.contains(&ip)
-        {
-            out.push(ip);
-            if out.len() == MAX_PUB_IPS {
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// A socket is public when its reflexive address is its own address.
@@ -511,32 +491,5 @@ mod tests {
         resp[2..4].copy_from_slice(&msg_len.to_be_bytes());
         let parsed = parse_mapped(&resp, &txid).expect("trailing attribute parses");
         assert_eq!(parsed.port(), 5010);
-    }
-
-    #[test]
-    fn public_ips_stay_distinct_in_send_order() {
-        let answer =
-            |ip: [u8; 4], port: u16| Some(SocketAddr::V4(SocketAddrV4::new(ip.into(), port)));
-        // A multi-homed path answers through several NATs; one slot stays
-        // silent and one address repeats.
-        let slots = vec![
-            answer([203, 0, 113, 7], 5000),
-            None,
-            answer([198, 51, 100, 4], 5001),
-            answer([203, 0, 113, 7], 5002),
-            answer([192, 0, 2, 9], 5003),
-            answer([198, 18, 0, 2], 5004),
-            answer([203, 0, 113, 99], 5005),
-        ];
-        // Distinct addresses in send order, capped at MAX_PUB_IPS, first
-        // entry from the first answered slot.
-        assert_eq!(collect_pub_ips(&slots), vec![
-            Ipv4Addr::new(203, 0, 113, 7),
-            Ipv4Addr::new(198, 51, 100, 4),
-            Ipv4Addr::new(192, 0, 2, 9),
-            Ipv4Addr::new(198, 18, 0, 2),
-        ]);
-        // An all-silent fan-out reports no addresses.
-        assert_eq!(collect_pub_ips(&[None]), Vec::<Ipv4Addr>::new());
     }
 }

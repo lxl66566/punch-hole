@@ -4,7 +4,7 @@ pub mod classify;
 pub mod predict;
 pub mod probe;
 
-use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddrV4, SocketAddrV6};
 
 pub use predict::PortPredictor;
 use serde::{Deserialize, Serialize};
@@ -51,10 +51,6 @@ pub struct V4Nat {
     pub class: NatClass,
     /// The primary reflexive address.
     pub reflexive: SocketAddrV4,
-    /// Distinct public IPv4 addresses across the probe answers, in send
-    /// order. The first entry is the address `reflexive` reports. Capped at
-    /// 4 entries.
-    pub pub_ips: Vec<Ipv4Addr>,
     /// External ports observed at the NAT, in send order. Capped at 64 entries.
     pub alloc_seq: Vec<u16>,
     /// Inbound filtering evidence. A probe runs no filtering test, so its
