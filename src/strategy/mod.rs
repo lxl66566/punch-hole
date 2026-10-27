@@ -7,6 +7,7 @@ mod easy_sym;
 mod sym_cone;
 
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
     time::Duration,
@@ -544,6 +545,14 @@ struct StunPending {
     attempts_left: u8,
 }
 
+/// Upper bound on the Syn sources the engine tracks for reply gating.
+///
+/// An attacker holding the nonce can spoof fresh sources without limit,
+/// so the map stays capped: past the bound, new sources wait for the
+/// current window instead of claiming memory. Honest traffic stays far
+/// below it, because real keys scale with both sides' socket counts.
+const MAX_SYN_REPLY_KEYS: usize = 1024;
+
 /// Drives one side through the Punch and Confirm phases.
 ///
 /// The engine is a single task fed by three streams: pool receive events,
@@ -582,6 +591,9 @@ pub(crate) struct Engine<S: UdpIo> {
     grace_end: Option<tokio::time::Instant>,
     next_reply: tokio::time::Instant,
     first_handshake: Option<tokio::time::Instant>,
+    /// Syn sources already answered, mapped to the instant their window
+    /// ends. Keyed by receiving socket and source address.
+    syn_replies: HashMap<(u16, SocketAddr), tokio::time::Instant>,
     stale_packets: u32,
     /// Sweep targets for the active stage, cached with the key they were
     /// built for: the stage index and the fresh peer port that shaped them.
@@ -624,6 +636,7 @@ impl<S: UdpIo> Engine<S> {
             grace_end: None,
             next_reply: tokio::time::Instant::now(),
             first_handshake: None,
+            syn_replies: HashMap::new(),
             stale_packets: 0,
             target_cache: None,
             _marker: std::marker::PhantomData,
@@ -871,6 +884,30 @@ impl<S: UdpIo> Engine<S> {
         self.peer_addr = Some(from);
     }
 
+    /// Whether this Syn still earns a direct SynAck.
+    ///
+    /// One reply per confirm window covers the peer, because the
+    /// retransmission tick repeats the SynAck on that same cadence for a
+    /// live candidate.
+    fn syn_reply_due(&mut self, socket: u16, from: SocketAddr, now: tokio::time::Instant) -> bool {
+        let key = (socket, from);
+        if let Some(&mute_until) = self.syn_replies.get(&key)
+            && now < mute_until
+        {
+            return false;
+        }
+        if self.syn_replies.len() >= MAX_SYN_REPLY_KEYS {
+            // Expired keys leave first; a still-full map leaves fresh
+            // keys unanswered until the window passes.
+            self.syn_replies.retain(|_, &mut until| until > now);
+            if self.syn_replies.len() >= MAX_SYN_REPLY_KEYS {
+                return false;
+            }
+        }
+        self.syn_replies.insert(key, now + self.cfg.confirm_retry);
+        true
+    }
+
     async fn on_data(
         &mut self,
         pool: &SocketPool<S>,
@@ -900,18 +937,22 @@ impl<S: UdpIo> Engine<S> {
         match pkt {
             DataPacket::Keepalive { .. } => {},
             DataPacket::Syn { socket, .. } => {
+                // Peer state refreshes on every Syn, duplicates included;
+                // only the reply is gated.
                 self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
                 self.candidate.get_or_insert((ev.family, ev.socket));
-                let buf = encode_packet(&DataPacket::SynAck {
-                    nonce,
-                    socket: ev.socket,
-                });
-                if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
-                    && let Some(e) = self.send_failed(e)
-                {
-                    return Err(e);
+                if self.syn_reply_due(ev.socket, ev.from, now) {
+                    let buf = encode_packet(&DataPacket::SynAck {
+                        nonce,
+                        socket: ev.socket,
+                    });
+                    if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
+                        && let Some(e) = self.send_failed(e)
+                    {
+                        return Err(e);
+                    }
+                    self.next_reply = now + self.cfg.confirm_retry;
                 }
-                self.next_reply = now + self.cfg.confirm_retry;
             },
             DataPacket::SynAck { socket, .. } => {
                 self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
@@ -1619,6 +1660,86 @@ mod tests {
             .expect("querying socket accepts the answer");
         assert!(engine.stun.is_none(), "the query completed");
         assert_eq!(engine.own_ports.map(|ports| ports.v4), Some(Some(41_002)));
+    }
+
+    /// Duplicate Syns share one SynAck per confirm window, so a flood
+    /// cannot drain the reply budget; a second source still gets answered
+    /// inside the same window, and the window passing re-arms a source.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_syns_share_one_reply_per_window() {
+        use crate::socket::{RecvEvent, SocketPool};
+
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::reply(Family::V4, cfg.punch_timeout)],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = crate::sim::Net::seeded("syn_reply_gate");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let syn = encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 4,
+        });
+        let event = |from: SocketAddr| {
+            let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+            buf[..syn.len()].copy_from_slice(&syn);
+            RecvEvent {
+                family: Family::V4,
+                socket: 0,
+                from,
+                len: syn.len(),
+                buf,
+            }
+        };
+        let a = SocketAddr::from(([203, 0, 113, 9], 50_001));
+        let b = SocketAddr::from(([203, 0, 113, 9], 50_002));
+
+        engine
+            .on_data(&pool, event(a))
+            .await
+            .expect("first syn answers");
+        let sent = pool.sent();
+        // Duplicates inside the window stay silent but still refresh the
+        // peer state.
+        for _ in 0..4 {
+            engine
+                .on_data(&pool, event(a))
+                .await
+                .expect("duplicate syn");
+        }
+        assert_eq!(pool.sent(), sent);
+        assert_eq!(engine.peer_addr, Some(a));
+        assert_eq!(engine.candidate, Some((Family::V4, 0)));
+
+        // A second distinct source earns its own reply inside the window.
+        engine
+            .on_data(&pool, event(b))
+            .await
+            .expect("second source answers");
+        assert_eq!(pool.sent(), sent + 1);
+
+        // The window passing re-arms the first source.
+        tokio::time::advance(cfg.confirm_retry).await;
+        engine
+            .on_data(&pool, event(a))
+            .await
+            .expect("re-armed syn answers");
+        assert_eq!(pool.sent(), sent + 2);
     }
 
     #[test]
