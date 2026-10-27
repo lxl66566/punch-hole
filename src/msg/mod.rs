@@ -40,7 +40,6 @@ pub fn new_nonce() -> Nonce {
 /// The punching algorithm the Initiator picked for an attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyId {
-    Direct,
     ConeExchange,
     SymProbe,
     PredictiveExchange,

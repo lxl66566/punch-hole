@@ -454,7 +454,6 @@ pub(crate) fn build_plan(
                 cfg,
             ));
         },
-        StrategyId::Direct => {},
     }
     // A peer without any usable address leaves the plan empty; bind one idle
     // socket so the engine still runs and fails on its deadline.
