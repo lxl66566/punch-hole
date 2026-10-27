@@ -34,15 +34,53 @@ use crate::{
     socket::{UdpFactory, UdpIo},
 };
 
-/// Labs draw public addresses from one global space: 127.hi.lo.1.
+/// Lab addresses drawn in this process: 127.hi.lo.1.
+static LAB_IPS: StdMutex<Vec<Ipv4Addr>> = StdMutex::new(Vec::new());
+/// Responder addresses drawn in this process: 127.50.hi.lo.
+static STUN_IPS: StdMutex<Vec<Ipv4Addr>> = StdMutex::new(Vec::new());
+
+/// Draws one fresh address for this process from `taken`.
 ///
-/// The counter starts at one, because 127.0.0.1 is the busy loopback
-/// address every other test binds.
-static LAB_IP_COUNTER: AtomicU32 = AtomicU32::new(1);
-/// STUN responders draw from a disjoint space: 127.50.hi.lo.
-///
-/// A lab reaches octet 50 only after 12_800 spawns, far past any test.
-static STUN_IP_COUNTER: AtomicU32 = AtomicU32::new(1);
+/// A process-global counter cannot keep test runners apart: cargo-nextest
+/// runs every test in its own process, and all counters would start at the
+/// same address. The draw reads OS entropy instead. A twin process that
+/// holds the drawn address surfaces as a bind failure, which the callers
+/// retry with a fresh draw.
+fn draw_ip(
+    taken: &StdMutex<Vec<Ipv4Addr>>,
+    make: impl Fn(u16) -> Option<Ipv4Addr>,
+) -> io::Result<Ipv4Addr> {
+    let mut taken = taken.lock().expect("address draw lock");
+    for _ in 0..32 {
+        let n: u16 = rand::random();
+        let Some(ip) = make(n) else {
+            continue;
+        };
+        if !taken.contains(&ip) {
+            taken.push(ip);
+            return Ok(ip);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no loopback address left to draw",
+    ))
+}
+
+/// One lab address. Octet one skips the responder space, and zero would
+/// redraw the busy 127.0.0.1.
+fn draw_lab_ip() -> io::Result<Ipv4Addr> {
+    draw_ip(&LAB_IPS, |n| {
+        (n != 0 && (n >> 8) != 50).then(|| Ipv4Addr::new(127, (n >> 8) as u8, (n & 0xff) as u8, 1))
+    })
+}
+
+/// One responder address from the space no lab draws.
+fn draw_stun_ip() -> io::Result<Ipv4Addr> {
+    draw_ip(&STUN_IPS, |n| {
+        Some(Ipv4Addr::new(127, 50, (n >> 8) as u8, (n & 0xff) as u8))
+    })
+}
 
 /// Frame tag of a client datagram on its way out.
 const TAG_OUT: u8 = 1;
@@ -120,8 +158,7 @@ impl NatLab {
     /// The gateway binds and the port window settles before the call
     /// returns, so a failed spawn leaves nothing behind.
     pub async fn spawn(seed: &str, spec: NatSpec) -> io::Result<Self> {
-        let public_ip = next_lab_ip();
-        let window = discover_window(public_ip, &spec.port_range)?;
+        let (public_ip, window) = settle_address(&spec)?;
         let gateway = Arc::new(UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await?);
         let inner = Arc::new(LabInner {
             spec,
@@ -214,6 +251,22 @@ impl NatLab {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Draws one lab address together with its bindable port window.
+///
+/// A twin process that squats the drawn address leaves no bindable port,
+/// so discovery repeats over fresh addresses.
+fn settle_address(spec: &NatSpec) -> io::Result<(Ipv4Addr, Range<u16>)> {
+    let mut last = None;
+    for _ in 0..8 {
+        let ip = draw_lab_ip()?;
+        match discover_window(ip, &spec.port_range) {
+            Ok(window) => return Ok((ip, window)),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("eight draws all failed"))
 }
 
 /// Collects (private, external) pairs of every live mapping.
@@ -674,16 +727,6 @@ fn seeded_rng(seed: &str) -> StdRng {
     StdRng::seed_from_u64(hasher.finish())
 }
 
-fn next_lab_ip() -> Ipv4Addr {
-    let n = LAB_IP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ipv4Addr::new(127, (n >> 8) as u8, (n & 0xff) as u8, 1)
-}
-
-fn next_stun_ip() -> Ipv4Addr {
-    let n = STUN_IP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ipv4Addr::new(127, 50, (n >> 8) as u8, (n & 0xff) as u8)
-}
-
 /// Handle of the lab STUN responder.
 pub struct StunServer {
     /// `host:port` strings for `PunchConfig::stun_servers`.
@@ -696,14 +739,25 @@ pub struct StunServer {
 /// the v4 XOR-MAPPED address of the datagram's source. Four destinations
 /// is what classification needs for a confident EasySym fit.
 pub fn stun_responder() -> io::Result<StunServer> {
-    let ip = next_stun_ip();
-    let mut addrs = Vec::new();
-    for port in 3478..=3481 {
-        let sock = bind_public(ip, port)?;
-        tokio::spawn(stun_loop(sock));
-        addrs.push(format!("{ip}:{port}"));
+    // Every port must bind; a twin process that holds one of them draws a
+    // fresh address.
+    for _ in 0..16 {
+        let ip = draw_stun_ip()?;
+        let mut sockets = Vec::with_capacity(4);
+        let bound =
+            (3478..=3481).all(|port| bind_public(ip, port).map(|s| sockets.push(s)).is_ok());
+        if bound {
+            for sock in sockets {
+                tokio::spawn(stun_loop(sock));
+            }
+            let addrs = (3478..=3481).map(|port| format!("{ip}:{port}")).collect();
+            return Ok(StunServer { addrs });
+        }
     }
-    Ok(StunServer { addrs })
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no responder address binds",
+    ))
 }
 
 /// Answers binding requests on one STUN socket.
