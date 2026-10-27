@@ -110,21 +110,35 @@ impl<F: UdpFactory> PunchSession<F> {
         };
         let probe_ms = elapsed_ms(t);
 
-        // Exchange: both sides publish their evidence.
+        // Exchange: both sides publish their evidence. The window opens when
+        // the phase starts, so a slow Probe leaves the full budget here.
         let t = Instant::now();
-        let exchange_deadline = total_start + self.config.exchange_timeout;
+        let exchange_deadline = t + self.config.exchange_timeout;
         let peer = self
             .exchange(role, &mine, exchange_deadline.min(overall))
             .await?;
         let exchange_ms = elapsed_ms(t);
 
         // Negotiate, then align both engines on the shared Accept event.
+        // The window opens at session start and stays inside the overall wall.
         let t = Instant::now();
+        let negotiate_deadline = (total_start + self.config.negotiate_timeout).min(overall);
         let (nonce, sel, engine_start) = match role {
-            Role::Initiator => self.negotiate_initiator(&mine, &peer, overall).await?,
-            Role::Responder => self.negotiate_responder(&mine, &peer, overall).await?,
+            Role::Initiator => {
+                self.negotiate_initiator(&mine, &peer, negotiate_deadline)
+                    .await?
+            },
+            Role::Responder => {
+                self.negotiate_responder(&mine, &peer, negotiate_deadline)
+                    .await?
+            },
         };
         let negotiate_ms = elapsed_ms(t);
+
+        // DNS for the refresh query depends on nothing from the negotiation,
+        // so it resolves before the aligned sleep; a lookup that ran after
+        // the shared start would shift this side's pulses by its own latency.
+        let refresh_server = first_stun_addr(&self.config).await;
 
         tokio::time::sleep_until(engine_start).await;
 
@@ -133,7 +147,6 @@ impl<F: UdpFactory> PunchSession<F> {
             Role::Initiator => sel.initiator_sockets,
             Role::Responder => sel.responder_sockets,
         };
-        let refresh_server = first_stun_addr(&self.config).await;
         let plan = strategy::build_plan(
             &mine,
             &peer,
@@ -332,10 +345,17 @@ fn clamp_nat_info(mut nat: NatInfo) -> NatInfo {
 }
 
 /// The first configured STUN server as a socket address, for refresh
-/// queries. Literal addresses resolve without any network access.
+/// queries. Literal addresses resolve without any network access. Each
+/// lookup runs under its own short budget, so a hung resolver cannot stall
+/// the phase.
 async fn first_stun_addr(cfg: &PunchConfig) -> Option<SocketAddr> {
+    let per_lookup = cfg.probe_timeout.min(Duration::from_secs(2));
     for server in &cfg.stun_servers {
-        if let Ok(list) = tokio::net::lookup_host(server).await {
+        let lookup = tokio::net::lookup_host(server);
+        let Ok(list) = tokio::time::timeout(per_lookup, lookup).await else {
+            continue;
+        };
+        if let Ok(list) = list {
             for addr in list {
                 if addr.is_ipv4() {
                     return Some(addr);

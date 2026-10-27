@@ -9,7 +9,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use common::config;
 use punch_hole::{
     FilterClass, PunchConfig, Puncher,
-    error::PunchError,
+    error::{Phase, PunchError},
     msg::{DataPacket, Frame, encode_packet},
     sim::{Mapping, NatSpec, Net},
     socket::{UdpFactory, UdpIo},
@@ -132,6 +132,48 @@ async fn lossy_bridge_still_completes() {
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
     ra.expect("initiator succeeds through loss");
     rb.expect("responder succeeds through loss");
+}
+
+/// Negotiate must fail on its own deadline, with the overall wall only as a
+/// ceiling, so a peer that never answers cannot stretch the phase.
+#[tokio::test(start_paused = true)]
+async fn negotiate_deadline_is_not_the_overall_wall() {
+    let net = Net::seeded("negotiate_deadline");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_eif());
+    let b = net.host(NatSpec::cone_eif());
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // Hellos cross so Exchange completes; every later frame is dropped, so
+    // both sides wait for a peer that never confirms.
+    punch_hole::sim::connect_with(ha, hb, |frame| {
+        let hello =
+            punch_hole::msg::decode_sig(frame).is_ok_and(|f| matches!(f.body, Frame::Hello(_)));
+        hello.then(|| frame.to_vec())
+    });
+
+    let mut cfg = config(&stun);
+    cfg.negotiate_timeout = Duration::from_secs(1);
+    let t0 = tokio::time::Instant::now();
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+
+    for r in [ra, rb] {
+        assert!(
+            matches!(
+                r,
+                Err(PunchError::Timeout {
+                    phase: Phase::Negotiate
+                })
+            ),
+            "got {r:?}"
+        );
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "negotiate ends on its own deadline, not the overall wall"
+    );
 }
 
 #[tokio::test(start_paused = true)]
