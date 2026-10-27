@@ -845,9 +845,11 @@ impl<S: UdpIo> Engine<S> {
         pool: &SocketPool<S>,
         ev: crate::socket::RecvEvent,
     ) -> Result<(), PunchError> {
-        // A pending refresh query collects its answer first.
+        // A pending refresh query collects its answer first: the answer must
+        // come from the queried server onto the socket that sent the query.
         if let Some(pending) = &self.stun
             && ev.from == pending.server
+            && ev.socket == pending.socket
         {
             if let Some(addr) = crate::nat::probe::parse_mapped(&ev.buf[..ev.len], &pending.txid) {
                 self.refresh_answered(addr.port());
@@ -1437,6 +1439,98 @@ mod tests {
 
         engine.on_tick(&pool).await.expect("stall, not an error");
         assert!(engine.send_stalled, "sends stalled after the failure");
+    }
+
+    /// A binding response for the pending refresh only counts when it lands
+    /// on the socket that sent the query; the same bytes on another socket
+    /// answer nothing.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn refresh_answer_only_counts_on_the_querying_socket() {
+        use crate::socket::{RecvEvent, SocketPool};
+
+        /// One binding response reporting `port` for `txid`.
+        fn binding_response(txid: [u8; 12], port: u16) -> Vec<u8> {
+            let cookie = 0x2112_a442u32.to_be_bytes();
+            let mut attr = vec![0x00, 0x01];
+            attr.extend_from_slice(&(port ^ 0x2112).to_be_bytes());
+            let xip: Vec<u8> = [203u8, 0, 113, 30]
+                .iter()
+                .zip(cookie)
+                .map(|(b, k)| b ^ k)
+                .collect();
+            attr.extend_from_slice(&xip);
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&0x0101u16.to_be_bytes());
+            // The length covers the cookie, transaction id, and attribute.
+            let body_len = u16::try_from(4 + 12 + 4 + attr.len()).expect("fits a test message");
+            resp.extend_from_slice(&body_len.to_be_bytes());
+            resp.extend_from_slice(&cookie);
+            resp.extend_from_slice(&txid);
+            resp.extend_from_slice(&0x0020u16.to_be_bytes());
+            resp.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&attr);
+            resp
+        }
+
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::reply(Family::V4, cfg.punch_timeout)],
+            refresh_v4: Refresh::Stun,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let server = SocketAddr::from(([203, 0, 113, 30], 3478));
+        let txid = [7u8; 12];
+        engine.stun = Some(StunPending {
+            txid,
+            request: Vec::new(),
+            socket: 0,
+            server,
+            next_retry: tokio::time::Instant::now(),
+            attempts_left: 4,
+        });
+        let net = crate::sim::Net::seeded("refresh_socket_guard");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 2, 0)
+            .await
+            .expect("pool binds");
+        let resp = binding_response(txid, 41_002);
+        let event = |socket: u16| {
+            let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+            buf[..resp.len()].copy_from_slice(&resp);
+            RecvEvent {
+                family: Family::V4,
+                socket,
+                from: server,
+                len: resp.len(),
+                buf,
+            }
+        };
+
+        // The answer on socket 1 matches no query and changes nothing.
+        engine
+            .on_data(&pool, event(1))
+            .await
+            .expect("wrong-socket answer is ignored");
+        assert!(engine.stun.is_some(), "the query stays pending");
+        assert!(engine.own_ports.is_none(), "no port was announced");
+
+        // The same answer on socket 0 completes the refresh.
+        engine
+            .on_data(&pool, event(0))
+            .await
+            .expect("querying socket accepts the answer");
+        assert!(engine.stun.is_none(), "the query completed");
+        assert_eq!(engine.own_ports.map(|ports| ports.v4), Some(Some(41_002)));
     }
 
     #[test]
