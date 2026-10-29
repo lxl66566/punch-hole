@@ -6,6 +6,8 @@ The Probe phase collects the facts every later decision reads. One socket asks e
 
 The prober resolves every configured server and keeps every resolved address as a destination, so one hostname with several records contributes one destination per record. Duplicates collapse, so one destination means one mapping. All destinations share one UDP socket, and the prober fires one STUN binding request at each in a single fan-out round.
 
+The binding subset follows RFC 5389 and later: requests carry the magic cookie, and only an XOR-MAPPED-ADDRESS answer parses, so an RFC 3489-only server reads as silence. Answers longer than one kilobyte arrive truncated and their mapped attribute, when it lives past the cap, goes unread the same way.
+
 Each request carries its own transaction id, and each answer fills the slot of the destination it belongs to. The slots record send order, whatever the arrival order was. Send order is allocation order only among the requests that reached the NAT, so the prober tracks two faults a retry round can hide: a destination whose sends all failed locally never allocated, and a first request lost on the uplink leaves its allocation to the retry, which runs after every first-round allocation. When the answers at their send positions hold no constant step, the fit re-reads the retry-round answers as late allocations before it gives up, so a single lost request keeps an `EasySym` reading instead of turning into `HardSym`. A destination that answers never the less leaves nothing behind; a silent one leaves a hole: an allocation whose port nobody reported.
 
 The whole phase ends by `probe_timeout`, three seconds by default. The first round waits half the budget and the retry round waits until the deadline. A short IPv6 pass collects global addresses inside what remains.
@@ -42,7 +44,7 @@ The port sequence measures mapping. Filtering stays unmeasured: telling endpoint
 
 ## IPv6
 
-The IPv6 pass collects up to eight global addresses through the same STUN servers. A global address needs no translation, so any address in the list is a direct candidate, and the NAT question stays open for IPv4 only.
+The IPv6 pass collects up to eight global addresses through the same STUN servers. A global address needs no translation, so any address in the list is a direct candidate, and the NAT question stays open for IPv4 only. Answers that name no reachable peer — an IPv4-mapped reflexive address from a dual-stack server, an unspecified, link-local, or multicast one — drop out at collection; loopback stays in so tests can stand it in for a global address.
 
 ## Caching
 

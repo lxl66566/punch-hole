@@ -250,14 +250,11 @@ fn is_symmetric(class: NatClass) -> bool {
 
 /// Whether a peer-signaled IPv6 address can carry punch traffic.
 ///
-/// Multicast, link-local, IPv4-mapped, and unspecified addresses cannot be
-/// a global peer. Loopback stays allowed: the smoke tests run the Direct
-/// stage over the IPv6 loopback.
+/// The shared `nat::usable_v6` predicate also governs the probe's own v6
+/// collection, so an address this filter admits is the same kind of
+/// address a probe would have collected.
 fn usable_peer_v6(ip: Ipv6Addr) -> bool {
-    !ip.is_multicast()
-        && !ip.is_unicast_link_local()
-        && !ip.is_unspecified()
-        && ip.to_ipv4_mapped().is_none()
+    crate::nat::usable_v6(ip)
 }
 
 /// Widening multiplier on the unbiased per-side extension of a span.

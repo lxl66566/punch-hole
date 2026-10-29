@@ -8,7 +8,7 @@
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     time::Duration,
 };
 
@@ -129,17 +129,24 @@ async fn probe_v6<F: UdpFactory>(
     let mut round = Fanout::new(servers.into_iter().take(MAX_V6_ADDRS).collect());
     round.send_pending(&socket).await;
     round.collect(&socket, until).await;
-    // A V4 answer on the v6 socket carries no IPv6 address.
-    let addrs: Vec<_> = round
-        .slots
+    let addrs = global_v6(&round.slots);
+    (!addrs.is_empty()).then_some(V6Nat { addrs })
+}
+
+/// The usable addresses among one fan-out's answers.
+///
+/// A V4 answer on the v6 socket carries no IPv6 address, and a non-global
+/// v6 answer — an IPv4-mapped reflexive address under a dual-stack server,
+/// an unspecified one — names no peer the Direct stage could reach.
+fn global_v6(slots: &[Option<SocketAddr>]) -> Vec<SocketAddrV6> {
+    slots
         .iter()
         .flatten()
         .filter_map(|addr| match addr {
-            SocketAddr::V6(addr) => Some(*addr),
-            SocketAddr::V4(_) => None,
+            SocketAddr::V6(addr) if super::usable_v6(*addr.ip()) => Some(*addr),
+            _ => None,
         })
-        .collect();
-    (!addrs.is_empty()).then_some(V6Nat { addrs })
+        .collect()
 }
 
 /// One round set of binding queries over one socket.
@@ -214,6 +221,11 @@ impl Fanout {
         while self.pending() > 0 {
             // Servers prepend their own attributes ahead of XOR-MAPPED, so
             // the buffer leaves room beyond the minimal binding response.
+            // The cap is 1024 bytes: a longer datagram arrives truncated,
+            // the parser bounds its attribute scan by the received bytes,
+            // and an XOR-MAPPED-ADDRESS living past the cap goes unread,
+            // which counts that server as silent. Binding responses that
+            // keep the mapped attribute inside a kilobyte are the norm.
             let mut buf = [0u8; 1024];
             // A deadline miss or a socket error ends the round; whatever
             // answered so far stands.
@@ -398,6 +410,13 @@ pub(crate) fn binding_request(txid: &[u8; 12]) -> Vec<u8> {
 }
 
 /// Parses a binding response with a matching transaction id.
+///
+/// The wire subset is RFC 5389 and RFC 8489: the response must carry the
+/// magic cookie, and only an XOR-MAPPED-ADDRESS attribute yields an
+/// address. RFC 3489 servers — no cookie, MAPPED-ADDRESS in the clear —
+/// are deliberately unsupported: 3489 is historic and the servers a host
+/// configures speak 5389+, so a 3489-only answer fails the cookie check
+/// and counts as silence.
 pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
     if buf.len() < 20 {
         return None;
@@ -440,12 +459,7 @@ pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
                         };
                         *b = body[4 + j] ^ key;
                     }
-                    Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                        ip.into(),
-                        xport,
-                        0,
-                        0,
-                    )))
+                    Some(SocketAddr::V6(SocketAddrV6::new(ip.into(), xport, 0, 0)))
                 },
                 _ => None,
             };
@@ -683,5 +697,34 @@ mod tests {
         resp[2..4].copy_from_slice(&msg_len.to_be_bytes());
         let parsed = parse_mapped(&resp, &txid).expect("trailing attribute parses");
         assert_eq!(parsed.port(), 5010);
+    }
+
+    /// A dual-stack server can answer the v6 fan-out with an IPv4-mapped
+    /// reflexive address; the collection keeps the global addresses only,
+    /// the same predicate the peer's advertised list passes at target
+    /// build.
+    #[test]
+    fn v6_collection_keeps_global_addresses_only() {
+        let v6 = |ip: std::net::Ipv6Addr| SocketAddr::V6(SocketAddrV6::new(ip, 9999, 0, 0));
+        let slots = vec![
+            Some(v6("2001:db8::1".parse().expect("global address"))),
+            Some(v6("::ffff:203.0.113.9".parse().expect("mapped address"))),
+            Some(v6("::".parse().expect("unspecified address"))),
+            Some(v6("fe80::1".parse().expect("link-local address"))),
+            Some(v6("ff02::1".parse().expect("multicast address"))),
+            Some(v6(std::net::Ipv6Addr::LOCALHOST)),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                [203, 0, 113, 9].into(),
+                9999,
+            ))),
+            None,
+        ];
+        let addrs = global_v6(&slots);
+        let ips: Vec<IpAddr> = addrs.iter().map(|a| (*a.ip()).into()).collect();
+        // Loopback survives: smoke tests stand it in for a global address.
+        assert_eq!(ips, vec![
+            "2001:db8::1".parse().expect("global address"),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ]);
     }
 }

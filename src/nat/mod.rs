@@ -4,10 +4,25 @@ pub mod classify;
 pub mod predict;
 pub mod probe;
 
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 pub use predict::PortPredictor;
 use serde::{Deserialize, Serialize};
+
+/// Whether an IPv6 reflexive address can carry punch traffic between two
+/// distinct hosts.
+///
+/// Multicast, link-local, unspecified, and IPv4-mapped addresses are not
+/// global peer addresses: a mapped address is an IPv4 path in disguise
+/// and would make the Direct stage believe a global v6 path exists.
+/// Loopback stays usable, so tests without a global address can stand it
+/// in for one end to end.
+pub(crate) fn usable_v6(ip: Ipv6Addr) -> bool {
+    !ip.is_multicast()
+        && !ip.is_unicast_link_local()
+        && !ip.is_unspecified()
+        && ip.to_ipv4_mapped().is_none()
+}
 
 /// Behavior of a NAT's outbound address and port mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
