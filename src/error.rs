@@ -36,16 +36,21 @@ pub enum PunchError {
     /// The peers run different protocol versions.
     #[error("protocol version mismatch: local {local}, peer {peer}")]
     VersionMismatch { local: u8, peer: u8 },
-    /// A signaling frame failed to decode.
-    #[error("signaling frame failed to decode")]
-    BadFrame,
     /// The data-plane handshake never completed both directions.
     #[error("data-plane handshake never completed both directions")]
     ConfirmFailed,
     /// The configuration failed validation.
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
-    /// Socket or STUN level failure.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    /// Socket or STUN level failure in the phase that produced it.
+    ///
+    /// Only Probe and the punch engine construct these. The engine covers
+    /// the Punch and Confirm windows as one phase, so failures from its
+    /// post-handshake window still report `Phase::Punch`.
+    #[error("phase {phase:?} io: {source}")]
+    Io {
+        phase: Phase,
+        #[source]
+        source: std::io::Error,
+    },
 }

@@ -41,11 +41,18 @@ pub(crate) async fn probe<F: UdpFactory>(
 
     let v4_dests = resolve(cfg, false, deadline).await;
     if v4_dests.is_empty() {
-        return Err(PunchError::Io(io::Error::other(
-            "no STUN server resolved to an IPv4 address",
-        )));
+        return Err(PunchError::Io {
+            phase: Phase::Probe,
+            source: io::Error::other("no STUN server resolved to an IPv4 address"),
+        });
     }
-    let socket = factory.bind(Family::V4.any_addr()).await?;
+    let socket = factory
+        .bind(Family::V4.any_addr())
+        .await
+        .map_err(|source| PunchError::Io {
+            phase: Phase::Probe,
+            source,
+        })?;
 
     // Destination count above the wire cap adds evidence the frames cannot
     // carry, so the fan-out stops there.

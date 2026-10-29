@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     config::PunchConfig,
-    error::PunchError,
+    error::{Phase, PunchError},
     msg::{DataPacket, DecodeError, Frame, Nonce, StrategyId, decode_packet, encode_packet},
     nat::{NatClass, NatInfo, classify::easy_confident},
     signaling::SigIo,
@@ -1028,9 +1028,10 @@ impl<S: UdpIo> Engine<S> {
             if self.plan.sequence_marker {
                 self.plan.refresh_v4 = Refresh::None;
             } else {
-                return Err(PunchError::Io(std::io::Error::other(
-                    "stun refresh has no server or bound socket",
-                )));
+                return Err(PunchError::Io {
+                    phase: Phase::Punch,
+                    source: std::io::Error::other("stun refresh has no server or bound socket"),
+                });
             }
         }
         let mut ticker = tokio::time::interval_at(start + self.cfg.tick, self.cfg.tick);
@@ -1043,16 +1044,19 @@ impl<S: UdpIo> Engine<S> {
             if self.confirmed.is_none() && now >= self.punch_deadline {
                 return Err(PunchError::Timeout {
                     phase: if self.first_handshake.is_some() {
-                        crate::error::Phase::Confirm
+                        Phase::Confirm
                     } else {
-                        crate::error::Phase::Punch
+                        Phase::Punch
                     },
                 });
             }
             tokio::select! {
                 ev = events.recv() => {
                     let Some(ev) = ev else {
-                        return Err(PunchError::Io(std::io::Error::other("pool receive tasks stopped")));
+                        return Err(PunchError::Io {
+                            phase: Phase::Punch,
+                            source: std::io::Error::other("pool receive tasks stopped"),
+                        });
                     };
                     self.on_data(pool, ev).await?;
                 }
@@ -1499,9 +1503,10 @@ impl<S: UdpIo> Engine<S> {
             // crossed only leaves the peer's prediction on its probe-time
             // base, so the plan continues.
             if self.first_handshake.is_none() && !self.plan.sequence_marker {
-                return Err(PunchError::Io(std::io::Error::other(
-                    "stun refresh retries exhausted",
-                )));
+                return Err(PunchError::Io {
+                    phase: Phase::Punch,
+                    source: std::io::Error::other("stun refresh retries exhausted"),
+                });
             }
             self.stun = None;
         } else if let Some(pending) = &mut self.stun
@@ -2808,7 +2813,8 @@ mod tests {
         // phase error for a session with no handshake traffic yet.
         let err = engine.on_tick(&pool).await.expect_err("retries exhausted");
         assert!(
-            matches!(&err, PunchError::Io(e) if e.to_string().contains("stun refresh")),
+            matches!(&err, PunchError::Io { phase: Phase::Punch, source }
+                if source.to_string().contains("stun refresh")),
             "got {err:?}"
         );
         pool.shutdown().await;

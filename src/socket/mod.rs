@@ -19,7 +19,11 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::PunchConfig, error::PunchError, msg::MAX_DATA_PACKET};
+use crate::{
+    config::PunchConfig,
+    error::{Phase, PunchError},
+    msg::MAX_DATA_PACKET,
+};
 
 /// One UDP socket. Implemented by tokio sockets and by the test simulator.
 ///
@@ -283,10 +287,10 @@ impl<S: UdpIo> SocketPool<S> {
         // The one choke point every outbound target crosses, because every
         // target list ultimately comes from peer-signaled data.
         if let Some(reason) = unusable_reason(target) {
-            return Err(PunchError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                reason,
-            )));
+            return Err(PunchError::Io {
+                phase: Phase::Punch,
+                source: io::Error::new(io::ErrorKind::InvalidInput, reason),
+            });
         }
         if !self
             .dests
@@ -323,7 +327,10 @@ impl<S: UdpIo> SocketPool<S> {
             // No packet left the host, so the reserved budget unit goes back.
             self.budget.fetch_add(1, Ordering::Relaxed);
             // The rate slot stays spent: a token cannot return to the limiter.
-            return Err(PunchError::Io(err));
+            return Err(PunchError::Io {
+                phase: Phase::Punch,
+                source: err,
+            });
         }
         self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -362,7 +369,10 @@ impl<S: UdpIo> SocketPool<S> {
                 // No packet left the host, so the reserved quota unit goes
                 // back.
                 self.refresh_budget.fetch_add(1, Ordering::Relaxed);
-                Err(PunchError::Io(err))
+                Err(PunchError::Io {
+                    phase: Phase::Punch,
+                    source: err,
+                })
             },
         }
     }
@@ -383,19 +393,21 @@ impl<S: UdpIo> SocketPool<S> {
         }
         let group = self.group(family);
         if group.get(winner as usize).is_none() {
-            return Err(PunchError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "winner index out of range",
-            )));
+            return Err(PunchError::Io {
+                phase: Phase::Punch,
+                source: io::Error::new(io::ErrorKind::InvalidInput, "winner index out of range"),
+            });
         }
         let sock = group.swap_remove(winner as usize);
         self.groups = [Vec::new(), Vec::new()];
-        let sock = Arc::try_unwrap(sock).map_err(|_| {
-            PunchError::Io(io::Error::other(
-                "winner socket still shared after election",
-            ))
+        let sock = Arc::try_unwrap(sock).map_err(|_| PunchError::Io {
+            phase: Phase::Punch,
+            source: io::Error::other("winner socket still shared after election"),
         })?;
-        sock.into_delivered().map_err(PunchError::from)
+        sock.into_delivered().map_err(|source| PunchError::Io {
+            phase: Phase::Punch,
+            source,
+        })
     }
 
     /// Stops every task and closes every socket on a failed session.
@@ -521,7 +533,10 @@ mod tests {
 
         // The out-of-range index fails after the reservation and refunds.
         let err = pool.send(Family::V4, 9, b"x", target).await.unwrap_err();
-        assert!(matches!(err, PunchError::Io(_)));
+        assert!(matches!(err, PunchError::Io {
+            phase: Phase::Punch,
+            ..
+        }));
 
         pool.send(Family::V4, 0, b"x", target)
             .await
@@ -588,7 +603,8 @@ mod tests {
         for target in bad {
             let err = pool.send(Family::V4, 0, b"x", target).await.unwrap_err();
             assert!(
-                matches!(&err, PunchError::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+                matches!(&err, PunchError::Io { source, .. }
+                    if source.kind() == io::ErrorKind::InvalidInput),
                 "target {target} rejected with {err:?}"
             );
         }
