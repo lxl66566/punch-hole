@@ -36,6 +36,7 @@
 - 套接字数越界，含 `max_sockets` 超过 4096
 - 速率超过每秒十亿包，那是 `Duration` 间隔限速器能表达的最细网格
 - 任何零时长
+- `probe_timeout` 超过 `overall_deadline`
 - 成功率目标超出 0.0 到 1.0
 - `min_success` 大于 `target_success`
 

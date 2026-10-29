@@ -9,6 +9,7 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    time::Duration,
 };
 
 use tokio::time::Instant;
@@ -28,15 +29,17 @@ const ATTR_XOR_MAPPED: u16 = 0x0020;
 
 /// Runs the Probe phase and returns the evidence it collected.
 ///
-/// Both address families fit inside `cfg.probe_timeout`.
+/// Both address families fit inside `cfg.probe_timeout`, and the whole
+/// phase never outlives `overall`, the session's wall-clock deadline.
 pub(crate) async fn probe<F: UdpFactory>(
     cfg: &PunchConfig,
     factory: &F,
+    overall: Instant,
 ) -> Result<NatInfo, PunchError> {
     let start = Instant::now();
-    let deadline = start + cfg.probe_timeout;
+    let deadline = (start + cfg.probe_timeout).min(overall);
 
-    let v4_dests = resolve(cfg, false).await;
+    let v4_dests = resolve(cfg, false, deadline).await;
     if v4_dests.is_empty() {
         return Err(PunchError::Io(io::Error::other(
             "no STUN server resolved to an IPv4 address",
@@ -48,7 +51,9 @@ pub(crate) async fn probe<F: UdpFactory>(
     // carry, so the fan-out stops there.
     let mut round = Fanout::new(v4_dests.into_iter().take(MAX_ALLOC_SEQ).collect());
     round.send_pending(&socket).await;
-    round.collect(&socket, start + cfg.probe_timeout / 2).await;
+    round
+        .collect(&socket, (start + cfg.probe_timeout / 2).min(deadline))
+        .await;
     // One retry round for silent destinations, bounded by the phase deadline.
     if round.pending() > 0 {
         round.send_pending(&socket).await;
@@ -107,7 +112,7 @@ async fn probe_v6<F: UdpFactory>(
     factory: &F,
     deadline: Instant,
 ) -> Option<V6Nat> {
-    let servers = resolve(cfg, true).await;
+    let servers = resolve(cfg, true, deadline).await;
     if servers.is_empty() {
         return None;
     }
@@ -267,13 +272,21 @@ fn is_public<S: UdpIo>(socket: &S, server: SocketAddr, reflexive: &SocketAddr) -
 ///
 /// Every address of a hostname joins the destination list, and a literal IP
 /// resolves to itself. Duplicates drop out, so one destination means one
-/// mapping.
-async fn resolve(cfg: &PunchConfig, want_v6: bool) -> Vec<SocketAddr> {
+/// mapping. Each lookup runs under its own short budget inside the phase
+/// deadline, so a hung system resolver costs one lookup, not the session.
+async fn resolve(cfg: &PunchConfig, want_v6: bool, deadline: Instant) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for server in &cfg.stun_servers {
-        let Ok(list) = tokio::net::lookup_host(server).await else {
+        // A literal IP resolves on the first poll even with no budget left.
+        let per_lookup = cfg
+            .probe_timeout
+            .min(Duration::from_secs(2))
+            .min(deadline.saturating_duration_since(Instant::now()));
+        let lookup = tokio::net::lookup_host(server);
+        let Ok(list) = tokio::time::timeout(per_lookup, lookup).await else {
             continue
         };
+        let Ok(list) = list else { continue };
         for addr in list {
             if addr.is_ipv6() == want_v6 && !out.contains(&addr) {
                 out.push(addr);

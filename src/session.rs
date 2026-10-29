@@ -113,7 +113,7 @@ impl<F: UdpFactory> PunchSession<F> {
         let t = Instant::now();
         let mine = match self.cached.take() {
             Some(cached) => cached,
-            None => crate::nat::probe::probe(&self.config, &self.factory).await?,
+            None => crate::nat::probe::probe(&self.config, &self.factory, overall).await?,
         };
         let probe_ms = elapsed_ms(t);
 

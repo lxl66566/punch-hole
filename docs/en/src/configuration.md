@@ -36,6 +36,7 @@
 - socket counts above their bounds, including `max_sockets` past 4096,
 - a rate above one billion packets per second, the finest grid a `Duration` spacing limiter can express,
 - any zero duration,
+- `probe_timeout` above `overall_deadline`,
 - a success target outside 0.0 to 1.0,
 - `min_success` above `target_success`.
 

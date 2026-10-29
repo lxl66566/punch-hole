@@ -137,6 +137,11 @@ impl PunchConfig {
         {
             return Err(bad("durations must be positive"));
         }
+        // Probe is the only phase whose window is its own budget, so a
+        // budget past the session wall could never complete anyway.
+        if self.probe_timeout > self.overall_deadline {
+            return Err(bad("probe_timeout must not exceed overall_deadline"));
+        }
         if !(0.0..=1.0).contains(&self.target_success) || !(0.0..=1.0).contains(&self.min_success) {
             return Err(bad("success targets must be probabilities"));
         }
@@ -196,6 +201,15 @@ mod tests {
     fn zero_max_mappings_is_rejected() {
         let cfg = PunchConfig {
             max_mappings: 0,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn probe_timeout_past_overall_deadline_is_rejected() {
+        let cfg = PunchConfig {
+            probe_timeout: Duration::from_secs(61),
             ..PunchConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));

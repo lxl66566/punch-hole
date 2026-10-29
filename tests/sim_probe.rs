@@ -99,6 +99,35 @@ async fn stun_timeout_is_bounded() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn probe_window_stays_under_overall_deadline() {
+    let net = Net::seeded("probe_overall");
+    // No STUN server on this address; the router drops the queries, so the
+    // phase spends its whole window against the session wall.
+    let mut cfg = punch_hole::PunchConfig::default();
+    cfg.stun_servers = vec!["9.9.9.9:3478".to_owned()];
+    cfg.probe_timeout = std::time::Duration::from_secs(2);
+    cfg.overall_deadline = std::time::Duration::from_secs(2);
+    let host = net.host(NatSpec::cone_eif());
+    let (_, lib) = punch_hole::signaling::bridge(8);
+
+    let t = tokio::time::Instant::now();
+    let err = common::run_initiator(host, cfg, lib).await.unwrap_err();
+    assert!(
+        matches!(err, PunchError::Timeout {
+            phase: punch_hole::Phase::Probe
+        }),
+        "got {err:?}"
+    );
+    // The phase deadline is clamped to the session wall, which the two
+    // budgets share down to the boundary.
+    assert!(
+        t.elapsed() <= std::time::Duration::from_millis(2_100),
+        "probe ran {} ms past the overall deadline",
+        t.elapsed().as_millis()
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn cached_nat_info_skips_probe() {
     let (net, stun, a, b) = common::cone_net("cached_nat");
     // The first host attached sits behind 100.64.2.1. A cache from an
