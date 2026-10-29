@@ -740,7 +740,7 @@ pub(crate) fn build_plan(
             }
         },
         StrategyId::SymProbe if !my_sym => Refresh::Stun,
-        StrategyId::SymProbe | StrategyId::PredictiveExchange
+        StrategyId::SymProbe | StrategyId::PredictiveExchange | StrategyId::PredictiveBurst
             if my_sym && matches!(my_class, NatClass::EasySym { .. }) =>
         {
             Refresh::Stun
@@ -751,11 +751,14 @@ pub(crate) fn build_plan(
     // every other announce names the port the peer aims at.
     let sequence_marker = refresh_v4 == Refresh::Stun && my_sym;
     // Prediction stages carry a fitted window over the peer's sequence:
-    // PredictiveExchange always, and the SymProbe cone side against an
-    // easy symmetric peer.
+    // PredictiveExchange always, the SymProbe cone side against an easy
+    // symmetric peer, and the hard side of a PredictiveBurst pair, whose
+    // window covers the easy peer's continuation and moves with its
+    // announced position the same way.
     let predicts_peer = match sel.strategy {
         StrategyId::PredictiveExchange => true,
         StrategyId::SymProbe => !my_sym && matches!(peer_class, NatClass::EasySym { .. }),
+        StrategyId::PredictiveBurst => matches!(peer_class, NatClass::EasySym { .. }),
         _ => false,
     };
 
@@ -2251,6 +2254,18 @@ mod tests {
         let cone_plan = build_plan(&cone, &hard, &sel, 1, [0; 16], Role::Responder, None, &cfg);
         assert_eq!(cone_plan.refresh_v4, Refresh::Stun);
         assert!(!cone_plan.predicts_peer, "a hard peer carries no window");
+
+        // PredictiveBurst: the easy side marks its sequence position, and
+        // the hard side's continuation window re-bases on that mark.
+        let sel = select(&easy, &hard, &cfg).expect("pred burst selects");
+        let easy_plan = build_plan(&easy, &hard, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(easy_plan.refresh_v4, Refresh::Stun);
+        assert!(easy_plan.sequence_marker);
+        assert!(!easy_plan.predicts_peer);
+        let hard_plan = build_plan(&hard, &easy, &sel, 1, [0; 16], Role::Responder, None, &cfg);
+        assert_eq!(hard_plan.refresh_v4, Refresh::None);
+        assert!(!hard_plan.sequence_marker);
+        assert!(hard_plan.predicts_peer);
     }
 
     /// A peer announce translates the fitted window onto the announced

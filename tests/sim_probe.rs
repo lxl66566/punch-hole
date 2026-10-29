@@ -517,6 +517,24 @@ async fn predictive_exchange_punches_under_external_drift() {
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
 }
 
+/// The easy side of a PredictiveBurst pair drifts during Negotiate, far
+/// past the window's slack. Its announced allocation position re-bases
+/// the hard side's continuation window, so the pair still punches; the
+/// same drift with the announce dropped leaves the window on the
+/// probe-time base and the attempt misses.
+#[tokio::test(start_paused = true)]
+async fn predictive_burst_rebases_under_external_drift() {
+    let net = Net::seeded("pred_burst_drift");
+    let stun = net.stun_server();
+    let easy = net.host(NatSpec::sequential(2));
+    let hard = net.host(NatSpec::random(30000..30400));
+    let (ra, rb) = drift_pair(easy.clone(), config(&stun), hard.clone(), vec![easy], 600).await;
+    let pa = ra.expect("rebased window punches");
+    let pb = rb.expect("peer side punches");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
 /// A rebind that lands mid-probe splits the observed sequence, so the
 /// stride fit fails and the class degrades to HardSym. The pair never
 /// carries a confidently wrong step into the punch.

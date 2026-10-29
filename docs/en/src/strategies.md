@@ -59,6 +59,8 @@ Exactly one side is easy symmetric; the other is hard symmetric, which includes 
 
 Each side opens one socket. The easy side's live mappings are exactly the first `easy` ports of the window the hard side covers, because an EasySym mapping walks its constant step and the easy side holds one mapping per covered port; the random direction therefore shoots `easy` candidates at the hard side's `window` live mappings, and the window feeds back into the live count. The solve `easy * (easy + 16) = ln(1 / (1 - target)) * space` runs through the shared spray sizing, so the budget and conntrack caps bind exactly as they do for every other spray.
 
+The easy side announces its current allocation position the same way SymProbe's symmetric side does, and the hard side moves its window onto that mark. Drift between the peer's Probe and its punch sockets — unrelated allocations, and the ports of probe destinations that stayed silent, which the wire sequence never carries — then moves the window instead of sliding the live block out of it.
+
 The estimate states its regime, the way the burst arithmetic states its filtering assumption: while the easy NAT keeps stepping from its last observed port, the window is certain to contain every live mapping, and drift tolerates up to a window width of unrelated allocations before the live block slides out. The random direction is sized for `target_success` on its own and is the quantified fallback when the regime breaks.
 
 ## BirthdayBurst

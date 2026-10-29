@@ -20,8 +20,11 @@ use crate::{
 /// continuation mapping of the easy peer, whose answer returns from
 /// exactly the covered port; a spray candidate that lands on one of the
 /// window mappings answers the same way. Both stages fire from the shared
-/// engine start with static targets, because a symmetric strategy has no
-/// port to announce.
+/// engine start with static targets. The easy side announces its current
+/// allocation position, and the hard side re-bases its window onto that
+/// mark, so drift between Probe and punch — silent probe destinations
+/// included — moves the window instead of sliding the live block out of
+/// it.
 pub(crate) fn stage(
     i_am_easy: bool,
     my_sockets: u16,
