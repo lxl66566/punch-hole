@@ -6,20 +6,20 @@ The Probe phase collects the facts every later decision reads. One socket asks e
 
 The prober resolves every configured server and keeps every resolved address as a destination, so one hostname with several records contributes one destination per record. Duplicates collapse, so one destination means one mapping. All destinations share one UDP socket, and the prober fires one STUN binding request at each in a single fan-out round.
 
-Each request carries its own transaction id, and each answer fills the slot of the destination it belongs to. The slots record send order, whatever the arrival order was, and send order is allocation order on the NAT. A retry round re-asks the destinations that stayed silent, from the same socket, so the NAT reuses the first mapping and the send indexes stay valid. A destination that never answers leaves a hole: an allocation whose port nobody reported.
+Each request carries its own transaction id, and each answer fills the slot of the destination it belongs to. The slots record send order, whatever the arrival order was. Send order is allocation order only among the requests that reached the NAT, so the prober tracks two faults a retry round can hide: a destination whose sends all failed locally never allocated, and a first request lost on the uplink leaves its allocation to the retry, which runs after every first-round allocation. When the answers at their send positions hold no constant step, the fit re-reads the retry-round answers as late allocations before it gives up, so a single lost request keeps an `EasySym` reading instead of turning into `HardSym`. A destination that answers never the less leaves nothing behind; a silent one leaves a hole: an allocation whose port nobody reported.
 
 The whole phase ends by `probe_timeout`, three seconds by default. The first round waits half the budget and the retry round waits until the deadline. A short IPv6 pass collects global addresses inside what remains.
 
 ## Reading the allocation sequence
 
-The answer ports, in send order, form `alloc_seq`. The sequence is the NAT's allocation history for this socket, one port per outbound flow in the order the flows were created. Three rules turn it into a class:
+The answer ports, in allocation order, form `alloc_seq`. The sequence is the NAT's allocation history for this socket, one port per outbound flow in the order the flows were created. Three rules turn it into a class:
 
 - the reflexive address equals the local address: `Public`,
 - every port in the sequence is equal, or fewer than two answers arrived: `Cone`,
-- consecutive ports keep one constant step per send-index distance: `EasySym { step }`,
+- consecutive ports keep one constant step per allocation-index distance: `EasySym { step }`,
 - anything else: `HardSym`.
 
-The step divides each port delta by the send-index distance that produced it, which keeps the true stride across holes. The sequence `5000, 5002, 5006` with a silent destination at index 2 still reads as a step of two, because the last delta spans two allocations.
+The step divides each port delta by the allocation-index distance that produced it, which keeps the true stride across holes. The sequence `5000, 5002, 5006` with a silent destination at index 2 still reads as a step of two, because the last delta spans two allocations.
 
 One socket against many destinations settles the class on its own. A port that two sockets share can be coincidence inside a narrow allocation range, so the prober reads the sequence rather than consulting a second socket.
 

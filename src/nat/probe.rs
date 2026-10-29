@@ -136,25 +136,38 @@ async fn probe_v6<F: UdpFactory>(
 
 /// One round set of binding queries over one socket.
 ///
-/// Slot `i` holds the answer of `dests[i]`. The slot index is the send
-/// index: queries go out in index order, so a symmetric NAT allocates the
-/// ports in index order and the slots record the allocation sequence.
+/// Slot `i` holds the answer of `dests[i]`. Queries go out in index
+/// order, so a symmetric NAT allocates in index order among the requests
+/// that reached it, and the slots plus the per-destination send and round
+/// records reconstruct the allocation sequence.
 struct Fanout {
     dests: Vec<SocketAddr>,
     /// One transaction id per destination, kept stable across retry rounds,
     /// so a late answer to an earlier round still matches its slot.
     txids: Vec<[u8; 12]>,
     slots: Vec<Option<SocketAddr>>,
+    /// Whether any send attempt to the destination left this host. A
+    /// destination nothing left for holds no NAT allocation.
+    sent: Vec<bool>,
+    /// The collect round each answer arrived in, zero while silent.
+    answered_in: Vec<u8>,
+    /// The collect round in progress, one-based.
+    collecting: u8,
 }
 
 impl Fanout {
     fn new(dests: Vec<SocketAddr>) -> Self {
         let slots = vec![None; dests.len()];
         let txids = dests.iter().map(|_| rand::random()).collect();
+        let sent = vec![false; dests.len()];
+        let answered_in = vec![0; dests.len()];
         Self {
             dests,
             txids,
             slots,
+            sent,
+            answered_in,
+            collecting: 0,
         }
     }
 
@@ -170,22 +183,26 @@ impl Fanout {
 
     /// Sends one request per still-silent destination, in send-index order.
     ///
-    /// A retry targets the same destination from the same socket, so the NAT
-    /// reuses the mapping of the first send. Retries allocate nothing new,
-    /// and the send indexes stay allocation indexes.
-    async fn send_pending<S: UdpIo>(&self, socket: &S) {
-        for ((slot, dst), txid) in self.slots.iter().zip(&self.dests).zip(&self.txids) {
-            if slot.is_some() {
+    /// A retry targets the same destination from the same socket, so it
+    /// reuses the mapping of the first send whenever that send reached the
+    /// NAT. A first send that never reached the NAT leaves the allocation
+    /// to the retry, which runs after every first-round allocation, so each
+    /// answer also records the round it arrived in.
+    async fn send_pending<S: UdpIo>(&mut self, socket: &S) {
+        for idx in 0..self.dests.len() {
+            if self.slots[idx].is_some() {
                 continue;
             }
-            let request = binding_request(txid);
-            // A failed send leaves a hole the fit treats as an unknown port.
-            let _ = socket.send_to(&request, *dst).await;
+            let request = binding_request(&self.txids[idx]);
+            if socket.send_to(&request, self.dests[idx]).await.is_ok() {
+                self.sent[idx] = true;
+            }
         }
     }
 
     /// Collects answers until no destination pends or `until` passes.
     async fn collect<S: UdpIo>(&mut self, socket: &S, until: Instant) {
+        self.collecting = self.collecting.saturating_add(1);
         while self.pending() > 0 {
             // Servers prepend their own attributes ahead of XOR-MAPPED, so
             // the buffer leaves room beyond the minimal binding response.
@@ -216,6 +233,7 @@ impl Fanout {
                 && let Some(addr) = parse_mapped(buf, txid)
             {
                 *slot = Some(addr);
+                self.answered_in[idx] = self.collecting;
                 break;
             }
         }
@@ -229,14 +247,63 @@ impl Fanout {
             .find_map(|(idx, slot)| slot.map(|addr| (idx, addr)))
     }
 
-    /// The `(send index, port)` pairs classification fits. A missing index
-    /// marks an allocation whose port no server reported.
+    /// The `(allocation index, port)` pairs classification fits.
+    ///
+    /// The allocation index counts the destinations that reached the NAT,
+    /// in send order. Two faults bend that count away from the send index:
+    /// a destination whose sends all failed locally never allocated, and a
+    /// round-two answer may report a mapping the retry allocated after
+    /// every round-one mapping instead of the one its send position
+    /// implies. When the straight reading holds no constant step, the
+    /// round-two answers are re-read as late allocations before the fit
+    /// gives up.
     fn observed(&self) -> Vec<(usize, u16)> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| slot.map(|addr| (idx, addr.port())))
-            .collect()
+        let straight = self.positions(false);
+        let answered_in_retry = self.answered_in.iter().any(|&round| round > 1);
+        if !answered_in_retry || classify::constant_step(&straight).is_some() {
+            return straight;
+        }
+        let retried = self.positions(true);
+        if classify::constant_step(&retried).is_some() {
+            return retried;
+        }
+        straight
+    }
+
+    /// Answer positions under one fault hypothesis.
+    ///
+    /// With `retries_allocate`, every round-two answer leaves the
+    /// first-round order and follows it: its retry ran after all
+    /// first-round sends, so its mapping sits behind theirs. A destination
+    /// that stayed silent keeps its position as a hole, an allocation
+    /// whose port no server reported.
+    fn positions(&self, retries_allocate: bool) -> Vec<(usize, u16)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for idx in 0..self.dests.len() {
+            if !self.sent[idx] {
+                continue;
+            }
+            let late = retries_allocate && self.answered_in[idx] > 1;
+            if !late {
+                if let Some(addr) = self.slots[idx] {
+                    out.push((pos, addr.port()));
+                }
+                pos += 1;
+            }
+        }
+        if retries_allocate {
+            for idx in 0..self.dests.len() {
+                if self.sent[idx]
+                    && self.answered_in[idx] > 1
+                    && let Some(addr) = self.slots[idx]
+                {
+                    out.push((pos, addr.port()));
+                    pos += 1;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -433,6 +500,8 @@ mod tests {
             .map(|port| SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478 + port)))
             .collect();
         let mut round = Fanout::new(dests);
+        // Every destination received its request.
+        round.sent = vec![true; 3];
         // Destination 2 answers first and destination 1 last.
         round.absorb(&binding_response(&round.txids[2], 5012), round.dest(2));
         round.absorb(&binding_response(&round.txids[0], 5010), round.dest(0));
@@ -445,10 +514,94 @@ mod tests {
         );
     }
 
+    /// Four destinations on one server address, the default fan-out shape.
+    fn four_dests() -> Vec<SocketAddr> {
+        (0..4u16)
+            .map(|port| SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478 + port)))
+            .collect()
+    }
+
+    /// Places one answer for `idx` while `round` is collecting.
+    fn answer(round: &mut Fanout, idx: usize, port: u16) {
+        let resp = binding_response(&round.txids[idx], port);
+        let dest = round.dest(idx);
+        round.absorb(&resp, dest);
+    }
+
+    #[test]
+    fn unsent_destinations_leave_no_hole() {
+        let mut round = Fanout::new(four_dests());
+        // Destination 1 never left the host, so the NAT never allocated
+        // for it and the stride of two must survive undivided.
+        round.sent = vec![true, false, true, true];
+        answer(&mut round, 0, 5000);
+        answer(&mut round, 2, 5002);
+        answer(&mut round, 3, 5004);
+        assert_eq!(round.observed(), vec![(0, 5000), (1, 5002), (2, 5004)]);
+    }
+
+    #[test]
+    fn lost_first_request_reorders_as_a_late_allocation() {
+        let mut round = Fanout::new(four_dests());
+        round.sent = vec![true; 4];
+        // Destination 1's first request never reached the NAT, so its
+        // retry allocates after the whole first round: the walk reads
+        // 5000, 5001, 5002, then 5003 out of send position.
+        round.collecting = 1;
+        answer(&mut round, 0, 5000);
+        answer(&mut round, 2, 5001);
+        answer(&mut round, 3, 5002);
+        round.collecting = 2;
+        answer(&mut round, 1, 5003);
+        assert_eq!(round.observed(), vec![
+            (0, 5000),
+            (1, 5001),
+            (2, 5002),
+            (3, 5003)
+        ]);
+    }
+
+    #[test]
+    fn late_answers_keep_their_position_when_the_walk_agrees() {
+        let mut round = Fanout::new(four_dests());
+        round.sent = vec![true; 4];
+        // Response loss alone: the mapping existed from round one and the
+        // answer arrived in round two, still on its send position.
+        round.collecting = 1;
+        answer(&mut round, 0, 5000);
+        answer(&mut round, 2, 5002);
+        answer(&mut round, 3, 5003);
+        round.collecting = 2;
+        answer(&mut round, 1, 5001);
+        assert_eq!(round.observed(), vec![
+            (0, 5000),
+            (1, 5001),
+            (2, 5002),
+            (3, 5003)
+        ]);
+    }
+
+    #[test]
+    fn contradictory_rounds_stay_hard() {
+        let mut round = Fanout::new(four_dests());
+        round.sent = vec![true; 4];
+        // Random-looking ports stay random under either hypothesis.
+        round.collecting = 1;
+        answer(&mut round, 0, 5000);
+        answer(&mut round, 2, 5137);
+        answer(&mut round, 3, 5288);
+        round.collecting = 2;
+        answer(&mut round, 1, 5303);
+        let obs = round.observed();
+        assert_eq!(obs.len(), 4);
+        assert_eq!(classify::constant_step(&obs), None);
+    }
+
     #[test]
     fn duplicate_and_foreign_answers_are_dropped() {
         let dest = vec![SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478))];
         let mut round = Fanout::new(dest);
+        round.sent = vec![true];
         round.absorb(&binding_response(&round.txids[0], 5010), round.dest(0));
         // A retransmitted answer and a foreign transaction change nothing.
         round.absorb(&binding_response(&round.txids[0], 5099), round.dest(0));
@@ -461,6 +614,7 @@ mod tests {
     fn answers_from_other_sources_are_dropped() {
         let dest = vec![SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 3478))];
         let mut round = Fanout::new(dest);
+        round.sent = vec![true];
         // Same transaction id, but the datagram left a different server; a
         // spoofed response has to come from the requested address.
         let other = SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 9999));

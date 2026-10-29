@@ -319,6 +319,53 @@ async fn two_stun_servers_double_the_samples() {
     }
 }
 
+/// One fan-out whose first request to one destination never reached the
+/// NAT: the retry allocates that mapping after every first-round mapping,
+/// which reorders the answers against their send positions.
+#[tokio::test(start_paused = true)]
+async fn outbound_probe_loss_keeps_easy_sym() {
+    let net = Net::seeded("outbound_probe_loss");
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        addrs.extend(net.stun_server().addrs);
+    }
+    let a = net.host(NatSpec::sequential(1));
+    let b = net.host(NatSpec::sequential(1));
+    // Destination one loses its first request before the NAT, so only the
+    // retry round creates its mapping.
+    a.drop_first_send_to(addrs[1].parse().expect("sim server address"));
+    let mut cfg = punch_hole::PunchConfig::default();
+    cfg.stun_servers = addrs;
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("easy pair punches through one lost request");
+    let _ = rb.expect("peer side punches");
+    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 1 });
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
+}
+
+/// One destination whose sends never leave the host holds no NAT
+/// allocation, so it must not sit between the answered samples as an
+/// allocation whose port went unreported.
+#[tokio::test(start_paused = true)]
+async fn persistent_send_failure_keeps_the_stride() {
+    let net = Net::seeded("send_failure_stride");
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        addrs.extend(net.stun_server().addrs);
+    }
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::sequential(2));
+    // Every send to destination three fails locally, so the NAT never
+    // allocates for it and the answered stride stays two.
+    a.fail_sends_to(addrs[3].parse().expect("sim server address"));
+    let mut cfg = punch_hole::PunchConfig::default();
+    cfg.stun_servers = addrs;
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("easy pair punches through one failed destination");
+    let _ = rb.expect("peer side punches");
+    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
+}
 #[tokio::test(start_paused = true)]
 async fn probe_phase_ends_at_its_deadline() {
     let net = Net::seeded("probe_deadline");

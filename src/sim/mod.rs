@@ -299,6 +299,19 @@ enum Msg {
     },
 }
 
+/// Uplink faults one test attaches to a host.
+///
+/// Both rules sit in front of the NAT: a datagram that never left the
+/// host holds no mapping, and a datagram dropped on the uplink delays the
+/// mapping until a retransmission follows.
+#[derive(Default)]
+struct UplinkFaults {
+    /// Destinations whose first datagram is dropped before the NAT.
+    drop_first: HashSet<SocketAddr>,
+    /// Destinations no datagram ever leaves the host for.
+    unreachable: HashSet<SocketAddr>,
+}
+
 struct Inner {
     tx: mpsc::UnboundedSender<Msg>,
     rng: StdMutex<StdRng>,
@@ -423,6 +436,7 @@ impl Net {
             inner: Arc::clone(&self.inner),
             nat: Some(nat),
             local_ip,
+            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
         }
     }
 
@@ -435,6 +449,7 @@ impl Net {
             inner: Arc::clone(&self.inner),
             nat: None,
             local_ip,
+            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
         }
     }
 
@@ -547,6 +562,31 @@ pub struct Host {
     inner: Arc<Inner>,
     nat: Option<Arc<NatShared>>,
     local_ip: Ipv4Addr,
+    /// Fault rules every socket of this host consults before the NAT.
+    faults: Arc<StdMutex<UplinkFaults>>,
+}
+
+impl Host {
+    /// Drops the first datagram this host sends to `target` before it
+    /// reaches the NAT, so the destination holds no mapping until the
+    /// sender retransmits.
+    pub fn drop_first_send_to(&self, target: SocketAddr) {
+        self.faults
+            .lock()
+            .expect("uplink fault lock")
+            .drop_first
+            .insert(target);
+    }
+
+    /// Fails every send to `target` locally, like a route that never
+    /// leaves the host.
+    pub fn fail_sends_to(&self, target: SocketAddr) {
+        self.faults
+            .lock()
+            .expect("uplink fault lock")
+            .unreachable
+            .insert(target);
+    }
 }
 
 impl UdpFactory for Host {
@@ -574,6 +614,7 @@ impl UdpFactory for Host {
             nat: self.nat.clone(),
             local,
             inbox: Mutex::new(rx),
+            faults: Arc::clone(&self.faults),
         })
     }
 }
@@ -584,10 +625,25 @@ pub struct SimSocket {
     nat: Option<Arc<NatShared>>,
     local: SocketAddr,
     inbox: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    faults: Arc<StdMutex<UplinkFaults>>,
 }
 
 impl UdpIo for SimSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        {
+            let mut faults = self.faults.lock().expect("uplink fault lock");
+            if faults.unreachable.contains(&target) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NetworkUnreachable,
+                    "sim uplink fault: destination unreachable",
+                ));
+            }
+            if faults.drop_first.remove(&target) {
+                // The datagram reports success and never reaches the NAT,
+                // so the destination holds no mapping yet.
+                return Ok(buf.len());
+            }
+        }
         let src = match &self.nat {
             Some(nat) => nat.translate_outbound(&self.inner.rng, self.local, target),
             None => self.local,

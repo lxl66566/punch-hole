@@ -4,11 +4,11 @@ use super::NatClass;
 
 /// Maps observed external ports to a mapping class.
 ///
-/// `obs` holds `(send index, port)` pairs in send order, one entry per
-/// destination that answered. A gap between two send indexes marks a
-/// destination that stayed silent: the NAT allocated a port there that no
-/// server reported. `public` marks a reflexive address equal to the local
-/// address.
+/// `obs` holds `(allocation index, port)` pairs in allocation order, one
+/// entry per destination that answered. A gap between two allocation
+/// indexes marks a destination that stayed silent: the NAT allocated a
+/// port there that no server reported. `public` marks a reflexive address
+/// equal to the local address.
 #[must_use]
 pub fn classify(public: bool, obs: &[(usize, u16)]) -> NatClass {
     if public {
@@ -43,9 +43,13 @@ pub fn easy_confident(seq: &[u16]) -> bool {
 /// there is one.
 ///
 /// A hole between two observations spans several allocations, so the delta
-/// divides by the send-index distance. A nonzero remainder, or two spans
-/// that disagree on the quotient, means no constant step fits.
-fn constant_step(obs: &[(usize, u16)]) -> Option<i16> {
+/// divides by the allocation-index distance. A nonzero remainder, or two
+/// spans that disagree on the quotient, means no constant step fits.
+/// Observations too short to span one delta fit nothing.
+pub(super) fn constant_step(obs: &[(usize, u16)]) -> Option<i16> {
+    if obs.len() < 2 {
+        return None;
+    }
     let per_allocation = |a: &(usize, u16), b: &(usize, u16)| -> Option<i32> {
         let dist = (b.0 - a.0) as i32;
         let delta = i32::from(b.1) - i32::from(a.1);
