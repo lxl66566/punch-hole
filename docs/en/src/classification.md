@@ -35,10 +35,10 @@ The port sequence measures mapping. Filtering stays unmeasured: telling endpoint
 
 `PortPredictor` turns a sequence into the next expected ports.
 
-- `fit` takes the median of the deltas as the step, so single outliers bend the fit rather than break it. Deltas are normalized into the signed 16-bit domain first, so a walk across the port boundary still reads as the small negative step it represents.
+- `fit` takes the median of the deltas as the step, so single outliers bend the fit rather than break it. Deltas are normalized into the signed 16-bit domain first, so a walk across the port boundary still reads as the small negative step it represents. The fit needs at least three deltas, the same bar the confidence rule sets, so a two-sample outlier cannot decide the step.
 - `with_step` continues a sequence at a step derived outside the observed deltas. The classifier's send-index step survives holes, while the adjacent deltas of a gapped sequence read wide, so the strategies prefer `with_step` and fall back to `fit`.
 
-`window(count)` lists the next `count` ports past the last observation, clamped to the valid port range. The strategies aim sockets at these ports.
+`window(count)` lists the next `count` ports past the last observation. The walk stops at the port range boundary, where the next port depends on where the NAT rebinds; `at` clamps single ports into `1..=65535`. The strategies aim sockets at these ports.
 
 ## IPv6
 

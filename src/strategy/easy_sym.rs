@@ -78,13 +78,14 @@ mod tests {
         assert_eq!(ports, vec![5012, 5014, 5016, 5018]);
     }
 
-    /// A class with a zero step falls back to the adjacent-delta fit.
+    /// A class with a zero step falls back to the adjacent-delta fit, which
+    /// needs three deltas of its own before it yields a window.
     #[test]
     fn degenerate_class_step_falls_back_to_the_fit() {
-        let peer = easy_peer(&[5000, 5002, 5004], 0);
+        let peer = easy_peer(&[5000, 5002, 5004, 5006], 0);
         let stage = stage(8, &peer, 2, &PunchConfig::default()).expect("stage builds");
         let ports: Vec<u16> = stage.targets.iter().map(SocketAddr::port).collect();
-        assert_eq!(ports, vec![5006, 5008]);
+        assert_eq!(ports, vec![5008, 5010]);
     }
 
     #[test]
@@ -93,6 +94,17 @@ mod tests {
         assert!(stage(8, &easy_peer(&[], 2), 4, &PunchConfig::default()).is_none());
         // No class step and too little sequence for the fallback fit.
         assert!(stage(8, &easy_peer(&[5000], 0), 4, &PunchConfig::default()).is_none());
+        // Two deltas leave the fallback fit without a majority step, so a
+        // degenerate class plus a thin sequence builds no stage either.
+        assert!(
+            stage(
+                8,
+                &easy_peer(&[5000, 5002, 5004], 0),
+                2,
+                &PunchConfig::default()
+            )
+            .is_none()
+        );
     }
 
     /// One observation plus the classifier step already spans the window,
