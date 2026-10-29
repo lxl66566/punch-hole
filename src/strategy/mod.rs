@@ -584,6 +584,9 @@ pub(crate) struct PortAnnounce {
     pub v6: Option<u16>,
 }
 /// One execution stage on one family.
+// The four booleans are independent pulse policies a stage mixes freely,
+// not states of one axis, so they stay flags.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct StageSpec {
     pub family: Family,
     pub duration: Duration,
@@ -600,6 +603,14 @@ pub(crate) struct StageSpec {
     /// Targets one sender covers per sweep, so a lone socket can spray many
     /// ports per tick.
     pub per_sweep: u16,
+    /// The peer's live mappings appear only once its own pulses begin,
+    /// which wait for this side's PortUpdate; pulses hold until peer
+    /// traffic proves them live, or one RTT plus a tick passes.
+    pub hold_for_peer: bool,
+    /// The peer's live ports are fixed once its first sweep lands, so
+    /// pulses stop after the racing pass and one settled pass over the
+    /// target list.
+    pub fixed_peer_ports: bool,
 }
 
 impl StageSpec {
@@ -619,6 +630,8 @@ impl StageSpec {
             reply_only: false,
             needs_peer_ports,
             per_sweep: 1,
+            hold_for_peer: false,
+            fixed_peer_ports: false,
         }
     }
 
@@ -632,6 +645,8 @@ impl StageSpec {
             reply_only: true,
             needs_peer_ports: false,
             per_sweep: 1,
+            hold_for_peer: false,
+            fixed_peer_ports: false,
         }
     }
 }
@@ -837,6 +852,19 @@ struct StunPending {
     attempts_left: u8,
 }
 
+/// Full passes over the target list a fixed-port spray runs before its
+/// pulses stop.
+///
+/// One pass races the peer's own mapping creation, one runs against the
+/// settled probe-derived set, and the handshake's answer chatter mints
+/// the last fresh mappings: each side answers the other's sources on the
+/// confirm_retry cadence, so the answer mappings close within a couple
+/// of confirm windows, which at the throttled one-packet-per-tick sweep
+/// is about two more passes. Past the fourth pass both live sets are
+/// closed and every later pass repeats covered ports while spending the
+/// rate budget handshake retransmissions need.
+const FIXED_PORT_PASSES: usize = 4;
+
 /// Refresh query attempts, one send plus retries on the confirm_retry
 /// cadence. Four attempts at the default 200 ms cadence spend well under
 /// a second of the punch window before the plan degrades to its
@@ -902,6 +930,10 @@ pub(crate) struct Engine<S: UdpIo> {
     /// Stage index and announce port the prediction targets were re-based
     /// on, so a retransmitted announce rebuilds nothing.
     rebased_for: Option<(usize, u16)>,
+    /// Fallback open time for a held spray: one RTT plus a tick past the
+    /// engine start, the latest the peer's first pulses can be due when
+    /// every inbound packet of them was lost.
+    peer_warm: tokio::time::Instant,
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -945,6 +977,7 @@ impl<S: UdpIo> Engine<S> {
             stale_packets: 0,
             target_cache: None,
             rebased_for: None,
+            peer_warm: tokio::time::Instant::now(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -1063,6 +1096,7 @@ impl<S: UdpIo> Engine<S> {
         let start = tokio::time::Instant::now();
         self.start = Some(start);
         self.punch_deadline = (start + self.cfg.punch_timeout).min(self.overall);
+        self.peer_warm = start + sig.rtt() + self.cfg.tick;
         // A STUN refresh that never started has no server or no bound
         // socket, so the V4 port can never be announced. A sequence
         // marker only sharpens the peer's prediction base, so its plan
@@ -1422,10 +1456,14 @@ impl<S: UdpIo> Engine<S> {
         }
     }
 
+    /// The nominal end of stage `idx`, never past the punch deadline: a
+    /// Direct stage spends its window inside the punch budget, so the sum
+    /// of the stage durations would otherwise outlive the deadline the
+    /// top-level check enforces.
     fn stage_end(&self, idx: usize) -> tokio::time::Instant {
         let start = self.start.expect("drive sets the start");
         let elapsed: Duration = self.plan.stages[..=idx].iter().map(|s| s.duration).sum();
-        start + elapsed
+        (start + elapsed).min(self.punch_deadline)
     }
 
     /// Targets for the active stage, honoring the fresh peer port of the
@@ -1529,7 +1567,12 @@ impl<S: UdpIo> Engine<S> {
 
     async fn on_tick(&mut self, pool: &SocketPool<S>) -> Result<(), PunchError> {
         let now = tokio::time::Instant::now();
-        if now >= self.stage_end(self.stage_idx) && self.stage_idx + 1 < self.plan.stages.len() {
+        // A tick delayed by an event storm can land past several stage
+        // boundaries at once, so the advance runs until the active stage
+        // owns `now`. Plans hold at most two stages today and validation
+        // keeps every stage longer than a tick, which makes one advance
+        // per tick sufficient; the loop keeps that true for any plan.
+        while now >= self.stage_end(self.stage_idx) && self.stage_idx + 1 < self.plan.stages.len() {
             self.stage_idx += 1;
             self.sweep = 0;
             self.sweep_off = 0;
@@ -1580,7 +1623,15 @@ impl<S: UdpIo> Engine<S> {
         self.apply_peer_base();
         let targets = self.live_targets();
         let stage = &self.plan.stages[self.stage_idx];
+        // A held spray targets ports the peer's NAT has not allocated yet:
+        // the peer's sockets bind at the shared start but their mappings
+        // appear only when its pulses leave, and its pulses wait for this
+        // side's PortUpdate. Inbound peer traffic is the direct proof the
+        // mappings exist, and one RTT plus a tick is the fallback for a
+        // path that loses every one of the peer's first packets.
+        let held = stage.hold_for_peer && self.first_handshake.is_none() && now < self.peer_warm;
         if !stage.reply_only
+            && !held
             && self.confirmed.is_none()
             && !self.send_stalled
             && let Some(targets) = targets
@@ -1601,6 +1652,12 @@ impl<S: UdpIo> Engine<S> {
             };
             let senders = usize::from(stage.senders.min(group.len() as u16));
             let sweep_len = senders * per_sweep;
+            // A spray against fixed peer ports earns nothing past
+            // FIXED_PORT_PASSES full passes; the constant derives the
+            // window. Inbound-loss recovery rides the retransmission
+            // tick, which re-answers the sources already tracked.
+            let settled = stage.fixed_peer_ports
+                && self.sweep.saturating_mul(sweep_len) >= FIXED_PORT_PASSES * targets.len();
             // One tick spends at most its share of the rate grid, the same
             // bound that caps a lone sender's burst. A sweep wider than the
             // share resumes where it stopped on the next tick, so the drive
@@ -1611,7 +1668,7 @@ impl<S: UdpIo> Engine<S> {
             let quota = usize::from(burst_len(&self.cfg));
             let mut sent = 0;
             let mut failure = None;
-            while self.sweep_off < sweep_len {
+            while !settled && self.sweep_off < sweep_len {
                 if sent == quota || tokio::time::Instant::now() >= self.punch_deadline {
                     break;
                 }
@@ -2386,6 +2443,58 @@ mod tests {
         assert!(Arc::ptr_eq(&moved, &untouched));
     }
 
+    /// The nominal end of a plan that runs Direct before the matrix stage
+    /// lands at the punch deadline, not past it: the stage windows share
+    /// the punch budget, so their sum never outlives the deadline the
+    /// drive loop enforces.
+    #[test]
+    fn stage_ends_never_pass_the_punch_deadline() {
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![
+                StageSpec::send(
+                    Family::V6,
+                    1,
+                    vec![SocketAddr::V6(SocketAddrV6::new(
+                        [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+                        9999,
+                        0,
+                        0,
+                    ))],
+                    true,
+                    cfg.direct_window,
+                ),
+                StageSpec::send(
+                    Family::V4,
+                    1,
+                    vec![SocketAddr::from(([203, 0, 113, 9], 40000))],
+                    true,
+                    cfg.punch_timeout,
+                ),
+            ],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let punch_timeout = cfg.punch_timeout;
+        let direct_window = cfg.direct_window;
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+        let start = tokio::time::Instant::now();
+        engine.start = Some(start);
+        engine.punch_deadline = start + punch_timeout;
+        assert_eq!(engine.stage_end(0), start + direct_window);
+        assert_eq!(
+            engine.stage_end(1),
+            engine.punch_deadline,
+            "the matrix stage ends at the deadline, not {direct_window:?} later"
+        );
+    }
+
     #[test]
     fn stray_packets_after_confirm_keep_the_winning_address() {
         use std::net::{Ipv4Addr, SocketAddrV4};
@@ -2573,6 +2682,126 @@ mod tests {
             .await
             .expect("tracked source answers again");
         assert_eq!(pool.sent(), 2);
+    }
+
+    /// A held spray emits nothing until the peer's traffic proves its
+    /// mappings live, while the same stage without the hold pulses from
+    /// the first tick; peer traffic and, failing that, one RTT plus a
+    /// tick open the hold.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn held_spray_waits_for_peer_traffic() {
+        use crate::socket::SocketPool;
+
+        let cfg = PunchConfig::default();
+        let addr = |port: u16| SocketAddr::from(([203, 0, 113, 9], port));
+        let plan = |hold: bool| {
+            let mut spec = StageSpec::send(
+                Family::V4,
+                1,
+                vec![addr(40000), addr(40001)],
+                false,
+                cfg.punch_timeout,
+            );
+            spec.per_sweep = 1;
+            spec.hold_for_peer = hold;
+            ExecPlan {
+                stages: vec![spec],
+                refresh_v4: Refresh::None,
+                announce_v6: false,
+                refresh_server: None,
+                predicts_peer: false,
+                sequence_marker: false,
+                peer_ip: [203, 0, 113, 9].into(),
+                peer_v6: Vec::new(),
+            }
+        };
+        let syn = encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 3,
+        });
+        let net = crate::sim::Net::seeded("held_spray");
+
+        // The ungated stage spends every tick from the shared start.
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan(false),
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = vec![syn.clone()];
+        let start = tokio::time::Instant::now();
+        engine.start = Some(start);
+        engine.punch_deadline = start + cfg.punch_timeout;
+        engine.peer_warm = start + cfg.punch_timeout;
+        engine.on_tick(&pool).await.expect("tick runs");
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 2, "the ungated spray pulses every tick");
+        pool.shutdown().await;
+
+        // The held stage stays silent without peer traffic.
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan(true),
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = vec![syn.clone()];
+        let start = tokio::time::Instant::now();
+        engine.start = Some(start);
+        engine.punch_deadline = start + cfg.punch_timeout;
+        engine.peer_warm = start + cfg.punch_timeout;
+        engine.on_tick(&pool).await.expect("tick runs");
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 0, "no pulse before peer traffic");
+
+        // Peer traffic opens the hold: the Syn earns its SynAck, and the
+        // next tick pulses.
+        let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+        buf[..syn.len()].copy_from_slice(&syn);
+        let event = crate::socket::RecvEvent {
+            family: Family::V4,
+            socket: 0,
+            from: addr(50_001),
+            len: syn.len(),
+            buf,
+        };
+        engine.on_data(&pool, event).await.expect("syn answered");
+        assert_eq!(pool.sent(), 1, "the SynAck leaves immediately");
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 2, "pulses follow peer traffic");
+        pool.shutdown().await;
+
+        // Without any traffic, the RTT-plus-tick fallback opens the hold.
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan(true),
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = vec![syn];
+        let start = tokio::time::Instant::now();
+        engine.start = Some(start);
+        engine.punch_deadline = start + cfg.punch_timeout;
+        engine.peer_warm = start + cfg.tick;
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 0, "the tick before the fallback holds");
+        tokio::time::advance(cfg.tick).await;
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 1, "the fallback time opens the hold");
+        pool.shutdown().await;
     }
 
     /// A sweep target that hits the conntrack bound is skipped for the

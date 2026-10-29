@@ -297,6 +297,39 @@ async fn birthday_measured_rate_tracks_the_estimate() {
     );
 }
 
+/// A birthday side stops emitting new Syns after FIXED_PORT_PASSES full
+/// passes over its candidate list, once both live sets are closed. Runs
+/// that miss — which previously pulsed until the packet budget or the
+/// deadline ran out, thousands of packets — now spend the probe fan-out
+/// plus four passes per side, win or lose, and the measured success rate
+/// is unchanged.
+#[tokio::test(start_paused = true)]
+async fn birthday_runs_stop_pulsing_after_the_settled_pass() {
+    const RUNS: usize = 16;
+    let mut max_packets = 0usize;
+    let mut wins = 0usize;
+    for i in 0..RUNS as u64 {
+        let net = Net::from_seed_u64(0x5717_0000 + i);
+        let stun = net.stun_server();
+        let a = net.host(NatSpec::random(30000..30400));
+        let b = net.host(NatSpec::random(30000..30400));
+        let before = net.forwarded();
+        let (ra, _rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+        let spent = (net.forwarded() - before) as usize;
+        max_packets = max_packets.max(spent);
+        wins += usize::from(ra.is_ok());
+    }
+    // Probe fan-out and answers are ~64 packets, four passes of ~13
+    // candidates per side are ~104, and a won run adds its handshake
+    // exchange: every run stays under two hundred fifty. Before the
+    // stop, a missing run pulsed to its packet budget, 2 x 4096.
+    assert!(
+        max_packets < 250,
+        "the worst run spent {max_packets} packets"
+    );
+    assert!(wins > 0, "the stop must not cost every run");
+}
+
 #[tokio::test(start_paused = true)]
 async fn birthday_starved_goes_unpunchable() {
     let net = Net::seeded("birthday_starved");
@@ -322,6 +355,55 @@ async fn birthday_starved_goes_unpunchable() {
     // The decision happened in Negotiate: only the probe traffic crossed.
     let spent = net.forwarded() - forwarded_before;
     assert!(spent < 60, "data plane sent {spent} packets");
+}
+
+/// The shooter's mappings appear only once its pulses leave, and its
+/// pulses wait for the cone's PortUpdate. Over a host channel that delays
+/// each frame by 250 ms, the cone's spray holds through the delay and
+/// opens on the shooter's first Syns, so the pair still punches and the
+/// delay window spends its rate share on nothing.
+#[tokio::test(start_paused = true)]
+async fn sym_probe_spray_holds_through_a_slow_channel() {
+    use std::time::Duration;
+
+    let net = Net::seeded("sym_probe_slow_channel");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::random(30000..30100));
+    let b = net.host(NatSpec::cone_apdf());
+    let mut cfg = config(&stun);
+    cfg.target_success = 0.99;
+
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // A pump that delays every frame by 250 ms in each direction, the
+    // host transport the spray gate exists for.
+    let mut a_out = ha.to_peer;
+    let b_in = hb.from_peer;
+    tokio::spawn(async move {
+        while let Some(frame) = a_out.recv().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let _ = b_in.send(frame).await;
+        }
+    });
+    let mut b_out = hb.to_peer;
+    let a_in = ha.from_peer;
+    tokio::spawn(async move {
+        while let Some(frame) = b_out.recv().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let _ = a_in.send(frame).await;
+        }
+    });
+
+    let cfg_b = cfg.clone();
+    let a = tokio::spawn(common::run_initiator(a, cfg, la));
+    let b = tokio::spawn(common::run_responder(b, cfg_b, lb));
+    let ra = a.await.expect("initiator task panicked");
+    let rb = b.await.expect("responder task panicked");
+    let pa = ra.expect("slow-channel pair punches");
+    let pb = rb.expect("peer side punches");
+    assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+    assert_eq!(pb.report.strategy, StrategyId::SymProbe);
+    common::assert_business_traffic(&pa, &pb).await;
 }
 
 /// A SymProbe pair whose spray the budget caps below `min_success` refuses

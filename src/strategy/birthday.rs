@@ -39,5 +39,11 @@ pub(crate) fn stage(
     // target count keeps a sweep from repeating ports it already covered.
     let per_sweep = (burst_len(cfg) as usize).min(stage.targets.len());
     stage.per_sweep = per_sweep as u16;
+    // The peer's live port set closes a few passes in — its own sweep,
+    // then the answer chatter of the handshake — so the engine stops
+    // emitting new Syns once FIXED_PORT_PASSES have covered the list;
+    // later passes would repeat covered ports at zero marginal value
+    // while spending the rate budget handshake retransmissions need.
+    stage.fixed_peer_ports = true;
     Some(stage)
 }

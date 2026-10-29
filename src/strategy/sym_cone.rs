@@ -59,6 +59,11 @@ pub(crate) fn stage(
         // at the target count keeps a sweep from repeating a port it
         // already covered this tick.
         stage.per_sweep = burst_len(cfg).min(stage.targets.len() as u16);
+        // The shooter's mappings appear only when its pulses leave, which
+        // wait for this side's PortUpdate, so the spray holds until peer
+        // traffic arrives instead of spending its first RTT on ports the
+        // shooter's NAT has not handed out yet.
+        stage.hold_for_peer = true;
         Some(stage)
     }
 }

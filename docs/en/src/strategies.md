@@ -45,7 +45,7 @@ An estimate below `min_success` fails Negotiate with `Unpunchable` before any da
 
 The allocations that land between the peer's Probe and its punch sockets move its whole sequence, often past that margin. A symmetric peer with a confident stride therefore re-queries STUN on its punch socket at engine start and announces the observed port; the cone side reads that port as the sequence's current position and moves its fitted window onto it, keeping the window's stride and length.
 
-Once traffic from the peer arrives, the spray throttles to one packet per sweep so handshake replies keep the send rate.
+The spray also holds its start: the shooter's mappings appear only when its pulses leave, and its pulses wait for the cone's PortUpdate, so the cone sprays nothing until peer traffic arrives — one measured RTT plus a tick is the fallback when every inbound packet of the peer's first pulses was lost. Once traffic from the peer arrives, the spray throttles to one packet per sweep so handshake replies keep the send rate.
 
 ## PredictiveExchange
 
@@ -75,7 +75,7 @@ chance = 1 - exp(-c_A * c_B * (1/space_A + 1/space_B))
 
 An asymmetric pair therefore plays over the effective space `1 / (1/space_A + 1/space_B)`, which sits below the narrower side: a 300-by-20000 pair solves like a 296-wide space instead of a 20000-wide one. The balanced solve covers `ceil(sqrt(ln(1 / (1 - target)) * S_eff))` ports per side, capped by the span it shoots into, the conntrack bound minus reply headroom, and a quarter of the packet budget. When a cap binds, the estimate states the shortfall and the `min_success` gate refuses the pair. With defaults against a full 32768-wide space on both sides, the sizing covers 107 ports per side.
 
-Port lists draw from a generator seeded by the attempt nonce, so both sides cover the space independently while a run stays reproducible from its seed. Sweeps repeat the same covered set, so the per-sweep chance equals the attempt chance.
+Port lists draw from a generator seeded by the attempt nonce, so both sides cover the space independently while a run stays reproducible from its seed. Sweeps repeat the same covered set, so the per-sweep chance equals the attempt chance, and a side stops emitting new Syns after four full passes: the peer's live set closes within that window — its own sweep, then the answer mappings the handshake chatter mints — and later passes would only repeat covered ports while spending the rate budget that retransmissions need. A run that misses therefore costs the probe fan-out plus four passes per side instead of pulsing to the packet budget.
 
 An estimate below `min_success` fails Negotiate with `Unpunchable` before any data packet is sent, which keeps a hopeless pair cheap for both sides.
 
