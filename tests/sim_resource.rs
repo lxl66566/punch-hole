@@ -235,6 +235,55 @@ async fn stuck_host_channel_bounds_the_engine() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn engine_start_never_sleeps_past_overall() {
+    let (net, stun, a, b) = common::cone_net("clamp_start");
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // Rewrite the Offer's start delay to the honored 10 second cap, far
+    // past the session wall, so the shared start has to clamp.
+    punch_hole::sim::connect_with(ha, hb, |frame| {
+        let frame = punch_hole::msg::decode_sig(frame).ok()?;
+        let body = match frame.body {
+            punch_hole::msg::Frame::Offer(mut offer) => {
+                offer.start_delay_ms = 10_000;
+                punch_hole::msg::Frame::Offer(offer)
+            },
+            body => body,
+        };
+        Some(punch_hole::msg::encode_sig(&punch_hole::msg::SigFrame {
+            ts: frame.ts,
+            echo: frame.echo,
+            body,
+        }))
+    });
+    let mut cfg = config(&stun);
+    cfg.probe_timeout = std::time::Duration::from_secs(1);
+    cfg.overall_deadline = std::time::Duration::from_secs(2);
+
+    let start = tokio::time::Instant::now();
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+        matches!(
+            r,
+            Err(PunchError::Timeout { .. } | PunchError::SignalingClosed)
+        )
+    };
+    assert!(bounded(&ra), "got {ra:?}");
+    assert!(bounded(&rb), "got {rb:?}");
+    // Without the clamp the responder sleeps the full offered delay first
+    // and only then times out, ten seconds past the wall.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "sessions ran {} ms",
+        start.elapsed().as_millis()
+    );
+    net.wait_mappings_drained().await;
+    assert_eq!(net.mapping_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropping_the_future_releases_sockets() {
     let (net, stun, a, b) = common::cone_net("drop_future");
     let (ha, la) = punch_hole::signaling::bridge(64);

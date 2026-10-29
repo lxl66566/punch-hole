@@ -142,28 +142,42 @@ impl<F: UdpFactory> PunchSession<F> {
         };
         let negotiate_ms = elapsed_ms(t);
 
-        // DNS for the refresh query depends on nothing from the negotiation,
-        // so it resolves before the aligned sleep; a lookup that ran after
-        // the shared start would shift this side's pulses by its own latency.
-        let refresh_server = first_stun_addr(&self.config).await;
-
-        tokio::time::sleep_until(engine_start).await;
+        // A peer delay or a large measured RTT can push the shared start
+        // past the session wall; the clamp keeps the sleep inside it, and
+        // the engine then fails fast on its own deadline instead of the
+        // session outliving every deadline first.
+        let engine_start = engine_start.min(overall);
 
         // Punch and Confirm.
         let my_sockets = match role {
             Role::Initiator => sel.initiator_sockets,
             Role::Responder => sel.responder_sockets,
         };
-        let plan = strategy::build_plan(
+        let mut plan = strategy::build_plan(
             &mine,
             &peer,
             &sel,
             my_sockets,
             nonce,
             role,
-            refresh_server,
+            None,
             &self.config,
         );
+
+        // DNS for the refresh query depends on nothing from the negotiation,
+        // so it resolves before the aligned sleep; a lookup that ran after
+        // the shared start would shift this side's pulses by its own latency.
+        // The plan settles first, so symmetric strategies that announce
+        // nothing skip the lookups entirely, and the whole resolution fits
+        // in the time left before the shared start.
+        plan.refresh_server = if plan.refresh_v4 == strategy::Refresh::Stun {
+            first_stun_addr(&self.config, engine_start).await
+        } else {
+            None
+        };
+
+        tokio::time::sleep_until(engine_start).await;
+
         let engine = Engine::new(plan, self.config.clone(), nonce, overall);
         let engine_result = engine.run(&self.factory, &mut self.sig).await;
         if let Err(e) = &engine_result {
@@ -421,11 +435,15 @@ fn clamp_nat_info(mut nat: NatInfo) -> NatInfo {
 
 /// The first configured STUN server as a socket address, for refresh
 /// queries. Literal addresses resolve without any network access. Each
-/// lookup runs under its own short budget, so a hung resolver cannot stall
-/// the phase.
-async fn first_stun_addr(cfg: &PunchConfig) -> Option<SocketAddr> {
-    let per_lookup = cfg.probe_timeout.min(Duration::from_secs(2));
+/// lookup runs under its own short budget inside `deadline`, so a hung
+/// resolver cannot stall the phase or shift the aligned start.
+async fn first_stun_addr(cfg: &PunchConfig, deadline: Instant) -> Option<SocketAddr> {
     for server in &cfg.stun_servers {
+        // A literal IP resolves on the first poll even with no budget left.
+        let per_lookup = cfg
+            .probe_timeout
+            .min(Duration::from_secs(2))
+            .min(deadline.saturating_duration_since(Instant::now()));
         let lookup = tokio::net::lookup_host(server);
         let Ok(list) = tokio::time::timeout(per_lookup, lookup).await else {
             continue;
