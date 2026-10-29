@@ -18,7 +18,7 @@ The default footprint of each strategy stays small on purpose:
 
 - BirthdayBurst holds 108 mappings against a 32768-wide port space, 107 covered ports plus the peer's reply port, about a third of one percent of the space.
 - PredictiveExchange holds the largest default footprint at 2048 mappings, 8 sockets over a 256-port window, which is why `max_mappings` defaults to 4096.
-- The SymProbe spray caps itself at a quarter of the packet budget and one slot below the conntrack bound.
+- The SymProbe spray caps itself at a quarter of the packet budget, and leaves the conntrack bound room for the refresh server and the peer's reply ports.
 
 ## Socket counts and channels
 

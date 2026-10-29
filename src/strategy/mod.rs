@@ -272,9 +272,12 @@ const MAX_BURST: u16 = 32;
 /// inside the conntrack bound.
 pub(crate) fn spray_count(m: usize, space: usize, cfg: &PunchConfig) -> usize {
     let budget_cap = (cfg.packet_budget as usize / SPRAY_BUDGET_SHARE).max(1);
-    // The spray socket is the pool's only socket, so every candidate is one
-    // mapping. One slot stays free for the peer's fresh reply port.
-    let dest_cap = cfg.max_mappings.saturating_sub(1).max(1);
+    // The spray socket is the pool's only socket, so every destination is
+    // one mapping. Besides the candidates themselves, the cone side opens
+    // one destination for the STUN refresh server and one reply destination
+    // per peer symmetric socket, because every SynAck returns from a fresh
+    // peer port. The cap leaves room for all of them.
+    let dest_cap = cfg.max_mappings.saturating_sub(m + 1).max(1);
     let need = -((1.0 - cfg.target_success).ln()) * space as f64 / m.max(1) as f64;
     (need.ceil() as usize).clamp(1, budget_cap.min(dest_cap))
 }
@@ -1320,13 +1323,18 @@ mod tests {
             target_success: 0.999,
             ..PunchConfig::default()
         };
-        // 40 / 4 = 10 by budget, 5 by the conntrack bound.
+        // 40 / 4 = 10 by budget; the conntrack bound stays far away.
         assert_eq!(spray_count(16, 30_000, &cfg), 10);
+        // Two peer sockets plus the refresh server leave 6 - 3 = 3 slots
+        // for candidates under a bound of 6.
         let cfg = PunchConfig {
             max_mappings: 6,
             ..cfg
         };
-        assert_eq!(spray_count(16, 30_000, &cfg), 5);
+        assert_eq!(spray_count(2, 30_000, &cfg), 3);
+        // A peer socket count that already fills the bound leaves the floor
+        // of one candidate.
+        assert_eq!(spray_count(16, 30_000, &cfg), 1);
     }
 
     #[test]
