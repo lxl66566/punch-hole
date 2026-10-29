@@ -679,8 +679,8 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_sends_never_overshoot_the_budget() {
-        let net = crate::sim::Net::seeded("pool_budget_concurrent");
         const BUDGET: u32 = 32;
+        let net = crate::sim::Net::seeded("pool_budget_concurrent");
         let cfg = PunchConfig {
             packet_budget: BUDGET,
             packets_per_sec: 1_000_000,
