@@ -817,17 +817,24 @@ impl<S: UdpIo> Engine<S> {
                 }
             }
             // Signaling side effects leave the handlers, so the handlers
-            // stay free of the signaling handle.
+            // stay free of the signaling handle. The session wall bounds
+            // both best-effort sends: a host that stops draining its
+            // channel drops the frame instead of parking the loop, which
+            // matches how a closed bridge is already treated.
             if let Some(socket) = self.announce.take() {
-                let _ = sig.send(Frame::Confirmed { socket }).await;
+                let _ =
+                    tokio::time::timeout_at(self.overall, sig.send(Frame::Confirmed { socket }))
+                        .await;
             }
             if let Some(ports) = self.announce_ports.take() {
-                let _ = sig
-                    .send(Frame::PortUpdate {
+                let _ = tokio::time::timeout_at(
+                    self.overall,
+                    sig.send(Frame::PortUpdate {
                         v4: ports.v4,
                         v6: ports.v6,
-                    })
-                    .await;
+                    }),
+                )
+                .await;
             }
         }
         let end = tokio::time::Instant::now();

@@ -1,6 +1,6 @@
 //! Puncher, the session state machine, and the Punched result.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, time::Duration};
 
 use tokio::time::Instant;
 
@@ -174,7 +174,8 @@ impl<F: UdpFactory> PunchSession<F> {
                 },
                 _ => AbortReason::Internal,
             };
-            let _ = self.sig.send(Frame::Abort(reason)).await;
+            let _ =
+                send_deadlined(self.sig.send(Frame::Abort(reason)), overall, Phase::Punch).await;
         }
         let (socket, outcome) = engine_result?;
 
@@ -212,18 +213,23 @@ impl<F: UdpFactory> PunchSession<F> {
         mine: &NatInfo,
         deadline: Instant,
     ) -> Result<NatInfo, PunchError> {
-        let hello = self.sig.send(Frame::Hello(mine.clone())).await?;
+        let hello = send_deadlined(
+            self.sig.send(Frame::Hello(mine.clone())),
+            deadline,
+            Phase::Exchange,
+        )
+        .await?;
         let mut retry = tokio::time::interval(self.config.signaling_retry);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = retry.tick() => self.sig.send_raw(hello.clone()).await?,
+                _ = retry.tick() => send_deadlined(self.sig.send_raw(hello.clone()), deadline, Phase::Exchange).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Hello(peer) => return Ok(peer),
                     // An Offer while we are ourselves the Initiator means
                     // both sides claimed the role.
                     Frame::Offer(_) if role == Role::Initiator => {
-                        let _ = self.sig.send(Frame::Abort(AbortReason::Internal)).await;
+                        let _ = send_deadlined(self.sig.send(Frame::Abort(AbortReason::Internal)), deadline, Phase::Exchange).await;
                         return Err(PunchError::PeerAborted(AbortReason::Internal));
                     }
                     Frame::Abort(reason) => return Err(PunchError::PeerAborted(reason)),
@@ -251,7 +257,12 @@ impl<F: UdpFactory> PunchSession<F> {
             Err(e @ PunchError::Unpunchable { .. }) => {
                 // The decision needs no packets, so the peer learns it before
                 // any socket opens.
-                let _ = self.sig.send(Frame::Abort(AbortReason::Unpunchable)).await;
+                let _ = send_deadlined(
+                    self.sig.send(Frame::Abort(AbortReason::Unpunchable)),
+                    deadline,
+                    Phase::Negotiate,
+                )
+                .await;
                 return Err(e);
             },
             Err(e) => return Err(e),
@@ -268,12 +279,12 @@ impl<F: UdpFactory> PunchSession<F> {
             peer_sockets: sel.responder_sockets,
             start_delay_ms: delay.as_millis() as u32,
         });
-        let offer = self.sig.send(offer).await?;
+        let offer = send_deadlined(self.sig.send(offer), deadline, Phase::Negotiate).await?;
         let mut retry = tokio::time::interval(self.config.signaling_retry);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = retry.tick() => self.sig.send_raw(offer.clone()).await?,
+                _ = retry.tick() => send_deadlined(self.sig.send_raw(offer.clone()), deadline, Phase::Negotiate).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Accept => {
                         // The Accept left the peer about half an RTT before
@@ -283,7 +294,7 @@ impl<F: UdpFactory> PunchSession<F> {
                         return Ok((nonce, sel, start));
                     }
                     Frame::Offer(_) => {
-                        let _ = self.sig.send(Frame::Abort(AbortReason::Internal)).await;
+                        let _ = send_deadlined(self.sig.send(Frame::Abort(AbortReason::Internal)), deadline, Phase::Negotiate).await;
                         return Err(PunchError::PeerAborted(AbortReason::Internal));
                     }
                     Frame::Abort(reason) => return Err(PunchError::PeerAborted(reason)),
@@ -313,7 +324,7 @@ impl<F: UdpFactory> PunchSession<F> {
                         // and a start beyond the cap aborts instead of
                         // sleeping past every deadline.
                         if u64::from(offer.start_delay_ms) > Self::MAX_START_DELAY_MS {
-                            let _ = self.sig.send(Frame::Abort(AbortReason::Internal)).await;
+                            let _ = send_deadlined(self.sig.send(Frame::Abort(AbortReason::Internal)), deadline, Phase::Negotiate).await;
                             return Err(PunchError::PeerAborted(AbortReason::Internal));
                         }
                         let clamp = |sockets: u16| sockets.min(self.config.max_sockets);
@@ -326,7 +337,9 @@ impl<F: UdpFactory> PunchSession<F> {
                         // The Offer carries no estimate, so the report
                         // rebuilds it over the local view.
                         sel.fill_estimate(mine, peer, &self.config);
-                        let accept = self.sig.send(Frame::Accept).await?;
+                        let accept =
+                            send_deadlined(self.sig.send(Frame::Accept), deadline, Phase::Negotiate)
+                                .await?;
                         // The shared event is this send; count from here.
                         let start = Instant::now() + Duration::from_millis(u64::from(offer.start_delay_ms));
                         // The Accept carries no acknowledgement, so it is
@@ -347,7 +360,7 @@ impl<F: UdpFactory> PunchSession<F> {
                         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tokio::select! {
-                                _ = retry.tick() => self.sig.send_raw(accept.clone()).await?,
+                                _ = retry.tick() => send_deadlined(self.sig.send_raw(accept.clone()), resend_until, Phase::Negotiate).await?,
                                 frame = self.sig.recv() => {
                                     // Only a peer Abort ends the window early.
                                     if let Frame::Abort(reason) = frame?.body {
@@ -374,6 +387,24 @@ impl<F: UdpFactory> PunchSession<F> {
 
 fn elapsed_ms(t: Instant) -> u64 {
     t.elapsed().as_millis() as u64
+}
+
+/// Runs one signaling send under its phase deadline.
+///
+/// The deadline branch of a select loop cannot preempt an await inside
+/// another arm's body, and a send outside the loop has no branch at all,
+/// so every signaling send carries its own bound: a host that holds its
+/// end of the bridge but stops draining it fails the phase instead of
+/// parking the session on a full channel.
+async fn send_deadlined<T>(
+    send: impl Future<Output = Result<T, PunchError>>,
+    deadline: Instant,
+    phase: Phase,
+) -> Result<T, PunchError> {
+    match tokio::time::timeout_at(deadline, send).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(PunchError::Timeout { phase }),
+    }
 }
 
 /// Truncates a host-supplied classification to the wire limits, so the first
@@ -412,10 +443,16 @@ async fn first_stun_addr(cfg: &PunchConfig) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4, SocketAddrV6},
+        time::Duration,
+    };
 
-    use super::clamp_nat_info;
-    use crate::nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat};
+    use super::{Phase, PunchError, Puncher, TokioFactory, clamp_nat_info};
+    use crate::{
+        config::PunchConfig,
+        nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat},
+    };
 
     #[test]
     fn cached_nat_is_clamped_to_wire_limits() {
@@ -440,5 +477,43 @@ mod tests {
             clamped.v6.expect("v6 survives the clamp").addrs.len(),
             crate::msg::MAX_V6_ADDRS
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_host_channel_fails_the_phase() {
+        let (host, lib) = crate::signaling::bridge(1);
+        let cfg = PunchConfig {
+            exchange_timeout: Duration::from_millis(200),
+            signaling_retry: Duration::from_millis(50),
+            ..PunchConfig::default()
+        };
+        let cached = NatInfo {
+            v4: Some(V4Nat {
+                class: NatClass::Cone,
+                reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 40000),
+                alloc_seq: vec![40000; 4],
+                filtering: FilterClass::Unknown,
+            }),
+            v6: None,
+        };
+        let session = Puncher::with_factory(cfg, TokioFactory)
+            .expect("config valid")
+            .with_cached_nat(cached)
+            .with_signaling(lib);
+        // The held host end never drains: the first Hello fills the channel
+        // and the resend inside the retry arm blocks, where the deadline
+        // branch of the select cannot reach it.
+        let stuck = tokio::time::timeout(Duration::from_secs(120), session.initiator());
+        let err = stuck
+            .await
+            .expect("session returns")
+            .expect_err("exchange cannot complete");
+        assert!(
+            matches!(err, PunchError::Timeout {
+                phase: Phase::Exchange
+            }),
+            "got {err:?}"
+        );
+        drop(host);
     }
 }

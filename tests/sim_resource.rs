@@ -158,6 +158,83 @@ async fn overall_deadline_bounds_the_engine() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stuck_host_channel_bounds_the_engine() {
+    let (net, stun, a, b) = common::cone_net("stuck_engine");
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(4);
+    // The initiator's pump relays the setup frames and drops the rest, so
+    // no announced port ever crosses and neither engine can sweep.
+    let mut a_out = ha.to_peer;
+    let b_in = hb.from_peer;
+    tokio::spawn(async move {
+        while let Some(frame) = a_out.recv().await {
+            let setup = punch_hole::msg::decode_sig(&frame).is_ok_and(|f| {
+                matches!(
+                    f.body,
+                    punch_hole::msg::Frame::Hello(_) | punch_hole::msg::Frame::Offer(_)
+                )
+            });
+            if setup {
+                let _ = b_in.send(frame).await;
+            }
+        }
+    });
+    // The responder's pump drains through negotiation, then parks on the
+    // first engine frame with the channel held: every later PortUpdate
+    // resend queues into a channel nothing drains anymore.
+    let mut b_out = hb.to_peer;
+    let a_in = ha.from_peer;
+    tokio::spawn(async move {
+        while let Some(frame) = b_out.recv().await {
+            let setup = punch_hole::msg::decode_sig(&frame).is_ok_and(|f| {
+                matches!(
+                    f.body,
+                    punch_hole::msg::Frame::Hello(_) | punch_hole::msg::Frame::Accept
+                )
+            });
+            if !setup {
+                std::future::pending::<()>().await;
+            }
+            let _ = a_in.send(frame).await;
+        }
+    });
+
+    let mut cfg = config(&stun);
+    cfg.punch_timeout = std::time::Duration::from_secs(15);
+    cfg.overall_deadline = std::time::Duration::from_secs(4);
+    let start = tokio::time::Instant::now();
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    // Without the send bound the responder parks forever inside its
+    // PortUpdate resend and neither join handle settles.
+    let ra = tokio::time::timeout(std::time::Duration::from_secs(120), a)
+        .await
+        .expect("initiator session ends")
+        .unwrap();
+    let rb = tokio::time::timeout(std::time::Duration::from_secs(120), b)
+        .await
+        .expect("responder session ends")
+        .unwrap();
+    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+        matches!(
+            r,
+            Err(PunchError::Timeout { .. }
+                | PunchError::SignalingClosed
+                | PunchError::PeerAborted(_))
+        )
+    };
+    assert!(bounded(&ra), "got {ra:?}");
+    assert!(bounded(&rb), "got {rb:?}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(8),
+        "sessions ran {} ms",
+        start.elapsed().as_millis()
+    );
+    net.wait_mappings_drained().await;
+    assert_eq!(net.mapping_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropping_the_future_releases_sockets() {
     let (net, stun, a, b) = common::cone_net("drop_future");
     let (ha, la) = punch_hole::signaling::bridge(64);
