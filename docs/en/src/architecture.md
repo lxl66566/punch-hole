@@ -93,4 +93,4 @@ Every outbound packet passes the three guards described in [Resource control](re
 
 ## Post-handover keepalive
 
-`keepalive::spawn` shares the winner behind an `Arc` and sends a small heartbeat every ten seconds, which holds the NAT mapping open while the host idles. The returned guard aborts the task on drop. The heartbeat carries the attempt nonce, and hosts discard any datagram whose first byte is the data-plane magic and whose length stays under the protocol limit.
+`keepalive::spawn_io` sends a small heartbeat every ten seconds, which holds the NAT mapping open while the host idles; the `Arc`-shared tokio winner flows in through the `UdpIo` impl. The returned guard aborts the task on drop, and the task owns the socket value it received, so a host that moved its only reference in closes the socket with the guard. A heartbeat send that fails ends the task, and `KeepaliveGuard::is_alive` reports it, so a dying mapping is observable instead of silent. The heartbeat carries the attempt nonce, and hosts discard any datagram whose first byte is the data-plane magic and whose length stays under the protocol limit.

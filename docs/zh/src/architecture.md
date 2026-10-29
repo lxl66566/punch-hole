@@ -93,4 +93,4 @@ Probe -> Exchange -> Negotiate -> Punch -> Confirm -> Handover -> Done
 
 ## 交付后的心跳
 
-`keepalive::spawn` 把胜出套接字放进 `Arc` 共享，每十秒发一个小心跳，宿主空闲时保住 NAT 映射。返回的 guard 在 drop 时中止任务。心跳载荷带尝试 nonce，宿主要丢弃首字节是数据面魔数、长度小于协议上限的数据报。
+`keepalive::spawn_io` 每十秒发一个小心跳，宿主空闲时保住 NAT 映射，`Arc` 共享的 tokio 胜出套接字经 `UdpIo` 实现流入。返回的 guard 在 drop 时中止任务；任务持有传入的套接字值，宿主若把仅有的引用移进来，随 guard 一起关闭。心跳发送失败会结束任务，`KeepaliveGuard::is_alive` 能查到，映射的死亡可观察而非无声。心跳载荷带尝试 nonce，宿主要丢弃首字节是数据面魔数、长度小于协议上限的数据报。

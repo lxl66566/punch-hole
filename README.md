@@ -63,17 +63,41 @@ the estimate states.
 
 ## Using the library
 
-```rust,ignore
-let puncher = punch_hole::Puncher::new(punch_hole::PunchConfig::default())?;
-let (host_end, lib_end) = punch_hole::signaling::bridge(64);
+```rust,no_run
+use std::sync::Arc;
 
-// Pump host_end against your own transport to the peer.
+use punch_hole::{PunchConfig, PunchError, Puncher};
 
-let punched = puncher.with_signaling(lib_end).initiator().await?;
-// punched.socket is a raw UDP socket; punched.peer_addr is the confirmed path.
+async fn run_initiator_side() -> Result<(), PunchError> {
+    let puncher = Puncher::new(PunchConfig::default())?;
+
+    let (host_end, lib_end) = punch_hole::signaling::bridge(64);
+
+    // The host pumps its own transport against the bridge: deliver
+    // host_end.to_peer frames to the peer, and push frames that arrive
+    // from the peer into host_end.from_peer.
+
+    let punched = puncher.with_signaling(lib_end).initiator().await?;
+
+    // The business layer owns the winner from here. Tokio sockets have
+    // no Clone, so share it behind an Arc; the optional heartbeat keeps
+    // the NAT mapping open while the host idles.
+    let socket = Arc::new(punched.socket);
+    let _guard = punch_hole::keepalive::spawn(
+        Arc::clone(&socket),
+        punched.peer_addr,
+        punched.report.nonce,
+    );
+    let _ = socket; // send and receive business traffic
+
+    Ok(())
+}
 ```
 
-The full walkthrough lives in the crate documentation (`cargo doc --open`).
+This block mirrors the crate-level example in the library docs, which
+`cargo test --doc` compiles, so the snippet cannot drift from the API.
+The full walkthrough lives in the crate documentation
+(`cargo doc --open`).
 The project book carries the UDP hole punching primer, the API guide, and
 the architecture and protocol reference, in English and Chinese:
 

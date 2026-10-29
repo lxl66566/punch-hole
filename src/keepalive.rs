@@ -14,6 +14,19 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[must_use = "the heartbeat stops when the guard is dropped"]
 pub struct KeepaliveGuard(tokio::task::JoinHandle<()>);
 
+impl KeepaliveGuard {
+    /// Whether the heartbeat task is still sending.
+    ///
+    /// The task ends when a heartbeat send fails, which usually means the
+    /// socket is gone; the NAT mapping then ages out with no further
+    /// signal from this side. A host that needs to notice polls this
+    /// alongside its own socket health.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.0.is_finished()
+    }
+}
+
 impl Drop for KeepaliveGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -21,6 +34,10 @@ impl Drop for KeepaliveGuard {
 }
 
 /// Lets an `Arc`-shared tokio socket flow into the generic [`spawn_io`].
+///
+/// `tokio::net::UdpSocket` has no `Clone`, so hosts share the winner behind
+/// an `Arc`. Hosts discard any datagram whose first byte is the data-plane
+/// magic and whose length stays under the protocol limit.
 impl UdpIo for Arc<tokio::net::UdpSocket> {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         (**self).send_to(buf, target).await
@@ -36,12 +53,21 @@ impl UdpIo for Arc<tokio::net::UdpSocket> {
 }
 
 /// Sends the heartbeat on any UDP socket implementation at the default
-/// interval, which covers the generic `Punched<F::Socket>` a session returns.
+/// interval, which covers an `Arc`-shared tokio socket and the generic
+/// `Punched<F::Socket>` a session returns.
+///
+/// The task owns the socket value it receives: dropping the guard aborts
+/// the task and releases that reference, so a host that moves its only
+/// reference in closes the socket with it. Share the socket (`Arc::clone`)
+/// when business traffic must outlive the heartbeat.
 pub fn spawn_io<U: UdpIo>(socket: U, peer: SocketAddr, nonce: Nonce) -> KeepaliveGuard {
     spawn_io_with_interval(socket, peer, nonce, KEEPALIVE_INTERVAL)
 }
 
 /// `spawn_io` with a custom interval, which compressed-timer tests use.
+///
+/// A heartbeat that fails to send ends the task;
+/// [`KeepaliveGuard::is_alive`] reports that.
 pub fn spawn_io_with_interval<U: UdpIo>(
     socket: U,
     peer: SocketAddr,
@@ -54,31 +80,14 @@ pub fn spawn_io_with_interval<U: UdpIo>(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // The socket is usually the reason a beat fails, so the task
+            // ends and the guard reports it instead of retrying blind.
             if socket.send_to(&packet, peer).await.is_err() {
                 break;
             }
         }
     });
     KeepaliveGuard(handle)
-}
-
-/// Sends the heartbeat on a shared socket at the default interval.
-///
-/// `tokio::net::UdpSocket` has no `Clone`, so the host shares it behind an
-/// `Arc`. Hosts discard any datagram whose first byte is the data-plane magic
-/// and whose length stays under the protocol limit.
-pub fn spawn(socket: Arc<tokio::net::UdpSocket>, peer: SocketAddr, nonce: Nonce) -> KeepaliveGuard {
-    spawn_with_interval(socket, peer, nonce, KEEPALIVE_INTERVAL)
-}
-
-/// `spawn` with a custom interval, which compressed-timer tests use.
-pub fn spawn_with_interval(
-    socket: Arc<tokio::net::UdpSocket>,
-    peer: SocketAddr,
-    nonce: Nonce,
-    interval: Duration,
-) -> KeepaliveGuard {
-    spawn_io_with_interval(socket, peer, nonce, interval)
 }
 
 #[cfg(test)]
@@ -132,5 +141,49 @@ mod tests {
             let decoded = crate::msg::decode_packet(&buf).expect("beat is a data packet");
             assert_eq!(decoded, DataPacket::Keepalive { nonce });
         }
+    }
+
+    /// Succeeds on the first `ok` beats, then fails like a closed socket.
+    struct FailsAfter {
+        ok: std::sync::atomic::AtomicUsize,
+    }
+
+    // The failure injection is fully synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl UdpIo for FailsAfter {
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+            if self.ok.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                Ok(buf.len())
+            } else {
+                Err(io::Error::other("socket gone"))
+            }
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::other("the recorder never receives"))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_beat_ends_the_task_and_the_guard_reports_it() {
+        let sock = FailsAfter {
+            ok: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let guard = spawn_io_with_interval(
+            sock,
+            SocketAddr::from(([203, 0, 113, 9], 4500)),
+            [7; 16],
+            Duration::from_millis(100),
+        );
+        assert!(guard.is_alive(), "the task starts alive");
+        // The beat at t = 0 succeeds, the beat at t = 100 fails and ends
+        // the task, so the mapping has an observable death instead of a
+        // silent one.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!guard.is_alive(), "a failed beat ends the task");
     }
 }

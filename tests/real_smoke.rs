@@ -218,7 +218,7 @@ async fn keepalive_beats_and_stops_with_guard() {
     let target = pa.peer_addr;
     let receiver = pb.socket;
 
-    let guard = punch_hole::keepalive::spawn_with_interval(
+    let guard = punch_hole::keepalive::spawn_io_with_interval(
         Arc::clone(&sender),
         target,
         nonce,

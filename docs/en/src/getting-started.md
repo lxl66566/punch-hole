@@ -31,7 +31,7 @@ async fn run_initiator_side() -> Result<(), PunchError> {
     // no Clone, so share it behind an Arc, and keep the NAT mapping open
     // with the optional heartbeat while the host idles.
     let socket = Arc::new(punched.socket);
-    let _guard = punch_hole::keepalive::spawn(
+    let _guard = punch_hole::keepalive::spawn_io(
         Arc::clone(&socket),
         punched.peer_addr,
         punched.report.nonce,

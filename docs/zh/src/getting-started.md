@@ -29,7 +29,7 @@ async fn run_initiator_side() -> Result<(), PunchError> {
     // 从这里起业务层接管胜出套接字。tokio 套接字没有 Clone，
     // 所以放进 Arc 共享，宿主空闲时用心跳保住 NAT 映射。
     let socket = Arc::new(punched.socket);
-    let _guard = punch_hole::keepalive::spawn(
+    let _guard = punch_hole::keepalive::spawn_io(
         Arc::clone(&socket),
         punched.peer_addr,
         punched.report.nonce,

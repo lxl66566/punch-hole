@@ -50,7 +50,7 @@
 //!     // no Clone, so share it behind an Arc; the optional heartbeat keeps
 //!     // the NAT mapping open while the host idles.
 //!     let socket = Arc::new(punched.socket);
-//!     let _guard = punch_hole::keepalive::spawn(
+//!     let _guard = punch_hole::keepalive::spawn_io(
 //!         Arc::clone(&socket),
 //!         punched.peer_addr,
 //!         punched.report.nonce,
