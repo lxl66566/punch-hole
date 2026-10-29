@@ -4,7 +4,11 @@
 
 mod common;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use common::config;
 use punch_hole::{
@@ -29,6 +33,44 @@ async fn bridge_closed_by_host_fails_fast() {
         .await
         .unwrap_err();
     assert!(matches!(err, PunchError::SignalingClosed), "got {err:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn signaling_retransmission_waits_a_full_cadence() {
+    let net = Net::seeded("retry_cadence");
+    let stun = net.stun_server();
+    let host = net.host(NatSpec::cone_eif());
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, silent_peer) = punch_hole::signaling::bridge(64);
+    // No responder ever answers, so the initiator retransmits its Hello
+    // into the tap until the exchange deadline. The held peer end keeps
+    // the inbound channel open, so the deadline ends the phase.
+    let stamps: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&stamps);
+    let start = tokio::time::Instant::now();
+    punch_hole::sim::connect_with(ha, hb, move |frame| {
+        if let Ok(sig) = decode_sig(frame)
+            && let Frame::Hello(_) = sig.body
+        {
+            // The tokio clock reads virtual time, which the gaps compare on.
+            sink.lock().expect("tap lock").push(start.elapsed());
+        }
+        Some(frame.to_vec())
+    });
+    let mut cfg = config(&stun);
+    cfg.signaling_retry = Duration::from_millis(100);
+    cfg.exchange_timeout = Duration::from_millis(250);
+    let _ = common::run_initiator(host, cfg, la).await;
+    drop(silent_peer);
+
+    let stamps = stamps.lock().expect("tap lock");
+    assert!(stamps.len() >= 2, "retransmissions were observed");
+    let min_gap = Duration::from_millis(90);
+    let short = stamps
+        .windows(2)
+        .filter(|w| w[1].checked_sub(w[0]).is_some_and(|g| g < min_gap))
+        .count();
+    assert_eq!(short, 0, "duplicate first send, stamps {stamps:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -117,9 +159,7 @@ async fn lossy_bridge_still_completes() {
     let (hb, lb) = punch_hole::signaling::bridge(64);
     // 30 percent frame loss on the host channel, decided by a private
     // generator so the net's seed stays untouched.
-    let rng = Arc::new(std::sync::Mutex::new(rand::rngs::StdRng::seed_from_u64(
-        0x00c0_ffee,
-    )));
+    let rng = Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(0x00c0_ffee)));
     punch_hole::sim::connect_with(ha, hb, move |frame| {
         use rand::prelude::*;
         let keep = rng.lock().expect("loss rng").random::<f32>() >= 0.3;

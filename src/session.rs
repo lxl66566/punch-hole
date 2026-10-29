@@ -233,7 +233,12 @@ impl<F: UdpFactory> PunchSession<F> {
             Phase::Exchange,
         )
         .await?;
-        let mut retry = tokio::time::interval(self.config.signaling_retry);
+        // The initial send just left, so the first retransmission waits one
+        // full cadence instead of firing immediately.
+        let mut retry = tokio::time::interval_at(
+            Instant::now() + self.config.signaling_retry,
+            self.config.signaling_retry,
+        );
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -294,7 +299,12 @@ impl<F: UdpFactory> PunchSession<F> {
             start_delay_ms: delay.as_millis() as u32,
         });
         let offer = send_deadlined(self.sig.send(offer), deadline, Phase::Negotiate).await?;
-        let mut retry = tokio::time::interval(self.config.signaling_retry);
+        // The initial send just left, so the first retransmission waits one
+        // full cadence instead of firing immediately.
+        let mut retry = tokio::time::interval_at(
+            Instant::now() + self.config.signaling_retry,
+            self.config.signaling_retry,
+        );
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
