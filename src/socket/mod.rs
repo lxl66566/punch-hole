@@ -121,17 +121,26 @@ fn reserve(budget: &AtomicU32) -> bool {
     }
 }
 
+/// Refresh queries one session may send. The strategy retries a query
+/// four times per refresh and starts one refresh per session, so the quota
+/// leaves headroom for a lossy path without touching the data-plane
+/// budget.
+const REFRESH_BUDGET: u32 = 16;
+
 /// Owns every socket a session opens. Only the pool closes them.
 ///
-/// Every outbound packet passes the rate limiter and the session budget, and
-/// the pool bounds live sockets times distinct destinations, which is the
-/// conntrack footprint the session leaves on its NAT.
+/// Every outbound packet passes the rate limiter, and every data-plane
+/// packet passes the session budget on top; the pool also bounds live
+/// sockets times distinct destinations, which is the conntrack footprint
+/// the session leaves on its NAT. Refresh queries share the rate grid and
+/// draw from their own small quota instead of the data-plane budget.
 pub(crate) struct SocketPool<S: UdpIo> {
     groups: [Vec<Arc<S>>; 2],
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     limiter: rate::RateLimiter,
     budget: AtomicU32,
+    refresh_budget: AtomicU32,
     dests: RwLock<HashSet<SocketAddr>>,
     max_mappings: usize,
     sent: AtomicU32,
@@ -158,6 +167,7 @@ impl<S: UdpIo> SocketPool<S> {
             tasks: Vec::new(),
             limiter: rate::RateLimiter::new(cfg.packets_per_sec),
             budget: AtomicU32::new(cfg.packet_budget),
+            refresh_budget: AtomicU32::new(REFRESH_BUDGET),
             dests: RwLock::new(HashSet::new()),
             max_mappings: cfg.max_mappings,
             sent: AtomicU32::new(0),
@@ -221,8 +231,8 @@ impl<S: UdpIo> SocketPool<S> {
         self.group_ref(family).len()
     }
 
-    /// One pool socket, for sends that bypass the engine loop, such as the
-    /// refresh STUN query.
+    /// One pool socket, for reads such as the local address a refresh
+    /// announces. Sends belong to `send` and `send_refresh`.
     pub(crate) fn socket(&self, family: Family, idx: u16) -> Option<Arc<S>> {
         self.group_ref(family).get(idx as usize).cloned()
     }
@@ -275,6 +285,44 @@ impl<S: UdpIo> SocketPool<S> {
         }
         self.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Sends one STUN refresh query from a V4 pool socket.
+    ///
+    /// Refresh is control-plane traffic to a host-configured server, so it
+    /// draws from a small dedicated quota instead of the data-plane budget
+    /// and never enters the conntrack table: the answer is matched to the
+    /// querying socket, not to a tracked destination. The shared rate grid
+    /// still paces it, and it counts in `sent` like every outbound packet.
+    pub(crate) async fn send_refresh(
+        &self,
+        idx: u16,
+        buf: &[u8],
+        server: SocketAddr,
+    ) -> Result<(), PunchError> {
+        if !reserve(&self.refresh_budget) {
+            return Err(PunchError::BudgetExhausted);
+        }
+        self.limiter.acquire().await;
+        let sent = match self.group_ref(Family::V4).get(idx as usize) {
+            Some(sock) => sock.send_to(buf, server).await,
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pool index out of range",
+            )),
+        };
+        match sent {
+            Ok(_) => {
+                self.sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            Err(err) => {
+                // No packet left the host, so the reserved quota unit goes
+                // back.
+                self.refresh_budget.fetch_add(1, Ordering::Relaxed);
+                Err(PunchError::Io(err))
+            },
+        }
     }
 
     /// Packets the pool actually sent.
@@ -466,6 +514,81 @@ mod tests {
             ));
         }
         assert_eq!(pool.sent(), 0);
+        pool.shutdown().await;
+    }
+
+    /// Refresh queries never take a conntrack slot: the answer is matched
+    /// to the querying socket, so a full destination table still leaves
+    /// the data-plane path exactly as bounded as before.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn refresh_sends_skip_the_conntrack_table() {
+        let net = crate::sim::Net::seeded("pool_refresh_conntrack");
+        let cfg = PunchConfig {
+            max_mappings: 1,
+            ..PunchConfig::default()
+        };
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+
+        // The one allowed destination slot goes to a data-plane target.
+        pool.send(Family::V4, 0, b"x", target)
+            .await
+            .expect("data-plane send");
+
+        // The refresh server is host-configured and conntrack-exempt.
+        let server = SocketAddr::from(([203, 0, 113, 30], 3478));
+        pool.send_refresh(0, b"q", server)
+            .await
+            .expect("refresh send");
+        assert_eq!(pool.sent(), 2, "refresh counts in the pool stats");
+
+        let other = SocketAddr::from(([203, 0, 113, 9], 40000));
+        assert!(matches!(
+            pool.send(Family::V4, 0, b"x", other).await,
+            Err(PunchError::ConntrackExhausted)
+        ));
+        pool.shutdown().await;
+    }
+
+    /// The refresh quota is a hard bound: past it every query fails without
+    /// touching the data-plane budget.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn refresh_quota_runs_out() {
+        let net = crate::sim::Net::seeded("pool_refresh_quota");
+        let cfg = PunchConfig::default();
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let server = SocketAddr::from(([203, 0, 113, 30], 3478));
+        for _ in 0..REFRESH_BUDGET {
+            pool.send_refresh(0, b"q", server)
+                .await
+                .expect("quota covers the query");
+        }
+        assert_eq!(pool.sent(), REFRESH_BUDGET);
+        assert!(matches!(
+            pool.send_refresh(0, b"q", server).await,
+            Err(PunchError::BudgetExhausted)
+        ));
+        // The data-plane budget stayed whole.
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+        pool.send(Family::V4, 0, b"x", target)
+            .await
+            .expect("data-plane budget untouched by refresh");
         pool.shutdown().await;
     }
 

@@ -10,7 +10,7 @@ Every `SocketPool::send` walks the same sequence:
 2. **Packet budget.** One session-wide counter caps the total data-plane packets. A failed send returns its unit, so an unreachable route spends nothing.
 3. **Rate cap.** A global token grid releases at most `packets_per_sec` packets across every pool socket.
 
-The guards apply to every packet the session sends, handshake replies included.
+The guards apply to every packet the session sends, handshake replies included. The engine's STUN refresh queries leave through the pool as well: they share the rate grid, count in the session stats, and draw from a small dedicated quota instead of the data-plane budget. They skip the conntrack table because the answer is matched to the querying socket rather than a tracked destination.
 
 ## Default footprints
 

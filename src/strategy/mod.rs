@@ -1114,10 +1114,13 @@ impl<S: UdpIo> Engine<S> {
         } else if let Some(pending) = &mut self.stun
             && now >= pending.next_retry
         {
-            if let Some(sock) = pool.socket(Family::V4, pending.socket) {
-                let _ = sock.send_to(&pending.request, pending.server).await;
-                pending.attempts_left -= 1;
-            }
+            // A failed send burns a retry exactly like an unanswered query,
+            // so persistent refresh failure surfaces through the
+            // retries-exhausted path above instead of silence.
+            let _ = pool
+                .send_refresh(pending.socket, &pending.request, pending.server)
+                .await;
+            pending.attempts_left -= 1;
             pending.next_retry = now + self.cfg.confirm_retry;
         }
 
@@ -1822,6 +1825,62 @@ mod tests {
             .expect("querying socket accepts the answer");
         assert!(engine.stun.is_none(), "the query completed");
         assert_eq!(engine.own_ports.map(|ports| ports.v4), Some(Some(41_002)));
+    }
+
+    /// Refresh queries leave through the pool: they count in its stats, and
+    /// a server that never answers exhausts the retries into an error
+    /// instead of four silent failures.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn refresh_queries_flow_through_the_pool_and_surface_failure() {
+        use crate::socket::SocketPool;
+
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::reply(Family::V4, cfg.punch_timeout)],
+            refresh_v4: Refresh::Stun,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let server = SocketAddr::from(([203, 0, 113, 30], 3478));
+        engine.stun = Some(StunPending {
+            txid: [7u8; 12],
+            request: crate::nat::probe::binding_request(&[7u8; 12]),
+            socket: 0,
+            server,
+            next_retry: tokio::time::Instant::now(),
+            attempts_left: 4,
+        });
+        let net = crate::sim::Net::seeded("refresh_via_pool");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        engine.start = Some(tokio::time::Instant::now());
+
+        // Every retry is a pool send and shows up in the stats.
+        for sent in 1..=4 {
+            engine.on_tick(&pool).await.expect("retry tick");
+            assert_eq!(pool.sent(), sent, "retry {sent} went through the pool");
+            tokio::time::advance(cfg.confirm_retry).await;
+        }
+
+        // A server that stays silent turns the exhausted retries into a
+        // phase error for a session with no handshake traffic yet.
+        let err = engine.on_tick(&pool).await.expect_err("retries exhausted");
+        assert!(
+            matches!(&err, PunchError::Io(e) if e.to_string().contains("stun refresh")),
+            "got {err:?}"
+        );
+        pool.shutdown().await;
     }
 
     /// Duplicate Syns share one SynAck per confirm window, so a flood
