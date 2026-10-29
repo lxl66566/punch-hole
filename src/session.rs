@@ -8,7 +8,7 @@ use crate::{
     config::PunchConfig,
     error::{Phase, PunchError},
     msg::{AbortReason, Frame, Nonce, Offer, new_nonce},
-    nat::NatInfo,
+    nat::{NatClass, NatInfo},
     report::{PhaseDurations, PunchReport, Role},
     signaling::{LibEnd, SigIo},
     socket::{TokioFactory, UdpFactory, UdpIo},
@@ -175,6 +175,7 @@ impl<F: UdpFactory> PunchSession<F> {
         } else {
             None
         };
+        let refresh_server = plan.refresh_server;
 
         tokio::time::sleep_until(engine_start).await;
 
@@ -193,12 +194,35 @@ impl<F: UdpFactory> PunchSession<F> {
         }
         let (socket, outcome) = engine_result?;
 
+        // The space estimate states the model's port-span input per side;
+        // only a symmetric reading draws one, and each side's own view
+        // feeds its span, so the roles map before measuring.
+        let (initiator_nat, responder_nat) = match role {
+            Role::Initiator => (&mine, &peer),
+            Role::Responder => (&peer, &mine),
+        };
+        let span_of = |nat: &NatInfo| {
+            matches!(
+                strategy::effective_class(nat),
+                NatClass::EasySym { .. } | NatClass::HardSym
+            )
+            .then(|| strategy::peer_space(nat))
+        };
+
         let report = PunchReport {
             role,
             nonce,
             strategy: sel.strategy,
             local_class: mine.v4_class(),
             peer_class: peer.v4_class(),
+            local_reflexive_v4: mine.reflexive_v4(),
+            local_reflexive_v6: mine
+                .v6
+                .as_ref()
+                .map_or_else(Vec::new, |v6| v6.addrs.clone()),
+            refresh_server,
+            initiator_space: span_of(initiator_nat),
+            responder_space: span_of(responder_nat),
             winner_local_port: socket.local_addr().map_or(0, |a| a.port()),
             peer_socket: outcome.peer_socket,
             packets_sent: outcome.packets_sent,

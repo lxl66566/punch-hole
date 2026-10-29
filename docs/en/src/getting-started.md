@@ -68,7 +68,7 @@ pub struct Punched<S = tokio::net::UdpSocket> {
 }
 ```
 
-The socket stays unconnected, so the host chooses its own receive pattern. `peer_addr` is the confirmed data-plane address of the peer. The report carries both NAT classes, the strategy, the success estimate for burst strategies, packet counts, and the wall time of each phase, which covers logging and relay decisions.
+The socket stays unconnected, so the host chooses its own receive pattern. `peer_addr` is the confirmed data-plane address of the peer. The report carries both NAT classes, the local reflexive addresses, the STUN server the engine's refresh queries used, the port-space estimate for each symmetric side, the strategy, the success estimate for burst strategies, packet counts, and the wall time of each phase, which covers logging, telemetry, and relay decisions.
 
 ## Host responsibilities
 

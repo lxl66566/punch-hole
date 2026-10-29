@@ -197,6 +197,26 @@ async fn cone_pair_punches_through_two_nat_labs() {
     assert_eq!(pb.report.local_class, NatClass::Cone);
     assert_eq!(pa.report.nonce, pb.report.nonce);
 
+    // The report carries the reflexive evidence behind the classification.
+    assert_eq!(
+        pa.report.local_reflexive_v4.map(|a| *a.ip()),
+        Some(nat_a.public_ip())
+    );
+    assert_eq!(
+        pb.report.local_reflexive_v4.map(|a| *a.ip()),
+        Some(nat_b.public_ip())
+    );
+    assert!(pa.report.local_reflexive_v6.is_empty(), "v6 stays off");
+    // Both sides resolve the same first STUN server for their refresh
+    // queries, and the report names it.
+    assert!(
+        pa.report.refresh_server.is_some(),
+        "refresh server resolves"
+    );
+    assert_eq!(pb.report.refresh_server, pa.report.refresh_server);
+    assert_eq!(pa.report.initiator_space, None, "no symmetric side");
+    assert_eq!(pa.report.responder_space, None);
+
     // Each side aims at the other NAT's public address.
     assert_eq!(pa.peer_addr.ip(), IpAddr::from(nat_b.public_ip()));
     assert_eq!(pb.peer_addr.ip(), IpAddr::from(nat_a.public_ip()));
@@ -279,6 +299,15 @@ async fn hard_sym_cone_apdf_punches_via_spray_over_two_nat_labs() {
     assert_eq!(pb.report.local_class, NatClass::Cone);
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
     assert_eq!(pb.report.strategy, StrategyId::SymProbe);
+    // The space estimate names the symmetric side, whichever role reports:
+    // the initiator is the symmetric one here, the responder the cone.
+    assert!(
+        pa.report.initiator_space.is_some(),
+        "initiator is symmetric"
+    );
+    assert_eq!(pa.report.responder_space, None, "responder is a cone");
+    assert_eq!(pb.report.initiator_space, pa.report.initiator_space);
+    assert_eq!(pb.report.responder_space, None);
     // The spray model sizes for the 0.99 target, so both roles carry an
     // estimate at or above it; 0.98 keeps float noise out of the bar.
     assert!(pa.report.success_estimate.unwrap_or(0.0) > 0.98);

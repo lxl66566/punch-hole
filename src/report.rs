@@ -1,5 +1,7 @@
 //! Session report values.
 
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+
 use crate::{
     msg::{Nonce, StrategyId},
     nat::NatClass,
@@ -20,6 +22,21 @@ pub struct PunchReport {
     pub strategy: StrategyId,
     pub local_class: NatClass,
     pub peer_class: NatClass,
+    /// Local IPv4 reflexive address Probe observed. `None` when a cached
+    /// classification carried no IPv4 evidence.
+    pub local_reflexive_v4: Option<SocketAddrV4>,
+    /// Local global IPv6 reflexive addresses Probe observed, capped at the
+    /// wire limit.
+    pub local_reflexive_v6: Vec<SocketAddrV6>,
+    /// The STUN server the engine's refresh queries used, when the plan
+    /// refreshed its V4 mapping.
+    pub refresh_server: Option<SocketAddr>,
+    /// Port-space width the model estimated over the initiator's own
+    /// allocation sequence; stated when that side reads as symmetric.
+    pub initiator_space: Option<usize>,
+    /// Port-space width the model estimated over the responder's own
+    /// allocation sequence; stated when that side reads as symmetric.
+    pub responder_space: Option<usize>,
     /// Local port of the winner socket.
     pub winner_local_port: u16,
     /// Pool index of the peer's winner socket, from its packets or its
