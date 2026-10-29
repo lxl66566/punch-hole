@@ -97,6 +97,30 @@ pub(crate) struct RecvEvent {
     pub buf: [u8; MAX_DATA_PACKET],
 }
 
+/// Reserves one unit from a budget counter, or fails when it is empty.
+///
+/// The compare-and-swap loop makes the check and the decrement one atomic
+/// step. A subtract-then-roll-back sequence reads as a huge wrapped value
+/// between the two steps, which lets a concurrent caller overshoot a budget
+/// that just ran out.
+fn reserve(budget: &AtomicU32) -> bool {
+    let mut current = budget.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return false;
+        }
+        match budget.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Owns every socket a session opens. Only the pool closes them.
 ///
 /// Every outbound packet passes the rate limiter and the session budget, and
@@ -230,9 +254,7 @@ impl<S: UdpIo> SocketPool<S> {
                 dests.insert(target);
             }
         }
-        // Subtraction on an empty budget wraps the counter, so roll the unit back.
-        if self.budget.fetch_sub(1, Ordering::Relaxed) == 0 {
-            self.budget.fetch_add(1, Ordering::Relaxed);
+        if !reserve(&self.budget) {
             return Err(PunchError::BudgetExhausted);
         }
         self.limiter.acquire().await;
@@ -416,6 +438,56 @@ mod tests {
             pool.send(Family::V4, 0, b"x", target).await,
             Err(PunchError::BudgetExhausted)
         ));
+        pool.shutdown().await;
+    }
+
+    /// Concurrent senders must never overshoot the budget. The reserve is
+    /// one atomic step per unit, so racing callers cannot read a wrapped
+    /// counter and slip past an exhausted budget.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_never_overshoot_the_budget() {
+        let net = crate::sim::Net::seeded("pool_budget_concurrent");
+        const BUDGET: u32 = 32;
+        let cfg = PunchConfig {
+            packet_budget: BUDGET,
+            packets_per_sec: 1_000_000,
+            ..PunchConfig::default()
+        };
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        let target = pool
+            .socket(Family::V4, 0)
+            .expect("one socket bound")
+            .local_addr()
+            .expect("sim socket has an address");
+        let pool = Arc::new(pool);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            tasks.push(tokio::spawn(async move {
+                let mut wins = 0;
+                loop {
+                    match pool.send(Family::V4, 0, b"x", target).await {
+                        Ok(()) => wins += 1,
+                        Err(PunchError::BudgetExhausted) => break,
+                        Err(e) => panic!("unexpected send error: {e}"),
+                    }
+                }
+                wins
+            }));
+        }
+        let mut spent = 0;
+        for t in tasks {
+            spent += t.await.expect("sender task finished");
+        }
+        assert_eq!(spent, BUDGET, "exactly the budget went out");
+        assert_eq!(pool.sent(), BUDGET);
+
+        let pool = Arc::try_unwrap(pool).ok().expect("tasks released the pool");
         pool.shutdown().await;
     }
 }
