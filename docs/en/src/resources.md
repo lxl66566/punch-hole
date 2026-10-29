@@ -16,6 +16,10 @@ The guards apply to every packet the session sends, handshake replies included. 
 
 Targets derive from peer-signaled data, so every send validates its destination first: the pool rejects unspecified addresses, port zero, multicast, and the IPv4 broadcast with an `InvalidInput` error, and a peer whose IPv4 address is unspecified yields no IPv4 targets at all. The peer's IPv6 list keeps only addresses that can be a global peer; multicast, link-local, IPv4-mapped, and unspecified entries drop out. Loopback stays allowed in the shipped configuration, because the smoke tests and the NAT lab exercise the engine over real loopback sockets.
 
+## Classification probing
+
+Probe runs before the pool exists, so its fan-out is the one path outside the three guards. The bound is structural: at most `MAX_ALLOC_SEQ` IPv4 plus `MAX_V6_ADDRS` IPv6 destinations, with one extra retry round for silent IPv4 destinations, so at most `2 * MAX_ALLOC_SEQ + MAX_V6_ADDRS` probe packets leave the host. Everything after Probe, refresh queries included, goes through the pool.
+
 ## Default footprints
 
 The default footprint of each strategy stays small on purpose:
