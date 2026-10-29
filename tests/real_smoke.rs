@@ -161,7 +161,7 @@ async fn loopback_punch_exchanges_business_bytes() {
     let (pa, pb) = punch_loopback().await;
     assert!(pa.peer_addr.ip().is_loopback());
     assert!(pb.peer_addr.ip().is_loopback());
-    assert_eq!(pa.report.local_class, punch_hole::NatClass::Public);
+    assert_eq!(pa.report.local_class, Some(punch_hole::NatClass::Public));
     assert_eq!(pa.report.nonce, pb.report.nonce);
 
     let mut buf = [0u8; 64];
@@ -284,7 +284,7 @@ async fn direct_v6_session_runs_on_loopback() {
     // matrix strategies bind IPv4 only.
     assert!(pa.peer_addr.is_ipv6(), "got {}", pa.peer_addr);
     assert!(pb.peer_addr.is_ipv6(), "got {}", pb.peer_addr);
-    assert_eq!(pa.report.local_class, punch_hole::NatClass::Public);
+    assert_eq!(pa.report.local_class, Some(punch_hole::NatClass::Public));
 
     let mut buf = [0u8; 64];
     pa.socket

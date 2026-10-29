@@ -86,13 +86,15 @@ pub struct V6Nat {
 }
 
 impl NatInfo {
-    /// The IPv4 mapping class, defaulting to `Public` when no IPv4 path exists.
+    /// The IPv4 mapping class, when any IPv4 evidence exists.
+    ///
+    /// `None` marks a side that reported no IPv4 path at all, which is
+    /// evidence absent, not evidence of a public host: `Public` asserts
+    /// the reflexive address is the host's own, a claim only an observed
+    /// probe can make.
     #[must_use]
-    pub fn v4_class(&self) -> NatClass {
-        match &self.v4 {
-            Some(v4) => v4.class,
-            None => NatClass::Public,
-        }
+    pub fn v4_class(&self) -> Option<NatClass> {
+        self.v4.as_ref().map(|v4| v4.class)
     }
 
     /// The IPv4 reflexive address, when one was observed.
@@ -108,4 +110,28 @@ impl NatInfo {
 #[must_use]
 pub fn parse_stun_response(buf: &[u8], txid: &[u8; 12]) -> Option<std::net::SocketAddr> {
     probe::parse_mapped(buf, txid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Missing IPv4 evidence is the absence of a claim, not a public one:
+    /// only an observed probe asserts `Public`.
+    #[test]
+    fn missing_v4_evidence_is_not_public() {
+        let none = NatInfo::default();
+        assert_eq!(none.v4_class(), None);
+        let public = NatInfo {
+            v4: Some(V4Nat {
+                class: NatClass::Public,
+                reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 5000),
+                alloc_seq: vec![5000, 5000],
+                distinct_probe_ips: 2,
+                filtering: FilterClass::Unknown,
+            }),
+            v6: None,
+        };
+        assert_eq!(public.v4_class(), Some(NatClass::Public));
+    }
 }

@@ -65,12 +65,17 @@ impl Selection {
 /// The mapping class after confidence demotion.
 ///
 /// An EasySym fit without three consistent deltas is treated as HardSym by
-/// every decision from here on.
+/// every decision from here on. A side without IPv4 evidence has no IPv4
+/// mapping behavior to read, and the matrix treats it as the non-symmetric
+/// case; every stage builder then refuses for lack of a peer reflexive
+/// address, so a pair with no IPv4 path on either side and no IPv6
+/// addresses runs idle to its punch deadline instead of mistaking the
+/// absence for a public path.
 pub(crate) fn effective_class(info: &NatInfo) -> NatClass {
     let seq = info.v4.as_ref().map_or(&[][..], |v4| &v4.alloc_seq);
     match info.v4_class() {
-        NatClass::EasySym { .. } if !easy_confident(seq) => NatClass::HardSym,
-        other => other,
+        Some(NatClass::EasySym { .. }) if !easy_confident(seq) => NatClass::HardSym,
+        other => other.unwrap_or(NatClass::Public),
     }
 }
 
@@ -84,7 +89,7 @@ pub(crate) fn effective_class(info: &NatInfo) -> NatClass {
 /// address with the local one and carries its own proof.
 pub(crate) fn cone_confident(info: &NatInfo) -> bool {
     match info.v4_class() {
-        NatClass::Cone => {
+        Some(NatClass::Cone) => {
             let v4 = info.v4.as_ref().expect("a cone reading owns v4 evidence");
             v4.distinct_probe_ips >= 2 && v4.alloc_seq.len() >= 2
         },
@@ -239,8 +244,13 @@ pub(crate) fn direct_first(mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) ->
     let both_v6 = cfg.ipv6
         && mine.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty())
         && peer.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty());
-    let both_public =
-        effective_class(mine) == NatClass::Public && effective_class(peer) == NatClass::Public;
+    // A public path is an observed claim, so a side without IPv4 evidence
+    // never qualifies: its v4 Direct stage would have skipped itself for
+    // lack of a reflexive address anyway.
+    let both_public = matches!(
+        (mine.v4_class(), peer.v4_class()),
+        (Some(NatClass::Public), Some(NatClass::Public))
+    );
     both_v6 || both_public
 }
 
@@ -3118,10 +3128,11 @@ mod tests {
         use crate::report::Role;
         let cfg = PunchConfig::default();
         // A public local side against a peer that reported no v4 and no v6:
-        // both classes read Public, so Direct qualifies but has no target.
+        // no IPv4 evidence is not a public claim, so Direct does not even
+        // qualify, and no stage builder finds a target either way.
         let mine = sample_info(NatClass::Public, &[5000, 5000]);
         let peer = NatInfo { v4: None, v6: None };
-        assert!(direct_first(&mine, &peer, &cfg));
+        assert!(!direct_first(&mine, &peer, &cfg));
         let sel = select(&mine, &peer, &cfg).expect("both public select");
         let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
         assert!(

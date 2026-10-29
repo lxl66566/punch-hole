@@ -24,8 +24,8 @@ async fn cone_detected() {
     let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
     let pa = ra.expect("cone pair punches");
     let pb = rb.expect("cone pair punches");
-    assert_eq!(pa.report.local_class, NatClass::Cone);
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
 }
 
 #[tokio::test(start_paused = true)]
@@ -37,7 +37,7 @@ async fn easy_step_detected() {
     let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
     let pa = ra.expect("easy pair punches");
     let _ = rb.expect("easy pair punches");
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 1 });
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 1 }));
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
 }
 
@@ -59,7 +59,7 @@ async fn hard_detected() {
     )
     .await;
     let pa = ra.expect("birthday pair punches");
-    assert_eq!(pa.report.local_class, NatClass::HardSym);
+    assert_eq!(pa.report.local_class, Some(NatClass::HardSym));
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);
 }
 
@@ -72,8 +72,8 @@ async fn public_detected() {
     let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
     let pa = ra.expect("public pair punches");
     let pb = rb.expect("public pair punches");
-    assert_eq!(pa.report.local_class, NatClass::Public);
-    assert_eq!(pb.report.local_class, NatClass::Public);
+    assert_eq!(pa.report.local_class, Some(NatClass::Public));
+    assert_eq!(pb.report.local_class, Some(NatClass::Public));
 }
 
 #[tokio::test(start_paused = true)]
@@ -340,7 +340,7 @@ async fn outbound_probe_loss_keeps_easy_sym() {
     let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
     let pa = ra.expect("easy pair punches through one lost request");
     let _ = rb.expect("peer side punches");
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 1 });
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 1 }));
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
 }
 
@@ -364,7 +364,7 @@ async fn persistent_send_failure_keeps_the_stride() {
     let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
     let pa = ra.expect("easy pair punches through one failed destination");
     let _ = rb.expect("peer side punches");
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 2 }));
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
 }
 #[tokio::test(start_paused = true)]

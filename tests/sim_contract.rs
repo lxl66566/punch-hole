@@ -419,9 +419,10 @@ async fn sequential_nat_produces_stepped_allocations() {
         common::punch_pair(host, config(&stun), b, config(&stun)).await
     };
     let report = ra.expect("easy pair punches").report;
-    assert_eq!(report.local_class, punch_hole::NatClass::EasySym {
-        step: 2
-    });
+    assert_eq!(
+        report.local_class,
+        Some(punch_hole::NatClass::EasySym { step: 2 })
+    );
     let _ = Mapping::Cone;
 }
 

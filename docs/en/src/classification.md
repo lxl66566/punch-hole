@@ -23,6 +23,8 @@ The answer ports, in allocation order, form `alloc_seq`. The sequence is the NAT
 
 The step divides each port delta by the allocation-index distance that produced it, which keeps the true stride across holes. The sequence `5000, 5002, 5006` with a silent destination at index 2 still reads as a step of two, because the last delta spans two allocations.
 
+A side that reported no IPv4 evidence at all carries no class: `NatInfo::v4_class()` returns `None`, and the report fields `local_class` and `peer_class` carry the same distinction. Absence of evidence is not a public path — `Public` is an observed claim that the reflexive address is the host's own — and the selection matrix treats a classless side as a pair the IPv4 strategies cannot target.
+
 One socket against many destinations settles the class on its own. A port that two sockets share can be coincidence inside a narrow allocation range, so the prober reads the sequence rather than consulting a second socket.
 
 ## Confidence

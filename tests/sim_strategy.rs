@@ -37,8 +37,8 @@ async fn hard_sym_cone_uses_sym_probe() {
     let pb = rb.expect("sym probe punches");
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
     assert_eq!(pb.report.strategy, StrategyId::SymProbe);
-    assert_eq!(pa.report.local_class, NatClass::HardSym);
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::HardSym));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
     common::assert_business_traffic(&pa, &pb).await;
     let _ = net.mapping_count();
 }
@@ -87,8 +87,8 @@ async fn easy_sym_cone_apdf_punches_via_prediction() {
     let pb = rb.expect("prediction spray punches");
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
     assert_eq!(pb.report.strategy, StrategyId::SymProbe);
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 2 }));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
     common::assert_business_traffic(&pa, &pb).await;
     let _ = net.mapping_count();
 }
@@ -124,8 +124,8 @@ async fn predictive_burst_easy_initiator_punches() {
     let pb = rb.expect("prediction burst punches");
     assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
     assert_eq!(pb.report.strategy, StrategyId::PredictiveBurst);
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
-    assert_eq!(pb.report.local_class, NatClass::HardSym);
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 2 }));
+    assert_eq!(pb.report.local_class, Some(NatClass::HardSym));
     // The estimate states the continuation regime, which the sim holds.
     assert_eq!(pa.report.success_estimate, Some(1.0));
     assert_eq!(pb.report.success_estimate, Some(1.0));
@@ -145,8 +145,8 @@ async fn predictive_burst_hard_initiator_punches() {
     let pb = rb.expect("prediction burst punches");
     assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
     assert_eq!(pb.report.strategy, StrategyId::PredictiveBurst);
-    assert_eq!(pa.report.local_class, NatClass::HardSym);
-    assert_eq!(pb.report.local_class, NatClass::EasySym { step: 3 });
+    assert_eq!(pa.report.local_class, Some(NatClass::HardSym));
+    assert_eq!(pb.report.local_class, Some(NatClass::EasySym { step: 3 }));
     common::assert_business_traffic(&pa, &pb).await;
 }
 
@@ -226,7 +226,7 @@ async fn easy_sym_pair_with_gapped_allocations_punches() {
     let pb = rb.expect("gapped easy pair punches");
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
     assert_eq!(pb.report.strategy, StrategyId::PredictiveExchange);
-    assert_eq!(pa.report.peer_class, NatClass::EasySym { step: 2 });
+    assert_eq!(pa.report.peer_class, Some(NatClass::EasySym { step: 2 }));
     common::assert_business_traffic(&pa, &pb).await;
     let _ = net.mapping_count();
 }
@@ -390,7 +390,7 @@ async fn address_dependent_pair_routes_sym_probe() {
     .await;
     let pa = ra.expect("ambiguous pair punches");
     let pb = rb.expect("ambiguous pair punches");
-    assert_eq!(pa.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
     assert_eq!(pb.report.strategy, StrategyId::SymProbe);
     // No spray model exists without a symmetric side.

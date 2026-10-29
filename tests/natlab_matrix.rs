@@ -193,8 +193,8 @@ async fn cone_pair_punches_through_two_nat_labs() {
     assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
     assert_eq!(pb.report.strategy, StrategyId::ConeExchange);
     // Public would mean the probe saw no translation, so the lab failed.
-    assert_eq!(pa.report.local_class, NatClass::Cone);
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
     assert_eq!(pa.report.nonce, pb.report.nonce);
 
     // The report carries the reflexive evidence behind the classification.
@@ -242,8 +242,8 @@ async fn cone_eif_pair_punches_through_two_nat_labs() {
     let (pa, pb) = punch_pair(nat_a.host(), cfg.clone(), nat_b.host(), cfg).await;
 
     assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
-    assert_eq!(pa.report.local_class, NatClass::Cone);
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
     assert_eq!(pa.report.nonce, pb.report.nonce);
     assert_eq!(pa.peer_addr.ip(), IpAddr::from(nat_b.public_ip()));
     assert_eq!(pb.peer_addr.ip(), IpAddr::from(nat_a.public_ip()));
@@ -269,8 +269,8 @@ async fn easy_sym_pair_punches_via_predictions_over_two_nat_labs() {
 
     // The classifier read the stepped allocations through the real probe
     // path, which proves the emulated walk reached it intact.
-    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
-    assert_eq!(pb.report.local_class, NatClass::EasySym { step: 3 });
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 2 }));
+    assert_eq!(pb.report.local_class, Some(NatClass::EasySym { step: 3 }));
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
     assert_eq!(pb.report.strategy, StrategyId::PredictiveExchange);
     assert_business(&pa, &pb).await;
@@ -295,8 +295,8 @@ async fn hard_sym_cone_apdf_punches_via_spray_over_two_nat_labs() {
     .await;
     let pa = ra.expect("spray punches");
     let pb = rb.expect("spray punches");
-    assert_eq!(pa.report.local_class, NatClass::HardSym);
-    assert_eq!(pb.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.local_class, Some(NatClass::HardSym));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
     assert_eq!(pa.report.strategy, StrategyId::SymProbe);
     assert_eq!(pb.report.strategy, StrategyId::SymProbe);
     // The space estimate names the symmetric side, whichever role reports:
@@ -336,8 +336,8 @@ async fn hard_sym_pair_punches_via_birthday_burst_over_two_nat_labs() {
     let pb = rb.expect("birthday punches");
     assert_eq!(pa.report.strategy, StrategyId::BirthdayBurst);
     assert_eq!(pb.report.strategy, StrategyId::BirthdayBurst);
-    assert_eq!(pa.report.local_class, NatClass::HardSym);
-    assert_eq!(pb.report.local_class, NatClass::HardSym);
+    assert_eq!(pa.report.local_class, Some(NatClass::HardSym));
+    assert_eq!(pb.report.local_class, Some(NatClass::HardSym));
     // The sizing solves for the target, so the estimate lands at or
     // slightly above it.
     assert!(pa.report.success_estimate.unwrap_or(0.0) >= 0.95 - 1e-9);

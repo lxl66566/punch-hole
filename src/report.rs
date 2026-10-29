@@ -20,8 +20,12 @@ pub struct PunchReport {
     pub role: Role,
     pub nonce: Nonce,
     pub strategy: StrategyId,
-    pub local_class: NatClass,
-    pub peer_class: NatClass,
+    /// The local IPv4 mapping class, `None` when the side reported no IPv4
+    /// evidence at all.
+    pub local_class: Option<NatClass>,
+    /// The peer's IPv4 mapping class, `None` when it reported no IPv4
+    /// evidence at all.
+    pub peer_class: Option<NatClass>,
     /// Local IPv4 reflexive address Probe observed. `None` when a cached
     /// classification carried no IPv4 evidence.
     pub local_reflexive_v4: Option<SocketAddrV4>,
