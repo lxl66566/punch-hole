@@ -582,6 +582,9 @@ pub(crate) struct Engine<S: UdpIo> {
     punch_deadline: tokio::time::Instant,
     stage_idx: usize,
     sweep: usize,
+    /// Position inside the current sweep round, where a tick stopped
+    /// after spending its send share; the next tick resumes from it.
+    sweep_off: usize,
     /// Set when budget or conntrack errors stopped outbound sends; handshake
     /// retransmissions keep retrying because replies matter more than new
     /// pulses.
@@ -635,6 +638,7 @@ impl<S: UdpIo> Engine<S> {
             punch_deadline: overall,
             stage_idx: 0,
             sweep: 0,
+            sweep_off: 0,
             send_stalled: false,
             candidate: None,
             confirmed: None,
@@ -1189,6 +1193,7 @@ impl<S: UdpIo> Engine<S> {
         if now >= self.stage_end(self.stage_idx) && self.stage_idx + 1 < self.plan.stages.len() {
             self.stage_idx += 1;
             self.sweep = 0;
+            self.sweep_off = 0;
         }
 
         // Refresh retries.
@@ -1249,28 +1254,47 @@ impl<S: UdpIo> Engine<S> {
             let per_sweep = if self.peer_addr.is_some() {
                 1
             } else {
-                stage.per_sweep as usize
+                usize::from(stage.per_sweep)
             };
+            let senders = usize::from(stage.senders.min(group.len() as u16));
+            let sweep_len = senders * per_sweep;
+            // One tick spends at most its share of the rate grid, the same
+            // bound that caps a lone sender's burst. A sweep wider than the
+            // share resumes where it stopped on the next tick, so the drive
+            // loop keeps polling events, signaling, and the deadline
+            // between bursts instead of sleeping a whole sweep inside the
+            // limiter. The deadline check keeps a tick from entering another
+            // limiter wait once the punch window is over.
+            let quota = usize::from(burst_len(&self.cfg));
+            let mut sent = 0;
             let mut failure = None;
-            'senders: for i in 0..stage.senders.min(group.len() as u16) {
-                // Rotating by the sender count per sweep tracks the
-                // peer's allocation rate, which also grows by one per
-                // sending socket.
-                let base = i as usize * per_sweep + self.sweep * stage.senders as usize * per_sweep;
-                for k in 0..per_sweep {
-                    let target = targets[(base + k) % targets.len()];
-                    if let Err(e) = pool.send(stage.family, i, &group[i as usize], target).await {
-                        failure = Some(e);
-                        break 'senders;
-                    }
+            while self.sweep_off < sweep_len {
+                if sent == quota || tokio::time::Instant::now() >= self.punch_deadline {
+                    break;
                 }
+                let sender = (self.sweep_off / per_sweep) as u16;
+                let target = targets[(self.sweep * sweep_len + self.sweep_off) % targets.len()];
+                if let Err(e) = pool
+                    .send(stage.family, sender, &group[sender as usize], target)
+                    .await
+                {
+                    failure = Some(e);
+                    break;
+                }
+                self.sweep_off += 1;
+                sent += 1;
+            }
+            // A round that finished or failed starts the next round; a round
+            // cut short by its quota boundary resumes on the next tick.
+            if failure.is_some() || self.sweep_off >= sweep_len {
+                self.sweep_off = 0;
+                self.sweep += 1;
             }
             if let Some(e) = failure
                 && let Some(e) = self.send_failed(e)
             {
                 return Err(e);
             }
-            self.sweep += 1;
         }
 
         // Handshake retransmissions on the confirm timer.
@@ -1991,6 +2015,78 @@ mod tests {
             .expect("third tick pulses again");
         assert!(!engine.send_stalled);
         assert_eq!(pool.sent(), 2);
+    }
+
+    /// A sweep wider than the tick's rate share spans ticks: each tick emits
+    /// at most its share of the rate grid and hands control back before the
+    /// punch deadline, so events, signaling, and the deadline keep their
+    /// cadence even at a rate cap far below the sweep width.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn low_rate_sweep_spans_ticks_without_blocking() {
+        use crate::socket::SocketPool;
+
+        // One packet per tick is the rate share: ceil(4 pps * 250 ms).
+        let cfg = PunchConfig {
+            packets_per_sec: 4,
+            tick: Duration::from_millis(250),
+            ..PunchConfig::default()
+        };
+        // Four senders covering four ports each: sixteen packets per sweep.
+        let targets: Vec<SocketAddr> = (40_000..40_016)
+            .map(|port| SocketAddr::from(([203, 0, 113, 9], port)))
+            .collect();
+        let mut spec = StageSpec::send(Family::V4, 4, targets, false, cfg.punch_timeout);
+        spec.per_sweep = 4;
+        let plan = ExecPlan {
+            stages: vec![spec],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = (0..4)
+            .map(|i| {
+                encode_packet(&DataPacket::Syn {
+                    nonce: [0; 16],
+                    socket: i,
+                })
+            })
+            .collect();
+        let net = crate::sim::Net::seeded("low_rate_sweep");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 4, 0)
+            .await
+            .expect("pool binds");
+        let start = tokio::time::Instant::now();
+        engine.start = Some(start);
+        engine.punch_deadline = start + cfg.punch_timeout;
+
+        for tick in 0..16 {
+            engine.on_tick(&pool).await.expect("tick runs");
+            assert_eq!(
+                pool.sent() as usize,
+                tick + 1,
+                "tick {tick} emitted its rate share only"
+            );
+            assert!(
+                tokio::time::Instant::now() < engine.punch_deadline,
+                "tick {tick} returned before the deadline"
+            );
+            tokio::time::advance(cfg.tick).await;
+        }
+        // The sweep finished across ticks; the next round starts over the
+        // same rotation.
+        engine.on_tick(&pool).await.expect("tick runs");
+        assert_eq!(pool.sent(), 17, "the second round begins");
+        pool.shutdown().await;
     }
 
     /// A binding response for the pending refresh only counts when it lands

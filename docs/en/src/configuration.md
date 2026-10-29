@@ -37,11 +37,14 @@
 - a rate above one billion packets per second, the finest grid a `Duration` spacing limiter can express,
 - any zero duration,
 - `probe_timeout` above `overall_deadline`,
+- a `tick` that is not shorter than `direct_window` and `punch_timeout`, or a `direct_window` that is not shorter than `punch_timeout`,
 - a success target outside 0.0 to 1.0,
 - `min_success` above `target_success`.
 
 ## Tuning notes
 
 The phases stack: Probe runs up to `probe_timeout`, Exchange gets `exchange_timeout` from its own start, Negotiate gets `negotiate_timeout` from session start, and Punch plus Confirm share `punch_timeout`. Every deadline sits under `overall_deadline`, which is the wall to raise first when a slow network needs more room.
+
+A tick emits at most `packets_per_sec × tick` pulses; a sweep wider than that share resumes on the next tick, so a low rate cap slows sweeps without blocking the engine's event and deadline checks.
 
 Compressed timers make tests fast. The simulator suites shrink `tick`, `confirm_retry`, `grace`, and the budgets by an order of magnitude and keep the session logic intact.

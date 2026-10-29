@@ -37,11 +37,14 @@
 - 速率超过每秒十亿包，那是 `Duration` 间隔限速器能表达的最细网格
 - 任何零时长
 - `probe_timeout` 超过 `overall_deadline`
+- `tick` 不比 `direct_window` 和 `punch_timeout` 短，或 `direct_window` 不比 `punch_timeout` 短
 - 成功率目标超出 0.0 到 1.0
 - `min_success` 大于 `target_success`
 
 ## 调参笔记
 
 各阶段是叠加的：Probe 最多跑 `probe_timeout`，Exchange 从自己的起点起算拿 `exchange_timeout`，Negotiate 从会话起点起算拿 `negotiate_timeout`，Punch 加 Confirm 共享 `punch_timeout`。所有截止时间都在 `overall_deadline` 之内，慢网络需要更多余量时先调它。
+
+一个 tick 至多发 `packets_per_sec × tick` 个脉冲；比这份配额更宽的扫描顺延下一 tick 继续，所以低速率上限只会拖慢扫描，不会阻塞引擎的事件与截止时间检查。
 
 压缩计时器让测试变快。模拟器套件把 `tick`、`confirm_retry`、`grace` 和各预算缩小一个量级，会话逻辑保持原样。

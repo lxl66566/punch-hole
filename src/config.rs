@@ -142,6 +142,19 @@ impl PunchConfig {
         if self.probe_timeout > self.overall_deadline {
             return Err(bad("probe_timeout must not exceed overall_deadline"));
         }
+        // The engine paces stage pulses on ticks, so a tick that lands past
+        // a stage window leaves the stage without a single pulse.
+        if self.tick >= self.direct_window || self.tick >= self.punch_timeout {
+            return Err(bad(
+                "tick must be shorter than direct_window and punch_timeout"
+            ));
+        }
+        // The Direct stage spends its window inside the punch budget, so a
+        // window that swallows the whole budget leaves the matrix stages
+        // nothing to run in.
+        if self.direct_window >= self.punch_timeout {
+            return Err(bad("direct_window must be shorter than punch_timeout"));
+        }
         if !(0.0..=1.0).contains(&self.target_success) || !(0.0..=1.0).contains(&self.min_success) {
             return Err(bad("success targets must be probabilities"));
         }
@@ -236,5 +249,29 @@ mod tests {
             ..PunchConfig::default()
         };
         assert!(boundary.validate().is_ok());
+    }
+
+    #[test]
+    fn tick_past_a_stage_window_is_rejected() {
+        let window = PunchConfig::default().direct_window;
+        let cfg = PunchConfig {
+            tick: window,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+        let cfg = PunchConfig {
+            tick: PunchConfig::default().punch_timeout,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn direct_window_past_punch_timeout_is_rejected() {
+        let cfg = PunchConfig {
+            direct_window: PunchConfig::default().punch_timeout,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
     }
 }
