@@ -9,7 +9,7 @@ use std::{
     collections::HashSet,
     future::Future,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU32, Ordering},
@@ -126,6 +126,26 @@ fn reserve(budget: &AtomicU32) -> bool {
 /// leaves headroom for a lossy path without touching the data-plane
 /// budget.
 const REFRESH_BUDGET: u32 = 16;
+
+/// Why a destination cannot carry punch traffic.
+///
+/// Targets derive from peer-signaled data, so the pool rejects the
+/// addresses that cannot be a punch peer: unspecified, port zero,
+/// multicast, and the IPv4 broadcast. Loopback stays allowed; the smoke
+/// tests and the NAT lab exercise the engine over real loopback sockets.
+fn unusable_reason(target: SocketAddr) -> Option<&'static str> {
+    if target.port() == 0 {
+        return Some("port 0");
+    }
+    match target.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => Some("unspecified address"),
+        IpAddr::V4(ip) if ip.is_multicast() => Some("multicast address"),
+        IpAddr::V4(ip) if ip.is_broadcast() => Some("broadcast address"),
+        IpAddr::V6(ip) if ip.is_unspecified() => Some("unspecified address"),
+        IpAddr::V6(ip) if ip.is_multicast() => Some("multicast address"),
+        _ => None,
+    }
+}
 
 /// Owns every socket a session opens. Only the pool closes them.
 ///
@@ -246,6 +266,14 @@ impl<S: UdpIo> SocketPool<S> {
         buf: &[u8],
         target: SocketAddr,
     ) -> Result<(), PunchError> {
+        // The one choke point every outbound target crosses, because every
+        // target list ultimately comes from peer-signaled data.
+        if let Some(reason) = unusable_reason(target) {
+            return Err(PunchError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                reason,
+            )));
+        }
         if !self
             .dests
             .read()
@@ -514,6 +542,59 @@ mod tests {
             ));
         }
         assert_eq!(pool.sent(), 0);
+        pool.shutdown().await;
+    }
+
+    /// Targets that cannot be a punch peer never leave the host, whatever
+    /// the peer signaled. Loopback carries no such restriction, because
+    /// the NAT lab and the smoke tests run the engine over it.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn unusable_targets_are_rejected() {
+        use std::net::Ipv6Addr;
+
+        let net = crate::sim::Net::seeded("pool_target_policy");
+        let cfg = PunchConfig::default();
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let bad = [
+            SocketAddr::from(([0, 0, 0, 0], 40000)),
+            SocketAddr::from(([224, 0, 0, 1], 40000)),
+            SocketAddr::from(([255, 255, 255, 255], 40000)),
+            SocketAddr::from(([203, 0, 113, 9], 0)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 40000)),
+            SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 40000)),
+        ];
+        for target in bad {
+            let err = pool.send(Family::V4, 0, b"x", target).await.unwrap_err();
+            assert!(
+                matches!(&err, PunchError::Io(e) if e.kind() == io::ErrorKind::InvalidInput),
+                "target {target} rejected with {err:?}"
+            );
+        }
+        assert_eq!(pool.sent(), 0);
+
+        // Loopback on both families stays a valid destination.
+        pool.send(
+            Family::V4,
+            0,
+            b"x",
+            SocketAddr::from(([127, 0, 0, 1], 40000)),
+        )
+        .await
+        .expect("v4 loopback sends");
+        pool.send(
+            Family::V4,
+            0,
+            b"x",
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 40000)),
+        )
+        .await
+        .expect("v6 loopback sends");
+        assert_eq!(pool.sent(), 2);
         pool.shutdown().await;
     }
 

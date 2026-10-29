@@ -8,7 +8,7 @@ mod sym_cone;
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV6},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
@@ -146,6 +146,18 @@ pub(crate) fn direct_first(mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) ->
 
 fn is_symmetric(class: NatClass) -> bool {
     matches!(class, NatClass::EasySym { .. } | NatClass::HardSym)
+}
+
+/// Whether a peer-signaled IPv6 address can carry punch traffic.
+///
+/// Multicast, link-local, IPv4-mapped, and unspecified addresses cannot be
+/// a global peer. Loopback stays allowed: the smoke tests run the Direct
+/// stage over the IPv6 loopback.
+fn usable_peer_v6(ip: Ipv6Addr) -> bool {
+    !ip.is_multicast()
+        && !ip.is_unicast_link_local()
+        && !ip.is_unspecified()
+        && ip.to_ipv4_mapped().is_none()
 }
 
 /// The port space a HardSym peer draws from, estimated from its probe.
@@ -1046,8 +1058,11 @@ impl<S: UdpIo> Engine<S> {
     ///
     /// The vector is rebuilt only when the stage index or that port
     /// changes, because a BirthdayBurst stage carries hundreds of
-    /// addresses that never move for the stage's lifetime. The shared
-    /// handle outlives the borrow, so the caller can keep sending through
+    /// addresses that never move for the stage's lifetime. Addresses the
+    /// peer cannot punch through are dropped here: a peer without a usable
+    /// IPv4 address yields no V4 target at all, and its V6 list keeps only
+    /// the addresses that can carry punch traffic. The shared handle
+    /// outlives the borrow, so the caller can keep sending through
     /// `&mut self` while holding it.
     fn live_targets(&mut self) -> Option<Arc<Vec<SocketAddr>>> {
         let stage = &self.plan.stages[self.stage_idx];
@@ -1067,11 +1082,16 @@ impl<S: UdpIo> Engine<S> {
         let targets = if stage.needs_peer_ports {
             let port = port?;
             match stage.family {
+                // An unspecified peer IP means the peer reported no usable
+                // IPv4 address, so no V4 target is generated rather than an
+                // unusable one.
+                Family::V4 if self.plan.peer_ip.is_unspecified() => Vec::new(),
                 Family::V4 => vec![SocketAddr::from((self.plan.peer_ip, port))],
                 Family::V6 => self
                     .plan
                     .peer_v6
                     .iter()
+                    .filter(|addr| usable_peer_v6(*addr.ip()))
                     .map(|addr| {
                         SocketAddr::V6(SocketAddrV6::new(
                             *addr.ip(),
@@ -1438,6 +1458,170 @@ mod tests {
             &[SocketAddr::from(([203, 0, 113, 9], 41_001))][..]
         );
         assert!(!Arc::ptr_eq(&v4, &rebuilt));
+    }
+
+    /// A peer that reported no usable IPv4 address gets no V4 target at
+    /// all, so no sweep can aim at an unspecified address.
+    #[test]
+    fn unspecified_peer_ip_generates_no_v4_targets() {
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![SocketAddr::from(([203, 0, 113, 9], 1))],
+                true,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: Ipv4Addr::UNSPECIFIED,
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(41000),
+                v6: None,
+            })
+            .expect("update applies");
+        engine.stage_idx = 0;
+        let targets = engine.live_targets().expect("targets resolve");
+        assert!(targets.is_empty(), "no target comes from an unspecified IP");
+    }
+
+    /// The peer's V6 list keeps only the addresses that can carry punch
+    /// traffic; loopback survives the filter for the loopback smoke tests.
+    #[test]
+    fn peer_v6_targets_keep_only_usable_addresses() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let v6 = |ip: Ipv6Addr| SocketAddrV6::new(ip, 9999, 0, 0);
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V6,
+                1,
+                vec![SocketAddr::V6(v6(Ipv6Addr::LOCALHOST))],
+                true,
+                cfg.direct_window,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: vec![
+                v6("2001:db8::1".parse().expect("global address")),
+                v6("ff02::1".parse().expect("multicast address")),
+                v6("fe80::1".parse().expect("link-local address")),
+                v6("::ffff:203.0.113.9".parse().expect("mapped address")),
+                v6(Ipv6Addr::LOCALHOST),
+            ],
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: None,
+                v6: Some(51000),
+            })
+            .expect("update applies");
+        engine.stage_idx = 0;
+        let targets = engine.live_targets().expect("targets resolve");
+        let ips: Vec<IpAddr> = targets.iter().map(SocketAddr::ip).collect();
+        assert_eq!(ips, vec![
+            IpAddr::V6("2001:db8::1".parse().expect("global address")),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]);
+    }
+
+    /// A malicious peer advertising multicast or port-zero targets produces
+    /// no outbound packets: the pool rejects the destination and the
+    /// engine, with no handshake yet, fails fast.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn malicious_peer_targets_never_leave_the_host() {
+        use std::net::Ipv4Addr;
+
+        use crate::socket::SocketPool;
+
+        let cfg = PunchConfig::default();
+        let net = crate::sim::Net::seeded("malicious_targets");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let syn = encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 0,
+        });
+        // A multicast reflexive address inside the plan's static targets.
+        let multicast = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![SocketAddr::from((Ipv4Addr::new(224, 0, 0, 1), 40000))],
+                false,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            multicast,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = vec![syn.clone()];
+        engine.start = Some(tokio::time::Instant::now());
+        assert!(
+            engine.on_tick(&pool).await.is_err(),
+            "the engine fails fast on an unusable target"
+        );
+        assert_eq!(pool.sent(), 0, "no packet left for the multicast target");
+
+        // A PortUpdate announcing port 0 aims at nothing usable.
+        let port_zero = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![SocketAddr::from(([203, 0, 113, 9], 40000))],
+                true,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            port_zero,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        engine.syn_bufs[0] = vec![syn];
+        engine.start = Some(tokio::time::Instant::now());
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(0),
+                v6: None,
+            })
+            .expect("update applies");
+        assert!(
+            engine.on_tick(&pool).await.is_err(),
+            "the engine fails fast on port zero"
+        );
+        assert_eq!(pool.sent(), 0, "no packet left for the port-zero target");
+        pool.shutdown().await;
     }
 
     #[test]

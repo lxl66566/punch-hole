@@ -12,6 +12,10 @@ Every `SocketPool::send` walks the same sequence:
 
 The guards apply to every packet the session sends, handshake replies included. The engine's STUN refresh queries leave through the pool as well: they share the rate grid, count in the session stats, and draw from a small dedicated quota instead of the data-plane budget. They skip the conntrack table because the answer is matched to the querying socket rather than a tracked destination.
 
+## Destination policy
+
+Targets derive from peer-signaled data, so every send validates its destination first: the pool rejects unspecified addresses, port zero, multicast, and the IPv4 broadcast with an `InvalidInput` error, and a peer whose IPv4 address is unspecified yields no IPv4 targets at all. The peer's IPv6 list keeps only addresses that can be a global peer; multicast, link-local, IPv4-mapped, and unspecified entries drop out. Loopback stays allowed in the shipped configuration, because the smoke tests and the NAT lab exercise the engine over real loopback sockets.
+
 ## Default footprints
 
 The default footprint of each strategy stays small on purpose:
