@@ -455,6 +455,12 @@ fn predictive_burst_estimate() -> f64 {
 }
 
 /// Upper bound on one sender's per-sweep burst.
+///
+/// A sweep shares its tick with event polling, signaling, and the
+/// deadline check, so one socket cannot spend the whole tick inside the
+/// rate limiter. Thirty-two packets per tick cap a lone sender at 640
+/// pps at the default 50 ms tick, above the default 400 pps rate limit,
+/// so the bound only binds configurations that rate faster than that.
 const MAX_BURST: u16 = 32;
 
 /// Candidate ports the cone side sprays at a HardSym peer.
@@ -485,6 +491,21 @@ pub(crate) fn burst_len(cfg: &PunchConfig) -> u16 {
 /// it the shuffle would pay the whole span for a few dozen ports.
 const SAMPLE_SPAN_MULTIPLE: usize = 8;
 
+/// Safety multiple on the two socket counts for a PredictiveExchange
+/// window. Each side allocates one mapping per (own socket, peer port)
+/// pair its pulses cross, so the peer's punch block spans
+/// `my_sockets * peer_sockets` allocations; the multiple absorbs the
+/// retry rounds and unrelated allocations that land between the probe
+/// base and the live block before the announced position re-bases the
+/// window.
+const PREDICTION_WINDOW_MULTIPLE: usize = 4;
+
+/// Cap on a PredictiveExchange window. The window is also the stage's
+/// target list, and a cross product that ran past half the port range
+/// would spend the whole packet budget on prediction targets before a
+/// single sweep completed.
+const PREDICTION_WINDOW_CAP: usize = 512;
+
 /// Distinct random ports over a span.
 ///
 /// Distinct draws carry a model's coverage exactly, so every path draws
@@ -506,12 +527,17 @@ pub(crate) fn distinct_ports(seed: u64, lo: u16, hi: u16, count: usize) -> Vec<u
         return ports;
     }
     // A wide span redraws a taken port rarely, so rejection costs about
-    // one draw per port. The push order keeps the draw sequence, which
-    // preserves the shuffled path's uniform order.
+    // one draw per port. Membership lives in a set — the count can reach
+    // the thousand-port budget share, where a linear scan per draw turns
+    // quadratic — and the push order keeps the draw sequence, which
+    // preserves the shuffled path's uniform order. The set answers the
+    // same taken-or-free question the scan did, so a seed repeats its
+    // exact output either way.
     let mut ports: Vec<u16> = Vec::with_capacity(count);
+    let mut taken: std::collections::HashSet<u16> = std::collections::HashSet::with_capacity(count);
     while ports.len() < count {
         let port = rng.random_range(lo..=hi);
-        if !ports.contains(&port) {
+        if taken.insert(port) {
             ports.push(port);
         }
     }
@@ -679,7 +705,8 @@ pub(crate) fn build_plan(
                 crate::report::Role::Initiator => sel.responder_sockets,
                 crate::report::Role::Responder => sel.initiator_sockets,
             };
-            let window = (my_sockets as usize * peer_sockets as usize * 4).min(512);
+            let window = (my_sockets as usize * peer_sockets as usize * PREDICTION_WINDOW_MULTIPLE)
+                .min(PREDICTION_WINDOW_CAP);
             stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
         },
         StrategyId::PredictiveBurst => {
@@ -809,6 +836,12 @@ struct StunPending {
     next_retry: tokio::time::Instant,
     attempts_left: u8,
 }
+
+/// Refresh query attempts, one send plus retries on the confirm_retry
+/// cadence. Four attempts at the default 200 ms cadence spend well under
+/// a second of the punch window before the plan degrades to its
+/// probe-time base or fails fast.
+const REFRESH_ATTEMPTS: u8 = 4;
 
 /// Upper bound on the Syn sources the engine tracks for reply gating.
 ///
@@ -1001,7 +1034,7 @@ impl<S: UdpIo> Engine<S> {
                     socket: 0,
                     server,
                     next_retry: tokio::time::Instant::now(),
-                    attempts_left: 4,
+                    attempts_left: REFRESH_ATTEMPTS,
                 });
             },
         }
@@ -2746,7 +2779,7 @@ mod tests {
             socket: 0,
             server,
             next_retry: tokio::time::Instant::now(),
-            attempts_left: 4,
+            attempts_left: REFRESH_ATTEMPTS,
         });
         let net = crate::sim::Net::seeded("refresh_socket_guard");
         let host = net.public_host();
@@ -2815,7 +2848,7 @@ mod tests {
             socket: 0,
             server,
             next_retry: tokio::time::Instant::now(),
-            attempts_left: 4,
+            attempts_left: REFRESH_ATTEMPTS,
         });
         let net = crate::sim::Net::seeded("refresh_via_pool");
         let host = net.public_host();
