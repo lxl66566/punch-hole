@@ -38,7 +38,7 @@
 - 任何零时长
 - `probe_timeout` 超过 `overall_deadline`
 - `tick` 不比 `direct_window` 和 `punch_timeout` 短，或 `direct_window` 不比 `punch_timeout` 短
-- 成功率目标超出 0.0 到 1.0
+- 成功率目标超出 0.0 到 1.0，或 `target_success` 恰为 1.0——脉冲求解读的是 ln(1 / (1 - target))，在 1 处发散，无法定尺寸
 - `min_success` 大于 `target_success`
 
 ## 调参笔记

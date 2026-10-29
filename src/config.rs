@@ -158,6 +158,13 @@ impl PunchConfig {
         if !(0.0..=1.0).contains(&self.target_success) || !(0.0..=1.0).contains(&self.min_success) {
             return Err(bad("success targets must be probabilities"));
         }
+        // The burst solve reads ln(1 / (1 - target)), which diverges at 1:
+        // a certainty target has no finite coverage, only the caps. The
+        // reject also covers min_success = 1, which this rule plus the
+        // ordering below leaves no valid target for.
+        if self.target_success >= 1.0 {
+            return Err(bad("target_success must leave a failure tail below 1"));
+        }
         if self.min_success > self.target_success {
             return Err(bad("min_success must not exceed target_success"));
         }
@@ -273,5 +280,20 @@ mod tests {
             ..PunchConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn certainty_target_is_rejected() {
+        let cfg = PunchConfig {
+            target_success: 1.0,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+        // The largest representable target below one stays valid.
+        let cfg = PunchConfig {
+            target_success: 1.0f64.next_down(),
+            ..PunchConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

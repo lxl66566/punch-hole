@@ -344,10 +344,15 @@ impl<F: UdpFactory> PunchSession<F> {
                     Frame::Offer(offer) => {
                         // The Offer crosses an untrusted wire with no
                         // send-side caps, so both fields are bounded before
-                        // they reach the plan: socket counts are clamped,
-                        // and a start beyond the cap aborts instead of
-                        // sleeping past every deadline.
-                        if u64::from(offer.start_delay_ms) > Self::MAX_START_DELAY_MS {
+                        // they reach the plan: socket counts are clamped, a
+                        // start beyond the cap aborts instead of sleeping
+                        // past every deadline, and a side with zero sockets
+                        // aborts instead of running an empty plan to the
+                        // phase deadline.
+                        if u64::from(offer.start_delay_ms) > Self::MAX_START_DELAY_MS
+                            || offer.local_sockets == 0
+                            || offer.peer_sockets == 0
+                        {
                             let _ = send_deadlined(self.sig.send(Frame::Abort(AbortReason::Internal)), deadline, Phase::Negotiate).await;
                             return Err(PunchError::PeerAborted(AbortReason::Internal));
                         }
@@ -516,19 +521,9 @@ mod tests {
             signaling_retry: Duration::from_millis(50),
             ..PunchConfig::default()
         };
-        let cached = NatInfo {
-            v4: Some(V4Nat {
-                class: NatClass::Cone,
-                reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 40000),
-                alloc_seq: vec![40000; 4],
-                distinct_probe_ips: 2,
-                filtering: FilterClass::Unknown,
-            }),
-            v6: None,
-        };
         let session = Puncher::with_factory(cfg, TokioFactory)
             .expect("config valid")
-            .with_cached_nat(cached)
+            .with_cached_nat(cached_cone())
             .with_signaling(lib);
         // The held host end never drains: the first Hello fills the channel
         // and the resend inside the retry arm blocks, where the deadline
@@ -545,5 +540,69 @@ mod tests {
             "got {err:?}"
         );
         drop(host);
+    }
+
+    /// A cached cone reading the Negotiate phase can consume without Probe.
+    fn cached_cone() -> NatInfo {
+        NatInfo {
+            v4: Some(V4Nat {
+                class: NatClass::Cone,
+                reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 40000),
+                alloc_seq: vec![40000; 4],
+                distinct_probe_ips: 2,
+                filtering: FilterClass::Unknown,
+            }),
+            v6: None,
+        }
+    }
+
+    /// An Offer that leaves a side with zero sockets aborts the attempt
+    /// right away instead of running an empty plan into the phase deadline.
+    #[tokio::test(start_paused = true)]
+    async fn zero_socket_offer_aborts_instead_of_idling() {
+        use crate::msg::{Frame, Offer, SigFrame, StrategyId, encode_sig};
+
+        for (local_sockets, peer_sockets) in [(0, 4), (4, 0)] {
+            let (mut host, lib) = crate::signaling::bridge(8);
+            let session = Puncher::with_factory(PunchConfig::default(), TokioFactory)
+                .expect("config valid")
+                .with_cached_nat(cached_cone())
+                .with_signaling(lib);
+            let drive = tokio::spawn(session.responder());
+            // Exchange consumes the peer Hello; the Offer follows in order.
+            for body in [
+                Frame::Hello(cached_cone()),
+                Frame::Offer(Offer {
+                    nonce: [1; 16],
+                    strategy: StrategyId::ConeExchange,
+                    local_sockets,
+                    peer_sockets,
+                    start_delay_ms: 500,
+                }),
+            ] {
+                host.from_peer
+                    .send(bytes::Bytes::from(encode_sig(&SigFrame {
+                        ts: 1,
+                        echo: 0,
+                        body,
+                    })))
+                    .await
+                    .expect("host frame send");
+            }
+
+            let err = drive
+                .await
+                .expect("task joins")
+                .expect_err("zero-socket offer aborts");
+            assert!(
+                matches!(err, PunchError::PeerAborted(super::AbortReason::Internal)),
+                "got {err:?}"
+            );
+            // The host channel saw our own Hello, then the Abort.
+            let _ = host.to_peer.recv().await.expect("hello drains");
+            let abort = host.to_peer.recv().await.expect("abort drains");
+            let frame = crate::msg::decode_sig(&abort).expect("abort decodes");
+            assert_eq!(frame.body, Frame::Abort(super::AbortReason::Internal));
+        }
     }
 }

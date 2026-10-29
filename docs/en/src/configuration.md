@@ -38,7 +38,7 @@
 - any zero duration,
 - `probe_timeout` above `overall_deadline`,
 - a `tick` that is not shorter than `direct_window` and `punch_timeout`, or a `direct_window` that is not shorter than `punch_timeout`,
-- a success target outside 0.0 to 1.0,
+- a success target outside 0.0 to 1.0, or a `target_success` of exactly 1.0, which the burst solve cannot size because it reads ln(1 / (1 - target)),
 - `min_success` above `target_success`.
 
 ## Tuning notes
