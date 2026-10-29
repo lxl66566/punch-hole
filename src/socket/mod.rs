@@ -246,9 +246,11 @@ impl<S: UdpIo> SocketPool<S> {
             // Re-check: a racing sender may have inserted this destination.
             if !dests.contains(&target) {
                 // A new destination costs one mapping per live socket, so
-                // the bound scales the destination count with the pool.
+                // the bound scales the destination count with the pool. A
+                // pool with no live socket carries no mapping at all, so it
+                // admits no destination and the table stays bounded.
                 let sockets = self.groups[0].len() + self.groups[1].len();
-                if sockets * (dests.len() + 1) > self.max_mappings {
+                if sockets == 0 || sockets * (dests.len() + 1) > self.max_mappings {
                     return Err(PunchError::ConntrackExhausted);
                 }
                 dests.insert(target);
@@ -438,6 +440,32 @@ mod tests {
             pool.send(Family::V4, 0, b"x", target).await,
             Err(PunchError::BudgetExhausted)
         ));
+        pool.shutdown().await;
+    }
+
+    /// A pool whose binds all failed must stay bounded: with no live socket
+    /// the destination admission check would otherwise pass on every send
+    /// and grow the table without limit.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_pool_admits_no_destination() {
+        let net = crate::sim::Net::seeded("pool_no_sockets");
+        let cfg = PunchConfig {
+            max_mappings: 1,
+            ..PunchConfig::default()
+        };
+        let pool_host = net.public_host();
+        let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 0, 0)
+            .await
+            .expect("pool binds empty");
+        let target = SocketAddr::from(([203, 0, 113, 9], 40000));
+        for _ in 0..4 {
+            assert!(matches!(
+                pool.send(Family::V4, 0, b"x", target).await,
+                Err(PunchError::ConntrackExhausted)
+            ));
+        }
+        assert_eq!(pool.sent(), 0);
         pool.shutdown().await;
     }
 
