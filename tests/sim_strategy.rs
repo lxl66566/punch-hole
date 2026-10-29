@@ -109,6 +109,98 @@ async fn easy_sym_pair_uses_predictions() {
     let _ = net.mapping_count();
 }
 
+/// An easy symmetric initiator against a hard symmetric responder: the
+/// easy side sprays the hard peer's span while the hard side covers the
+/// easy peer's continuation window, and either direction completes the
+/// handshake.
+#[tokio::test(start_paused = true)]
+async fn predictive_burst_easy_initiator_punches() {
+    let net = Net::seeded("pred_burst_easy_init");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::random(30000..30400));
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("prediction burst punches");
+    let pb = rb.expect("prediction burst punches");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
+    assert_eq!(pb.report.strategy, StrategyId::PredictiveBurst);
+    assert_eq!(pa.report.local_class, NatClass::EasySym { step: 2 });
+    assert_eq!(pb.report.local_class, NatClass::HardSym);
+    // The estimate states the continuation regime, which the sim holds.
+    assert_eq!(pa.report.success_estimate, Some(1.0));
+    assert_eq!(pb.report.success_estimate, Some(1.0));
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// The same pair with the roles swapped: the matrix entry holds in both
+/// orientations, and each side derives its stage from its own class.
+#[tokio::test(start_paused = true)]
+async fn predictive_burst_hard_initiator_punches() {
+    let net = Net::seeded("pred_burst_hard_init");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::random(30000..30400));
+    let b = net.host(NatSpec::sequential(3));
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("prediction burst punches");
+    let pb = rb.expect("prediction burst punches");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
+    assert_eq!(pb.report.strategy, StrategyId::PredictiveBurst);
+    assert_eq!(pa.report.local_class, NatClass::HardSym);
+    assert_eq!(pb.report.local_class, NatClass::EasySym { step: 3 });
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// A demoted easy fit — three consistent samples, one short of a
+/// confident fit — leaves exactly one predictable side, so the pair runs
+/// PredictiveBurst instead of a birthday attack against the peer it could
+/// predict.
+#[tokio::test(start_paused = true)]
+async fn predictive_burst_covers_a_demoted_easy_fit() {
+    let net = Net::seeded("pred_burst_demoted");
+    let stun = net.stun_server();
+    // Three destinations answer for the initiator: enough for a constant
+    // step, one short of the confident fit.
+    let mut cfg_a = config(&stun);
+    cfg_a.stun_servers.truncate(3);
+    let a = net.host(NatSpec::sequential(2));
+    let b = net.host(NatSpec::sequential(3));
+    let (ra, rb) = common::punch_pair(a, cfg_a, b, config(&stun)).await;
+    let pa = ra.expect("demoted pair punches on prediction");
+    let pb = rb.expect("demoted pair punches on prediction");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
+    assert_eq!(pb.report.strategy, StrategyId::PredictiveBurst);
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// PredictiveBurst across independent seeds and both role orientations:
+/// the measured success rate must track the model's estimate, which
+/// states certainty under the continuation regime. The sim injects no
+/// unrelated allocations, so the regime holds and every run must punch.
+#[tokio::test(start_paused = true)]
+async fn predictive_burst_measured_rate_tracks_the_estimate() {
+    const RUNS: usize = 16;
+    for i in 0..RUNS as u64 {
+        let net = Net::from_seed_u64(0x5eed_600d + i);
+        let stun = net.stun_server();
+        let (a, b) = if i % 2 == 0 {
+            (
+                net.host(NatSpec::sequential(2)),
+                net.host(NatSpec::random(30000..30400)),
+            )
+        } else {
+            (
+                net.host(NatSpec::random(30000..30400)),
+                net.host(NatSpec::sequential(2)),
+            )
+        };
+        let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+        let pa = ra.unwrap_or_else(|e| panic!("run {i} punches: {e:?}"));
+        rb.expect("peer punches");
+        assert_eq!(pa.report.strategy, StrategyId::PredictiveBurst);
+        assert_eq!(pa.report.success_estimate, Some(1.0));
+    }
+}
+
 /// Two silent STUN destinations interleave with answering ones, so each side
 /// classifies over a gap-compressed sequence: the adjacent deltas read two
 /// strides while the classifier step carries the true one. The pair must

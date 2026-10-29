@@ -3,7 +3,8 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use super::{
-    StageSpec, burst_len, distinct_ports, effective_class, peer_space, span_estimate, spray_count,
+    PREDICTION_SLACK, StageSpec, burst_len, distinct_ports, effective_class, peer_space,
+    span_estimate, spray_count,
 };
 use crate::{
     config::PunchConfig,
@@ -11,10 +12,6 @@ use crate::{
     nat::{NatClass, NatInfo, PortPredictor},
     socket::Family,
 };
-
-/// Unrelated allocations the prediction window tolerates besides the peer's
-/// own punch sockets.
-const PREDICTION_SLACK: usize = 16;
 
 /// The shooter side sprays from many sockets at the peer's announced port.
 /// The replying side answers every Syn it sees and additionally sprays

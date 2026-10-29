@@ -63,6 +63,7 @@ pub enum StrategyId {
     SymProbe,
     PredictiveExchange,
     BirthdayBurst,
+    PredictiveBurst,
 }
 
 pub enum AbortReason {

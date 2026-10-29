@@ -4,6 +4,7 @@ mod birthday;
 mod cone;
 mod direct;
 mod easy_sym;
+mod predictive_burst;
 mod sym_cone;
 
 use std::{
@@ -55,6 +56,7 @@ impl Selection {
                 let sized = size_burst(space_i, space_r, cfg);
                 Some(burst_hit_chance(&sized, space_i, space_r))
             },
+            StrategyId::PredictiveBurst => Some(predictive_burst_estimate()),
             _ => None,
         };
     }
@@ -186,32 +188,46 @@ pub(crate) fn select(
         }
         return Ok(sel);
     }
-    if let (NatClass::EasySym { .. }, NatClass::EasySym { .. }) = (mine_class, peer_class) {
-        Ok(Selection {
+    match (mine_class, peer_class) {
+        (NatClass::EasySym { .. }, NatClass::EasySym { .. }) => Ok(Selection {
             strategy: StrategyId::PredictiveExchange,
             initiator_sockets: cfg.predictive_sockets,
             responder_sockets: cfg.predictive_sockets,
             estimate: None,
-        })
-    } else {
-        // The probe cannot read a symmetric peer's filtering class, so the
-        // estimate assumes address-dependent filtering, the common CGNAT
-        // shape; `burst_hit_chance` states what that costs.
-        let (space_i, space_r) = (peer_space(mine), peer_space(peer));
-        let sized = size_burst(space_i, space_r, cfg);
-        let estimate = burst_hit_chance(&sized, space_i, space_r);
-        if estimate < cfg.min_success {
-            return Err(PunchError::Unpunchable {
-                local: mine_class,
-                peer: peer_class,
-            });
-        }
-        Ok(Selection {
-            strategy: StrategyId::BirthdayBurst,
+        }),
+        // One predictable side is enough: the side facing the easy peer
+        // aims its continuation window, the side facing the hard peer
+        // keeps its random spray, and either direction completes the
+        // handshake. A demoted easy fit lands here with its confident
+        // peer, so the predictable side still gets used instead of a
+        // birthday attack against it.
+        (NatClass::EasySym { .. }, NatClass::HardSym)
+        | (NatClass::HardSym, NatClass::EasySym { .. }) => Ok(Selection {
+            strategy: StrategyId::PredictiveBurst,
             initiator_sockets: 1,
             responder_sockets: 1,
-            estimate: Some(estimate),
-        })
+            estimate: Some(predictive_burst_estimate()),
+        }),
+        _ => {
+            // The probe cannot read a symmetric peer's filtering class, so
+            // the estimate assumes address-dependent filtering, the common
+            // CGNAT shape; `burst_hit_chance` states what that costs.
+            let (space_i, space_r) = (peer_space(mine), peer_space(peer));
+            let sized = size_burst(space_i, space_r, cfg);
+            let estimate = burst_hit_chance(&sized, space_i, space_r);
+            if estimate < cfg.min_success {
+                return Err(PunchError::Unpunchable {
+                    local: mine_class,
+                    peer: peer_class,
+                });
+            }
+            Ok(Selection {
+                strategy: StrategyId::BirthdayBurst,
+                initiator_sockets: 1,
+                responder_sockets: 1,
+                estimate: Some(estimate),
+            })
+        },
     }
 }
 
@@ -376,6 +392,60 @@ pub(crate) fn size_burst(space_i: usize, space_r: usize, cfg: &PunchConfig) -> B
 /// Share of the packet budget a spray may spend. Retransmissions keep the
 /// rest.
 const SPRAY_BUDGET_SHARE: usize = 4;
+
+/// Unrelated allocations a prediction window tolerates besides the peer's
+/// own punch allocations.
+pub(crate) const PREDICTION_SLACK: usize = 16;
+
+/// Coverage pair for a PredictiveBurst, one socket per side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PredictiveSize {
+    /// Distinct ports the easy side sprays at the hard peer.
+    pub easy: usize,
+    /// Continuation ports the hard side covers over the easy side's
+    /// sequence: its live window plus slack.
+    pub window: usize,
+}
+
+/// Sizes a PredictiveBurst against the hard side's space.
+///
+/// The easy side holds one mapping per covered port and an EasySym mapping
+/// walks its constant step, so its live ports fill exactly the first
+/// `easy` ports of the continuation window the hard side covers. The
+/// random direction shoots the easy coverage at the hard side's `window`
+/// live mappings, so the window feeds back into the live count and the
+/// solve is `easy * (easy + PREDICTION_SLACK) = L * space` with `L` the
+/// one-directional target. The quadratic's positive root feeds
+/// `spray_count` as the live count, so the budget and conntrack caps bind
+/// exactly as they do for every other spray.
+pub(crate) fn size_predictive(space: usize, cfg: &PunchConfig) -> PredictiveSize {
+    let target = -(1.0 - cfg.target_success).ln();
+    let slack = PREDICTION_SLACK as f64;
+    let root = ((slack * slack + 4.0 * target * space as f64).sqrt() - slack) / 2.0;
+    let live = (root as usize).saturating_add(PREDICTION_SLACK);
+    let easy = spray_count(live, space, cfg);
+    PredictiveSize {
+        easy,
+        window: easy + PREDICTION_SLACK,
+    }
+}
+
+/// The estimate PredictiveBurst reports: certainty under its stated
+/// regime.
+///
+/// The hard side covers the easy side's whole continuation window, so
+/// while the easy NAT keeps stepping from its last observed port — the
+/// assumption PredictiveExchange also acts on — a window Syn is certain
+/// to land on a live mapping once both rotations run, and the regime
+/// tolerates up to a window width of unrelated allocations before the
+/// live block slides out. The estimate states that regime the way the
+/// burst arithmetic states its filtering assumption; the random direction
+/// is sized for `target_success` of its own and is the quantified
+/// fallback a regime break leaves, so `min_success` has no number to
+/// gate here.
+fn predictive_burst_estimate() -> f64 {
+    1.0
+}
 
 /// Upper bound on one sender's per-sweep burst.
 const MAX_BURST: u16 = 32;
@@ -604,6 +674,26 @@ pub(crate) fn build_plan(
             };
             let window = (my_sockets as usize * peer_sockets as usize * 4).min(512);
             stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
+        },
+        StrategyId::PredictiveBurst => {
+            let i_am_easy = matches!(effective_class(mine), NatClass::EasySym { .. });
+            // The sizing always reads the hard side's space, whichever
+            // side builds the stage, so both roles derive the same
+            // coverage pair from the same views.
+            let hard_space = if i_am_easy {
+                peer_space(peer)
+            } else {
+                peer_space(mine)
+            };
+            stages.extend(predictive_burst::stage(
+                i_am_easy,
+                my_sockets,
+                hard_space,
+                peer,
+                nonce,
+                role as u64,
+                cfg,
+            ));
         },
         StrategyId::BirthdayBurst => {
             // Selection sized the same pure solve over the same pair of

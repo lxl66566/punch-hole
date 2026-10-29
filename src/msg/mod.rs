@@ -49,6 +49,7 @@ pub enum StrategyId {
     SymProbe,
     PredictiveExchange,
     BirthdayBurst,
+    PredictiveBurst,
 }
 
 /// Why a side stopped the attempt.

@@ -116,6 +116,19 @@ fn decoders_survive_random_and_edge_inputs() {
             start_delay_ms: 400,
         }),
     });
+    // The appended variant encodes as the highest StrategyId index, so
+    // its mutations walk a byte the mid-list variants never vary.
+    let predictive = encode_sig(&SigFrame {
+        ts: 2,
+        echo: 1,
+        body: Frame::Offer(Offer {
+            nonce: [0x9e; 16],
+            strategy: StrategyId::PredictiveBurst,
+            local_sockets: 1,
+            peer_sockets: 1,
+            start_delay_ms: 350,
+        }),
+    });
     let syn = encode_packet(&DataPacket::Syn {
         nonce: [0xcd; 16],
         socket: 1023,
@@ -124,11 +137,12 @@ fn decoders_survive_random_and_edge_inputs() {
     // mutation and not at the corpus itself.
     assert!(decode_sig(&hello).is_ok());
     assert!(decode_sig(&offer).is_ok());
+    assert!(decode_sig(&predictive).is_ok());
     assert_eq!(decode_packet(&syn).unwrap(), DataPacket::Syn {
         nonce: [0xcd; 16],
         socket: 1023
     });
-    for valid in [&hello, &offer, &syn] {
+    for valid in [&hello, &offer, &predictive, &syn] {
         cases.extend(mutations(valid));
     }
 

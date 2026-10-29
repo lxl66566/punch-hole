@@ -1,6 +1,6 @@
 # The punching strategies
 
-Selection reads both NAT classes and picks one strategy from a matrix. The two sides then execute the same plan on the data plane, each from its own view. This chapter walks the matrix, the four strategies from simplest to heaviest, and the arithmetic that sizes the heavy ones.
+Selection reads both NAT classes and picks one strategy from a matrix. The two sides then execute the same plan on the data plane, each from its own view. This chapter walks the matrix, the five strategies from simplest to heaviest, and the arithmetic that sizes the heavy ones.
 
 ## The selection matrix
 
@@ -9,8 +9,8 @@ Selection runs on the **effective** classes, which means a weak EasySym fit has 
 | local \ peer | cone or public | easy symmetric | hard symmetric |
 |---|---|---|---|
 | cone or public | ConeExchange | SymProbe | SymProbe |
-| easy symmetric | SymProbe | PredictiveExchange | BirthdayBurst |
-| hard symmetric | SymProbe | BirthdayBurst | BirthdayBurst |
+| easy symmetric | SymProbe | PredictiveExchange | PredictiveBurst |
+| hard symmetric | SymProbe | PredictiveBurst | BirthdayBurst |
 
 The Initiator applies the matrix and sends the result in an `Offer` that also carries the socket counts for both sides and the pulse schedule. The Responder clamps the socket counts to its own limits and answers `Accept`.
 
@@ -53,6 +53,14 @@ Both sides are easy symmetric. Each side fits the peer's sequence, then sends in
 
 Both sides also announce their current allocation position the same way SymProbe's symmetric side does, and each side moves its fitted window onto the peer's announced position, so the windows overlap on the sequences as they stand at engine start instead of where Probe left them.
 
+## PredictiveBurst
+
+Exactly one side is easy symmetric; the other is hard symmetric, which includes an easy fit demoted for thin evidence. One predictable side is enough: the side facing the hard peer sprays a distinct random stream over its estimated span — the same one-directional spray SymProbe's replying side runs — while the side facing the easy peer covers its whole continuation window at the classifier's step. Either direction completes the handshake: a window Syn lands on a live continuation mapping, or a spray candidate lands on one of the window mappings, and the answer returns from exactly the port that was aimed at.
+
+Each side opens one socket. The easy side's live mappings are exactly the first `easy` ports of the window the hard side covers, because an EasySym mapping walks its constant step and the easy side holds one mapping per covered port; the random direction therefore shoots `easy` candidates at the hard side's `window` live mappings, and the window feeds back into the live count. The solve `easy * (easy + 16) = ln(1 / (1 - target)) * space` runs through the shared spray sizing, so the budget and conntrack caps bind exactly as they do for every other spray.
+
+The estimate states its regime, the way the burst arithmetic states its filtering assumption: while the easy NAT keeps stepping from its last observed port, the window is certain to contain every live mapping, and drift tolerates up to a window width of unrelated allocations before the live block slides out. The random direction is sized for `target_success` on its own and is the quantified fallback when the regime breaks.
+
 ## BirthdayBurst
 
 Both sides are symmetric with at least one hard side. Prediction is out of the picture, so the strategy plays the collision game: each side opens sockets, each socket covers distinct ports drawn from the peer's observed span, and both sides pulse at once until a covered port pair collides in both directions.
@@ -71,7 +79,7 @@ An estimate below `min_success` fails Negotiate with `Unpunchable` before any da
 
 ## Estimates
 
-SymProbe and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A pair routed to SymProbe on low cone confidence carries no estimate; its outcome rests on inbound filtering the probe does not measure. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
+SymProbe, PredictiveBurst, and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A pair routed to SymProbe on low cone confidence carries no estimate; its outcome rests on inbound filtering the probe does not measure, while PredictiveBurst's estimate states its continuation regime instead of measuring it. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
 
 ## The boundary the model states
 
