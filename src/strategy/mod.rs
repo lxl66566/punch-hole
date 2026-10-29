@@ -8,7 +8,7 @@ mod sym_cone;
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
@@ -937,6 +937,43 @@ impl<S: UdpIo> Engine<S> {
         true
     }
 
+    /// Whether this side aimed Syns at the host of `addr`.
+    ///
+    /// A SynAck answer carries no proof beyond the nonce, so it only
+    /// counts from the peer this side probed. The check anchors on the
+    /// peer's own addresses, the same ones every stage targets: the
+    /// peer's replies leave through its NAT, so a cone answers from the
+    /// announced port while a symmetric mapping answers from a fresh one
+    /// no target list could name, and the port carries no evidence. A
+    /// family with only port-dependent stages probed nothing until the
+    /// peer announced its live port.
+    fn syn_targeted(&self, addr: SocketAddr) -> bool {
+        let (family, announced) = match addr {
+            SocketAddr::V4(_) => (Family::V4, self.fresh_peer.and_then(|p| p.v4).is_some()),
+            SocketAddr::V6(_) => (Family::V6, self.fresh_peer.and_then(|p| p.v6).is_some()),
+        };
+        let probed = self.plan.stages.iter().any(|s| {
+            s.family == family
+                && !s.reply_only
+                && (if s.needs_peer_ports {
+                    announced
+                } else {
+                    !s.targets.is_empty()
+                })
+        });
+        if !probed {
+            return false;
+        }
+        match family {
+            Family::V4 => addr.ip() == IpAddr::from(self.plan.peer_ip),
+            Family::V6 => self
+                .plan
+                .peer_v6
+                .iter()
+                .any(|a| addr.ip() == IpAddr::from(*a.ip())),
+        }
+    }
+
     async fn on_data(
         &mut self,
         pool: &SocketPool<S>,
@@ -984,6 +1021,12 @@ impl<S: UdpIo> Engine<S> {
                 }
             },
             DataPacket::SynAck { socket, .. } => {
+                // An answer from an address no Syn aimed at confirms
+                // nothing and earns no Ack: the nonce alone cannot make an
+                // unvisited source the peer.
+                if !self.syn_targeted(ev.from) {
+                    return Ok(());
+                }
                 self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
                 let resend_ack = if let Some((family, idx)) = self.confirmed {
                     // The peer missed our Ack; answer again while grace runs.
@@ -1009,16 +1052,31 @@ impl<S: UdpIo> Engine<S> {
         Ok(())
     }
 
+    /// Whether `socket` answered a Syn from the host of `addr`.
+    ///
+    /// A symmetric peer sends its Ack through a fresh mapping port, so
+    /// the evidence keys on the host rather than the port: the socket
+    /// ran a Syn-and-answer exchange with that host, and the Ack's
+    /// landing socket is the one that exchange validated.
+    fn answered_syn(&self, socket: u16, addr: SocketAddr) -> bool {
+        self.syn_replies
+            .keys()
+            .any(|(s, from)| *s == socket && from.ip() == addr.ip())
+    }
+
     /// Completes the handshake from the peer's Ack.
     ///
-    /// An Ack that lands on a socket other than the winner answers a
-    /// handshake this side never elected, so it moves nothing.
+    /// An Ack only counts on a socket that answered a Syn from the
+    /// Ack's host: the answer and the Ack together prove the exchange
+    /// ran on that socket, and the socket the Ack landed on is the
+    /// winner it proves. An Ack anywhere else answers a handshake this
+    /// side never ran, so it moves nothing.
     fn on_ack(&mut self, from: SocketAddr, family: Family, socket: u16, now: tokio::time::Instant) {
         if self.confirmed.is_none() {
-            if let Some((f, i)) = self.candidate {
+            if self.answered_syn(socket, from) {
                 self.observe_addr(from, now);
-                self.confirmed = Some((f, i));
-                self.announce = Some(i);
+                self.confirmed = Some((family, socket));
+                self.announce = Some(socket);
                 // The final Ack proves both directions, so no grace wait
                 // applies on this path.
                 self.finish_now = true;
@@ -2152,6 +2210,199 @@ mod tests {
             .await
             .expect("re-armed syn answers");
         assert_eq!(pool.sent(), sent + 2);
+    }
+
+    /// A SynAck from an address no stage targeted confirms nothing: no
+    /// confirmation, no grace, no Ack reply, no recorded peer address.
+    /// The same answer from the targeted address confirms, and grace
+    /// alone still crowns that path when the peer's Confirmed frame never
+    /// crosses the signaling channel.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn synack_from_unvisited_source_confirms_nothing() {
+        use crate::socket::{RecvEvent, SocketPool};
+
+        let cfg = PunchConfig::default();
+        let target = SocketAddr::from(([203, 0, 113, 9], 40000));
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![target],
+                false,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = crate::sim::Net::seeded("synack_source_gate");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let synack = encode_packet(&DataPacket::SynAck {
+            nonce: [0; 16],
+            socket: 4,
+        });
+        let event = |from: SocketAddr| {
+            let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+            buf[..synack.len()].copy_from_slice(&synack);
+            RecvEvent {
+                family: Family::V4,
+                socket: 0,
+                from,
+                len: synack.len(),
+                buf,
+            }
+        };
+        let forged = SocketAddr::from(([198, 51, 100, 99], 50_009));
+        // A symmetric peer answers from a fresh mapping port no target
+        // list names, so the gate anchors on the peer's host.
+        assert!(engine.syn_targeted(SocketAddr::from(([203, 0, 113, 9], 40_900))));
+        assert!(!engine.syn_targeted(forged));
+        engine
+            .on_data(&pool, event(forged))
+            .await
+            .expect("forged synack is ignored");
+        assert!(
+            engine.confirmed.is_none(),
+            "unvisited source confirms nothing"
+        );
+        assert!(engine.grace_end.is_none());
+        assert!(engine.announce.is_none());
+        assert_eq!(pool.sent(), 0, "no Ack answers an unvisited source");
+        assert!(engine.peer_addr.is_none());
+        assert!(engine.first_handshake.is_none());
+
+        // The targeted address carries the confirmation, and its Ack leaves.
+        engine
+            .on_data(&pool, event(target))
+            .await
+            .expect("targeted synack confirms");
+        assert_eq!(engine.confirmed, Some((Family::V4, 0)));
+        assert_eq!(engine.announce, Some(0));
+        assert_eq!(pool.sent(), 1, "the Ack answer left");
+
+        // Grace alone crowns the confirmed path, which is what a peer
+        // whose Confirmed frame was lost leaves this side with.
+        let grace_end = engine.grace_end.expect("grace armed");
+        assert!(!engine.finished(tokio::time::Instant::now()));
+        assert!(engine.finished(grace_end));
+    }
+
+    /// A port-dependent stage earns its SynAcks from the peer's host once
+    /// the peer announced a port: a cone answers from the announced port,
+    /// an address-dependent mapping from a fresh one. Before the
+    /// announcement, and from any other host, the answer confirms
+    /// nothing.
+    #[test]
+    fn announced_port_opens_the_peer_host_for_synacks() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let peer_ip = Ipv4Addr::new(203, 0, 113, 9);
+        let at = |ip: Ipv4Addr, port: u16| SocketAddr::V4(SocketAddrV4::new(ip, port));
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            // The stage carries the peer's dead probe address and waits on
+            // its PortUpdate, the cone stage shape.
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![at(peer_ip, 40000)],
+                true,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip,
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+
+        // No announcement yet: the stage never sent, so nothing confirms.
+        assert!(!engine.syn_targeted(at(peer_ip, 40000)));
+
+        // The announcement starts the sweeps at the announced port.
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(41000),
+                v6: None,
+            })
+            .expect("update applies");
+        assert!(engine.syn_targeted(at(peer_ip, 41000)));
+        // A fresh mapping port of the same host still answered our sweeps.
+        assert!(engine.syn_targeted(at(peer_ip, 41777)));
+        // Any other host stayed unvisited.
+        assert!(!engine.syn_targeted(at(Ipv4Addr::new(198, 51, 100, 99), 41000)));
+    }
+
+    /// An Ack proves the exchange only of the socket that answered a Syn
+    /// from the Ack's host, which is the socket the Ack landed on. A
+    /// landing socket with no answered Syn from that host confirms
+    /// nothing, a fresh mapping port of an answered host still counts,
+    /// and a proven landing socket wins over a candidate another source
+    /// set first.
+    #[test]
+    fn ack_confirms_the_socket_that_answered_the_source() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let peer = Ipv4Addr::new(203, 0, 113, 9);
+        let at = |ip: Ipv4Addr, port: u16| SocketAddr::V4(SocketAddrV4::new(ip, port));
+        let cfg = PunchConfig::default();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::reply(Family::V4, cfg.punch_timeout)],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: peer,
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let now = tokio::time::Instant::now();
+        let first = at(peer, 50_001);
+        let second = at(peer, 50_002);
+
+        // Socket 1 answered the first source; socket 0 answered a second.
+        engine.observe_peer(5, first, now, Family::V4, 1);
+        engine.candidate = Some((Family::V4, 1));
+        engine
+            .syn_replies
+            .insert((1, first), now + cfg.confirm_retry);
+        engine
+            .syn_replies
+            .insert((0, second), now + cfg.confirm_retry);
+
+        // An Ack from a host no socket answered moves nothing, whatever
+        // socket it lands on.
+        let foreign = at(Ipv4Addr::new(198, 51, 100, 99), 50_009);
+        engine.on_ack(foreign, Family::V4, 0, now);
+        assert!(engine.confirmed.is_none());
+        assert!(!engine.finish_now);
+
+        // The Ack on socket 0 crowns socket 0 through a fresh mapping
+        // port of the answered host, the symmetric peer's shape, not the
+        // candidate socket 1.
+        let fresh_port = at(peer, 50_077);
+        engine.on_ack(fresh_port, Family::V4, 0, now);
+        assert_eq!(engine.confirmed, Some((Family::V4, 0)));
+        assert_eq!(engine.announce, Some(0));
+        assert!(engine.finish_now);
+        assert_eq!(engine.peer_addr, Some(fresh_port));
     }
 
     #[test]

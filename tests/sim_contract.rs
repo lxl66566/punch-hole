@@ -571,3 +571,27 @@ fn gate_port_updates(
         }
     });
 }
+
+/// A pair whose signaling channel loses everything after `Accept` still
+/// finishes: the data-plane handshake confirms both sides, and grace
+/// crowns them without the peer's `Confirmed` frame. The pair runs an
+/// EasySym exchange, whose static spray needs no `PortUpdate` to fire.
+#[tokio::test(start_paused = true)]
+async fn confirmed_lost_with_traffic_seen_still_succeeds() {
+    let net = Net::seeded("confirmed_lost");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(1));
+    let b = net.host(NatSpec::sequential(1));
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // Setup frames cross; PortUpdate and Confirmed never do, and the
+    // bridge itself stays open, so only grace can end the engines.
+    common::connect_then_blackhole(ha, hb);
+
+    let a = tokio::spawn(common::run_initiator(a, config(&stun), la));
+    let b = tokio::spawn(common::run_responder(b, config(&stun), lb));
+    let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+    let pa = ra.expect("initiator crowns after grace");
+    let pb = rb.expect("responder crowns after grace");
+    common::assert_business_traffic(&pa, &pb).await;
+}

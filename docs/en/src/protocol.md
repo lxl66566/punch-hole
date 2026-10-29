@@ -168,7 +168,7 @@ Initiator socket k                    Responder socket m
    |---- Ack {nonce} ----------------->|   repeated until Confirmed or grace end
 ```
 
-`Syn` proves Initiator to Responder. `SynAck` proves the reverse direction, and the Initiator is confirmed the moment it arrives. The final `Ack` proves the forward direction again and confirms the Responder. `Syn` and `SynAck` repeat on the confirm retry timer, and the grace responder answers repeated `SynAck` after the Initiator is confirmed, so a peer that is still waiting always gets its answer.
+`Syn` proves Initiator to Responder. `SynAck` proves the reverse direction, and the Initiator is confirmed the moment one arrives from the peer's own address, the host its stages aimed their `Syn` pulses at; an answer from any other host confirms nothing. The final `Ack` proves the forward direction again and confirms the Responder on the socket it landed on, which is the socket that answered a `Syn` from the Ack's host, so a scan across the Responder's sockets confirms only the path it actually ran. `Syn` and `SynAck` repeat on the confirm retry timer, and the grace responder answers repeated `SynAck` after the Initiator is confirmed, so a peer that is still waiting always gets its answer.
 
 Each side closes its loser sockets at its own confirmation.
 
@@ -201,7 +201,7 @@ Each side closes its loser sockets at its own confirmation.
 
 ## Security posture
 
-The nonce keeps foreign and stale packets out of an attempt. An attacker who can guess a 128-bit nonce can inject handshake packets, which reduces to noise.
+The nonce keeps foreign and stale packets out of an attempt. An attacker who can guess a 128-bit nonce can inject handshake packets; confirmation still asks for the peer's own address on the `SynAck` path and for a socket that answered the source on the `Ack` path, so injection from unrelated hosts reduces to noise.
 
 The protocol carries no authentication and no encryption of its own. Securing the signaling channel is the host's job: authenticate the peer, reject replays, and keep the channel confidential before feeding it into the bridge. Whoever can read the signaling frames holds the nonce and can forge the handshake packets of that attempt, so signaling confidentiality is part of the security of the data plane.
 
