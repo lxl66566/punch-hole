@@ -16,7 +16,7 @@ use std::{
 use crate::{
     config::PunchConfig,
     error::PunchError,
-    msg::{DataPacket, Frame, Nonce, StrategyId, decode_packet, encode_packet},
+    msg::{DataPacket, DecodeError, Frame, Nonce, StrategyId, decode_packet, encode_packet},
     nat::{NatClass, NatInfo, classify::easy_confident},
     signaling::SigIo,
     socket::{Family, SocketPool, UdpFactory, UdpIo},
@@ -991,8 +991,17 @@ impl<S: UdpIo> Engine<S> {
             }
             return Ok(());
         }
-        let Ok(pkt) = decode_packet(&ev.buf[..ev.len]) else {
-            return Ok(())
+        let pkt = match decode_packet(&ev.buf[..ev.len]) {
+            Ok(pkt) => pkt,
+            // A frame with our magic but a foreign version can only be a
+            // peer running an incompatible protocol; fail the session now
+            // instead of letting it burn to a phase timeout.
+            Err(DecodeError::Version { local, peer }) => {
+                return Err(PunchError::VersionMismatch { local, peer });
+            },
+            // Any other broken frame is foreign traffic on a fresh
+            // ephemeral port and stays noise.
+            Err(DecodeError::BadFrame) => return Ok(()),
         };
         let nonce = pkt.nonce();
         if nonce != self.nonce {

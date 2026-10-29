@@ -23,6 +23,11 @@ pub const DATA_MAGIC: u8 = 0x70;
 pub const MAX_SIG_FRAME: usize = 1024;
 /// Data packets longer than this are dropped.
 pub const MAX_DATA_PACKET: usize = 64;
+/// Smallest legal data packet: the magic byte, the version byte, one
+/// byte of variant ordinal, and the 16 nonce bytes every variant carries.
+/// `Ack` and `Keepalive` carry nothing beyond the nonce, so they encode
+/// to exactly this size.
+pub(crate) const MIN_DATA_PACKET: usize = 2 + 1 + size_of::<Nonce>();
 /// Upper bound on `alloc_seq` entries.
 pub const MAX_ALLOC_SEQ: usize = 64;
 /// Upper bound on collected IPv6 addresses.
@@ -135,6 +140,9 @@ pub fn encode_sig(frame: &SigFrame) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(VERSION);
     buf.extend_from_slice(&postcard::to_allocvec(frame).expect("SigFrame is serializable"));
+    // The peer rejects frames past the cap, so an oversized encoding is a
+    // wire bug the decoder would silently drop.
+    debug_assert!(buf.len() <= MAX_SIG_FRAME);
     buf
 }
 
@@ -153,10 +161,15 @@ pub fn decode_sig(bytes: &[u8]) -> Result<SigFrame, DecodeError> {
     }
     let mut frame: SigFrame =
         postcard::from_bytes(&bytes[1..]).map_err(|_| DecodeError::BadFrame)?;
-    if let Frame::Hello(info) = &mut frame.body
-        && let Some(v4) = &mut info.v4
-    {
-        v4.alloc_seq.truncate(MAX_ALLOC_SEQ);
+    // The wire limits bind both sides: a peer that ignored the send-side
+    // caps cannot push an oversized vector into the session.
+    if let Frame::Hello(info) = &mut frame.body {
+        if let Some(v4) = &mut info.v4 {
+            v4.alloc_seq.truncate(MAX_ALLOC_SEQ);
+        }
+        if let Some(v6) = &mut info.v6 {
+            v6.addrs.truncate(MAX_V6_ADDRS);
+        }
     }
     Ok(frame)
 }
@@ -174,7 +187,7 @@ pub fn encode_packet(packet: &DataPacket) -> Vec<u8> {
 /// Decodes a data-plane packet. Garbage on this plane is dropped silently, so
 /// callers only care whether decoding succeeded.
 pub fn decode_packet(bytes: &[u8]) -> Result<DataPacket, DecodeError> {
-    if bytes.len() > MAX_DATA_PACKET || bytes.len() < 3 || bytes[0] != DATA_MAGIC {
+    if bytes.len() > MAX_DATA_PACKET || bytes.len() < MIN_DATA_PACKET || bytes[0] != DATA_MAGIC {
         return Err(DecodeError::BadFrame);
     }
     if bytes[1] != VERSION {
@@ -327,13 +340,38 @@ mod tests {
             Err(DecodeError::BadFrame)
         );
         // Wrong magic drops before the version check.
-        assert_eq!(decode_packet(&[0x00, 9, 0x00]), Err(DecodeError::BadFrame));
+        let mut wrong_magic = encode_packet(&DataPacket::Keepalive { nonce: [0; 16] });
+        wrong_magic[0] = 0x00;
+        assert_eq!(decode_packet(&wrong_magic), Err(DecodeError::BadFrame));
+        // A full-length frame with a foreign version names the mismatch.
+        let mut foreign = encode_packet(&DataPacket::Keepalive { nonce: [0; 16] });
+        foreign[1] = 9;
         assert_eq!(
-            decode_packet(&[DATA_MAGIC, 9, 0x00]),
+            decode_packet(&foreign),
             Err(DecodeError::Version {
                 local: VERSION,
                 peer: 9
             })
+        );
+        // Below the smallest legal body even the version byte is
+        // unreachable.
+        assert_eq!(
+            decode_packet(&[DATA_MAGIC, 9, 0x00]),
+            Err(DecodeError::BadFrame)
+        );
+    }
+
+    #[test]
+    fn data_packets_never_encode_below_the_minimum() {
+        let ack = encode_packet(&DataPacket::Ack { nonce: [0; 16] });
+        let keepalive = encode_packet(&DataPacket::Keepalive { nonce: [0; 16] });
+        assert_eq!(ack.len(), MIN_DATA_PACKET);
+        assert_eq!(keepalive.len(), MIN_DATA_PACKET);
+        // Every proper prefix of a legal packet is garbage, including the
+        // one-byte-short prefix.
+        assert_eq!(
+            decode_packet(&ack[..ack.len() - 1]),
+            Err(DecodeError::BadFrame)
         );
     }
 
@@ -353,5 +391,27 @@ mod tests {
         // A peer that ignored the send-side cap cannot push an unbounded
         // sequence into the session.
         assert_eq!(info.v4.expect("v4 survives").alloc_seq.len(), MAX_ALLOC_SEQ);
+    }
+
+    #[test]
+    fn oversized_peer_v6_addrs_is_truncated() {
+        let mut info = sample_nat_info();
+        let addrs: Vec<_> = (0..u16::MAX)
+            .take(MAX_V6_ADDRS * 3)
+            .map(|i| SocketAddrV6::new([0x2001, 0xdb8, 0, i, 0, 0, 0, 1].into(), 5300 + i, 0, 0))
+            .collect();
+        let expected = addrs[..MAX_V6_ADDRS].to_vec();
+        info.v6.as_mut().unwrap().addrs = addrs;
+        let frame = SigFrame {
+            ts: 0,
+            echo: 0,
+            body: Frame::Hello(info),
+        };
+        let decoded = decode_sig(&encode_sig(&frame)).expect("frame fits the size cap");
+        let Frame::Hello(info) = decoded.body else {
+            panic!("body survives the round trip");
+        };
+        // The first MAX_V6_ADDRS entries survive in order.
+        assert_eq!(info.v6.expect("v6 survives").addrs, expected);
     }
 }

@@ -9,8 +9,8 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 
 use punch_hole::{
     msg::{
-        DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_SIG_FRAME, Offer,
-        SigFrame, StrategyId, VERSION, decode_packet, decode_sig, encode_packet, encode_sig,
+        DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_SIG_FRAME, MAX_V6_ADDRS,
+        Offer, SigFrame, StrategyId, VERSION, decode_packet, decode_sig, encode_packet, encode_sig,
     },
     nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat},
 };
@@ -74,6 +74,27 @@ fn decoders_survive_random_and_edge_inputs() {
     over_cap.resize(MAX_DATA_PACKET + 1, 0xee);
     cases.push(over_cap);
 
+    // A full-length frame with our magic and a foreign version names the
+    // mismatch; a valid frame truncated one byte below the smallest legal
+    // body stays garbage.
+    let mut foreign_version = encode_packet(&DataPacket::Syn {
+        nonce: [0x5a; 16],
+        socket: 3,
+    });
+    foreign_version[1] = 9;
+    let mut short = encode_packet(&DataPacket::Ack { nonce: [0x5a; 16] });
+    short.truncate(short.len() - 1);
+    assert_eq!(
+        decode_packet(&foreign_version),
+        Err(DecodeError::Version {
+            local: VERSION,
+            peer: 9
+        })
+    );
+    assert_eq!(decode_packet(&short), Err(DecodeError::BadFrame));
+    cases.push(foreign_version);
+    cases.push(short);
+
     // Pseudo-random buffers of decoder-relevant sizes.
     for _ in 0..2048 {
         let len = rng.random_range(0..=80usize);
@@ -122,5 +143,45 @@ fn decoders_survive_random_and_edge_inputs() {
         {
             assert_eq!(decode_packet(bytes), Err(DecodeError::BadFrame));
         }
+        // Any signaling-sized frame stamped with a foreign version names
+        // the mismatch, which the session treats as fatal.
+        if !bytes.is_empty() && bytes.len() <= MAX_SIG_FRAME && bytes[0] != VERSION {
+            assert_eq!(
+                decode_sig(bytes),
+                Err(DecodeError::Version {
+                    local: VERSION,
+                    peer: bytes[0]
+                })
+            );
+        }
     }
+}
+
+/// A peer that ignored the send-side IPv6 cap cannot push an oversized
+/// address list into the session: decode truncates it to the wire limit
+/// whatever the frame carries otherwise.
+#[test]
+fn oversized_peer_v6_list_is_truncated() {
+    let addrs: Vec<_> = (0..u16::MAX)
+        .take(MAX_V6_ADDRS * 3)
+        .map(|i| SocketAddrV6::new([0x2001, 0xdb8, 0, i, 0, 0, 0, 1].into(), 5300 + i, 0, 0))
+        .collect();
+    let expected = addrs[..MAX_V6_ADDRS].to_vec();
+    let frame = SigFrame {
+        ts: 0,
+        echo: 0,
+        body: Frame::Hello(NatInfo {
+            v4: None,
+            v6: Some(V6Nat { addrs }),
+        }),
+    };
+    let bytes = encode_sig(&frame);
+    assert!(
+        bytes.len() <= MAX_SIG_FRAME,
+        "the oversized list still fits the frame cap"
+    );
+    let Frame::Hello(decoded) = decode_sig(&bytes).expect("frame decodes").body else {
+        panic!("hello body survives");
+    };
+    assert_eq!(decoded.v6.expect("v6 survives").addrs, expected);
 }

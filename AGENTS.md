@@ -16,4 +16,4 @@ punch-hole 是一个信令无关的 UDP 打洞原语库。一场会话给两端�
 
 ## 线上协议变更
 
-`src/msg/mod.rs` 是唯一事实源。枚举变体只增不减，布局变更必须升 `VERSION`。改动要同步 `docs/en/src/protocol.md` 与 `docs/zh/src/protocol.md`，消息形状变化还要同步解码语料测试与 fuzz 目标。
+`src/msg/mod.rs` 是唯一事实源。枚举变体只增不减；postcard 把变体编为下标，旧端无法区分未知变体与损坏字节，因此新增变体与其他布局变更一样必须升 `VERSION`，否则旧端只会把新帧当坏帧静默跳过、空耗到阶段超时。改动要同步 `docs/en/src/protocol.md` 与 `docs/zh/src/protocol.md`，消息形状变化还要同步解码语料测试与 fuzz 目标。
