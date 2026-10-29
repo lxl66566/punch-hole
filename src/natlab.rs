@@ -733,24 +733,38 @@ pub struct StunServer {
     pub addrs: Vec<String>,
 }
 
-/// Starts a STUN responder on a dedicated loopback address.
+/// Starts a STUN responder over two dedicated loopback addresses.
 ///
-/// Four sockets on ports 3478 through 3481 answer binding requests with
-/// the v4 XOR-MAPPED address of the datagram's source. Four destinations
-/// is what classification needs for a confident EasySym fit.
+/// Four sockets, two ports on each of two addresses, answer binding
+/// requests with the v4 XOR-MAPPED address of the datagram's source. Four
+/// destinations is what classification needs for a confident EasySym fit,
+/// and spanning two IPs is what a cone reading needs before it counts as
+/// mapping-dimension evidence.
 pub fn stun_responder() -> io::Result<StunServer> {
-    // Every port must bind; a twin process that holds one of them draws a
-    // fresh address.
+    const PORTS: [u16; 2] = [3478, 3479];
+    // Every port must bind on both addresses; a twin process that holds
+    // one of them draws fresh addresses.
     for _ in 0..16 {
-        let ip = draw_stun_ip()?;
-        let mut sockets = Vec::with_capacity(4);
-        let bound =
-            (3478..=3481).all(|port| bind_public(ip, port).map(|s| sockets.push(s)).is_ok());
+        let first = draw_stun_ip()?;
+        let second = draw_stun_ip()?;
+        let layout = [
+            (first, PORTS[0]),
+            (first, PORTS[1]),
+            (second, PORTS[0]),
+            (second, PORTS[1]),
+        ];
+        let mut sockets = Vec::with_capacity(layout.len());
+        let bound = layout
+            .iter()
+            .all(|&(ip, port)| bind_public(ip, port).map(|s| sockets.push(s)).is_ok());
         if bound {
             for sock in sockets {
                 tokio::spawn(stun_loop(sock));
             }
-            let addrs = (3478..=3481).map(|port| format!("{ip}:{port}")).collect();
+            let addrs = layout
+                .iter()
+                .map(|&(ip, port)| format!("{ip}:{port}"))
+                .collect();
             return Ok(StunServer { addrs });
         }
     }

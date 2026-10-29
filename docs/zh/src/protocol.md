@@ -29,7 +29,7 @@ data:      [magic: 0x70][version: u8][postcard DataPacket]
 
 ## 版本策略
 
-两端必须跑同一个 `VERSION`，当前是 2。枚举变体跨版本只增不减，postcard 用变体下标编码，重排或删除变体都要升版本。
+两端必须跑同一个 `VERSION`，当前是 3。枚举变体跨版本只增不减，postcard 用变体下标编码，新增、重排或删除变体都要升版本。
 
 新增变体同样必须升版本。postcard 无法区分未知变体下标与损坏字节，旧端收到携带更新变体的帧只会看到一次普通的解码失败：在信令平面上这一帧被跳过，对端直到阶段超时也不知道版本不一致。版本纪律是这一平面唯一的防线。数据面在解包体之前先查版本字节，第一个版本不符的包就会让会话立即以 `VersionMismatch` 失败。
 
@@ -86,6 +86,9 @@ pub struct V4Nat {
     pub reflexive: SocketAddrV4,
     /// 在 NAT 上观测到的外部端口，按发送顺序。上限 64 条。
     pub alloc_seq: Vec<u16>,
+    /// 应答了探测的目的地中不同的服务器 IP 数。单 IP 扇出在地址相关
+    /// NAT 上只跨越一个映射，据此读出的锥形只代表该映射的行为。
+    pub distinct_probe_ips: u8,
     /// 入站过滤证据。探测不测过滤，值恒为 `Unknown`。
     pub filtering: FilterClass,
 }

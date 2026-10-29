@@ -138,6 +138,7 @@ async fn cached_nat_info_skips_probe() {
             class: NatClass::Cone,
             reflexive: SocketAddrV4::new([100, 64, 2, 1].into(), 40000),
             alloc_seq: vec![40000, 40000, 40000, 40000],
+            distinct_probe_ips: 2,
             filtering: punch_hole::FilterClass::Unknown,
         }),
         v6: None,

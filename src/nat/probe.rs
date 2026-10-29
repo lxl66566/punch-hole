@@ -91,6 +91,7 @@ pub(crate) async fn probe<F: UdpFactory>(
             reflexive.port(),
         ),
         alloc_seq: observed.iter().map(|&(_, port)| port).collect(),
+        distinct_probe_ips: distinct_answered_ips(&round.dests, &round.slots),
         filtering,
     };
 
@@ -305,6 +306,23 @@ impl Fanout {
         }
         out
     }
+}
+
+/// Distinct server IPs among the answered destinations of one fan-out.
+///
+/// The count measures how many mappings an address-dependent NAT could
+/// have shown: a destination that stayed silent contributed no port, so
+/// only the answered destinations count. The answer slots carry reflexive
+/// addresses, so the count pairs each answer with its destination.
+fn distinct_answered_ips(dests: &[SocketAddr], slots: &[Option<SocketAddr>]) -> u8 {
+    let mut ips: Vec<IpAddr> = dests
+        .iter()
+        .zip(slots)
+        .filter_map(|(dst, slot)| slot.is_some().then_some(dst.ip()))
+        .collect();
+    ips.sort_unstable();
+    ips.dedup();
+    ips.len().min(usize::from(u8::MAX)) as u8
 }
 
 /// A socket is public when its reflexive address is its own address.

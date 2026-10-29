@@ -60,6 +60,7 @@ mod tests {
                 // empty sequence still carries a valid address.
                 reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 5000),
                 alloc_seq: seq.to_vec(),
+                distinct_probe_ips: 4,
                 filtering: FilterClass::Unknown,
             }),
             v6: None,

@@ -16,7 +16,7 @@ use crate::nat::{FilterClass, NatClass};
 /// Wire protocol version shared by both planes. Frames stamped with a
 /// different version are rejected, so incompatible layouts never decode
 /// halfway.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 /// First byte of every data-plane packet.
 pub const DATA_MAGIC: u8 = 0x70;
 /// Signaling frames longer than this are rejected.
@@ -206,6 +206,7 @@ fn sample_nat_info() -> NatInfo {
             class: NatClass::EasySym { step: 2 },
             reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 40001),
             alloc_seq: vec![40001, 40003, 40005, 40007],
+            distinct_probe_ips: 4,
             filtering: FilterClass::AddressPortDependent,
         }),
         v6: Some(crate::nat::V6Nat {

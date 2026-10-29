@@ -438,7 +438,12 @@ async fn stale_attempt_injection_is_counted_and_ignored() {
     // Injection rounds, one Syn and one Ack per external endpoint each.
     const ROUNDS: u32 = 3;
     let net = Net::seeded("stale_attempt");
-    let stun = net.stun_server();
+    // Two server addresses keep both cone readings confident, so the pair
+    // runs the ConeExchange whose parked engines this test assumes.
+    let mut addrs = Vec::new();
+    addrs.extend(net.stun_server().addrs);
+    addrs.extend(net.stun_server().addrs);
+    let stun = punch_hole::sim::StunServer { addrs };
     // The initiator NAT drops inbound from unknown sources, so it never
     // sees the injected packets. The responder NAT passes any source.
     // A distinct port range keeps the two external endpoints apart.

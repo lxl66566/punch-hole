@@ -53,6 +53,12 @@ pub struct V4Nat {
     pub reflexive: SocketAddrV4,
     /// External ports observed at the NAT, in send order. Capped at 64 entries.
     pub alloc_seq: Vec<u16>,
+    /// Distinct server IPs among the answered probe destinations. An
+    /// address-dependent NAT gives the whole fan-out one mapping per IP,
+    /// so a fan-out that answered from a single IP exercised the mapping
+    /// dimension once and a cone reading built from it rests on one
+    /// mapping's behavior.
+    pub distinct_probe_ips: u8,
     /// Inbound filtering evidence. A probe runs no filtering test, so its
     /// value is always `Unknown`.
     pub filtering: FilterClass,

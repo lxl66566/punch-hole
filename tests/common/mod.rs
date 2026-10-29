@@ -121,12 +121,18 @@ pub fn connect_then_blackhole(
 use punch_hole::sim::NatSpec;
 
 /// One cone behind one cone NAT, the standard happy path setup.
+///
+/// Two server addresses feed the fan-out, so both cone readings answer
+/// from two distinct IPs and carry mapping-dimension evidence. The first
+/// server draws before the hosts so the first host keeps the 100.64.2.1
+/// gateway the cached-NAT tests pin.
 pub fn cone_net(name: &str) -> (Net, StunServer, Host, Host) {
     let net = Net::seeded(name);
-    let stun = net.stun_server();
+    let mut addrs = net.stun_server().addrs;
     let a = net.host(NatSpec::cone_apdf());
     let b = net.host(NatSpec::cone_apdf());
-    (net, stun, a, b)
+    addrs.extend(net.stun_server().addrs);
+    (net, StunServer { addrs }, a, b)
 }
 
 /// Runs the pair on a fresh net per try until both sides punch, and returns

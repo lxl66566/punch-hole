@@ -10,7 +10,7 @@ use common::config;
 use punch_hole::{
     NatClass, PunchConfig, StrategyId,
     error::PunchError,
-    sim::{NatSpec, Net},
+    sim::{Mapping, NatSpec, Net},
 };
 
 #[tokio::test(start_paused = true)]
@@ -49,13 +49,13 @@ async fn hard_sym_cone_apdf_punches_via_spray() {
     // from sources the cone never wrote to, so only the cone's own spray
     // opens the path.
     let mut cfg = PunchConfig::default();
-    // The span estimate is unbiased for the 100-wide range: four samples
-    // show a ~60-wide range and widen to ~100. With m = 16 peer sockets
-    // and target 0.99, c = ceil(ln(100) * space / 16) solves the estimate
-    // to 1 - exp(-m * c / space) >= 0.99 against whatever span the probe
-    // saw, so the 0.98 bar keeps float noise out of the assertion. A run
-    // whose estimate undershot the true range is covered by a rerun on a
-    // fresh nonce.
+    // The span estimate reads upper-confidence: four samples of the
+    // 100-wide range show a ~60-wide range and widen to ~140. With m = 16
+    // peer sockets and target 0.99, c = ceil(ln(100) * space / 16) solves
+    // the estimate to 1 - exp(-m * c / space) >= 0.99 against whatever
+    // span the probe saw, so the 0.98 bar keeps float noise out of the
+    // assertion. A run from the thin undershoot tail is covered by a
+    // rerun on a fresh nonce.
     cfg.target_success = 0.99;
     let (ra, rb) = common::punch_pair_retried(
         "hard_sym_cone_apdf",
@@ -144,9 +144,10 @@ async fn birthday_burst_narrow_range() {
     let mut cfg = PunchConfig::default();
     // The sizing is honest for its target, so the 0.5 default target leaves
     // a coin flip. At 0.95 the solve covers ceil(sqrt(ln(20) * S_eff))
-    // ports, 13 on a typical 100-wide span estimate (S_eff = 50), which
-    // keeps the true chance above 0.95 on the 100-wide range. The rest is
-    // the estimator's variance, covered by a rerun on a fresh nonce.
+    // ports, 15 on a typical ~140-wide span estimate (S_eff = 70), which
+    // keeps the true chance above 0.95 while the estimate stays above the
+    // true span. The rest is the estimator's variance, covered by a rerun
+    // on a fresh nonce.
     cfg.target_success = 0.95;
     let (ra, rb) = common::punch_pair_retried(
         "birthday_narrow",
@@ -195,10 +196,9 @@ async fn birthday_measured_rate_tracks_the_estimate() {
     // nonce even at a fixed seed, which makes the count binomial: 64 runs
     // give a standard deviation near 0.06, and 0.25 covers more than four
     // standard deviations. The margin also absorbs the span estimator's
-    // variance: the order-statistics estimate is unbiased for the 400-wide
-    // range, but an undershooting run concentrates candidates inside the
-    // true range while an overshooting run dilutes them, a swing of a few
-    // hundredths in probability at this width.
+    // variance: the estimate reads upper-confidence for the 400-wide
+    // range, and the thin undershoot tail concentrates candidates inside
+    // the true range, a swing of a few hundredths at this width.
     assert!(
         (rate - 0.5).abs() <= 0.25,
         "measured rate {rate} drifted from the estimated 0.5"
@@ -269,5 +269,39 @@ async fn public_pair_goes_direct() {
     let pb = rb.expect("public pair punches");
     // No NAT devices attached, so the session created no mappings.
     assert_eq!(net.mapping_count(), 0);
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// An address-dependent symmetric NAT whose whole fan-out crossed one
+/// server IP reads as a cone. The reading stays a cone — the probe cannot
+/// tell — but the matrix stops trusting it blindly: the pair runs
+/// SymProbe with the ambiguous side shooting, and it punches.
+#[tokio::test(start_paused = true)]
+async fn address_dependent_pair_routes_sym_probe() {
+    let net = Net::seeded("adm_routes_sym_probe");
+    // One server: all four destinations share one IP, so each ADM NAT
+    // answers the whole fan-out through one mapping. Endpoint-independent
+    // filtering admits the shooter's pulses, the shape the spray-free
+    // routing relies on.
+    let stun = net.stun_server();
+    let spec = NatSpec {
+        mapping: Mapping::AddressSequential { step: 2 },
+        filtering: punch_hole::FilterClass::EndpointIndependent,
+        port_range: 30000..40000,
+    };
+    let (ra, rb) = common::punch_pair(
+        net.host(spec.clone()),
+        config(&stun),
+        net.host(spec),
+        config(&stun),
+    )
+    .await;
+    let pa = ra.expect("ambiguous pair punches");
+    let pb = rb.expect("ambiguous pair punches");
+    assert_eq!(pa.report.local_class, NatClass::Cone);
+    assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+    assert_eq!(pb.report.strategy, StrategyId::SymProbe);
+    // No spray model exists without a symmetric side.
+    assert_eq!(pa.report.success_estimate, None);
     common::assert_business_traffic(&pa, &pb).await;
 }

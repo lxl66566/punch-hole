@@ -16,11 +16,15 @@ use crate::{
 /// own punch sockets.
 const PREDICTION_SLACK: usize = 16;
 
-/// The symmetric side shoots from many sockets at the cone side's announced
-/// port. The cone side answers every Syn it sees and additionally sprays
-/// candidate ports at the symmetric peer.
+/// The shooter side sprays from many sockets at the peer's announced port.
+/// The replying side answers every Syn it sees and additionally sprays
+/// candidate ports at the shooter's public address.
+///
+/// The shooter is the symmetric side of a normal pair, or the ambiguous
+/// side of a pair routed here on low cone confidence; both shapes punch,
+/// because a socket's mappings exist whatever its NAT turns out to be.
 pub(crate) fn stage(
-    i_am_symmetric: bool,
+    i_shoot: bool,
     my_sockets: u16,
     peer_sockets: u16,
     peer: &NatInfo,
@@ -28,8 +32,8 @@ pub(crate) fn stage(
     cfg: &PunchConfig,
 ) -> Option<StageSpec> {
     let v4 = peer.v4.as_ref()?;
-    if i_am_symmetric {
-        // The cone side's live port arrives with its PortUpdate.
+    if i_shoot {
+        // The replying side's live port arrives with its PortUpdate.
         Some(StageSpec::send(
             Family::V4,
             my_sockets as usize,
@@ -38,13 +42,14 @@ pub(crate) fn stage(
             cfg.punch_timeout,
         ))
     } else {
-        // A cone that filters on address and port drops the peer's Syn
-        // pulses, because they arrive from source ports this socket never
-        // wrote to. The spray writes first: when a spray Syn lands on a live
-        // peer mapping, the SynAck returns from the peer's IP plus exactly
-        // the candidate port this socket sent to, so the cone's own mapping
-        // admits it. The reverse direction holds because the spray leaves
-        // from the socket whose port the PortUpdate announced.
+        // A replying side that filters on address and port drops the peer's
+        // Syn pulses, because they arrive from source ports this socket
+        // never wrote to. The spray writes first: when a spray Syn lands
+        // on a live peer mapping, the SynAck returns from the peer's IP
+        // plus exactly the candidate port this socket sent to, so the
+        // local mapping admits it. The reverse direction holds because the
+        // spray leaves from the socket whose port the PortUpdate
+        // announced.
         let ip = *v4.reflexive.ip();
         let targets = match effective_class(peer) {
             NatClass::EasySym { step } => predicted(ip, &v4.alloc_seq, peer_sockets, step)
@@ -53,8 +58,10 @@ pub(crate) fn stage(
         };
         let mut stage = StageSpec::send(Family::V4, 1, targets, false, cfg.punch_timeout);
         // A lone socket covers several ports per tick, so the spray runs at
-        // the configured rate cap instead of one packet per tick.
-        stage.per_sweep = burst_len(cfg);
+        // the configured rate cap instead of one packet per tick. The cap
+        // at the target count keeps a sweep from repeating a port it
+        // already covered this tick.
+        stage.per_sweep = burst_len(cfg).min(stage.targets.len() as u16);
         Some(stage)
     }
 }
@@ -111,6 +118,7 @@ mod tests {
                 class: NatClass::EasySym { step },
                 reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), seq[0]),
                 alloc_seq: seq.to_vec(),
+                distinct_probe_ips: 4,
                 filtering: FilterClass::Unknown,
             }),
             v6: None,

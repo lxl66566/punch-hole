@@ -14,6 +14,8 @@ Selection runs on the **effective** classes, which means a weak EasySym fit has 
 
 The Initiator applies the matrix and sends the result in an `Offer` that also carries the socket counts for both sides and the pulse schedule. The Responder clamps the socket counts to its own limits and answers `Accept`.
 
+Cone readings enter the matrix with confidence. Identical ports across destinations also fall out of an address-dependent symmetric NAT when the whole fan-out crossed one server IP, and a probe that answered fewer than two destinations says nothing at all, so a cone reading counts only when its fan-out answered from at least two IPs with at least two samples. When either cone reading falls short, the pair runs SymProbe with the ambiguous side shooting: the shooter's sockets punch whether that side turns out to be a cone or symmetric, and the price is the port-strict corner of the trusted side, which ConeExchange would have covered.
+
 ## The Direct stage
 
 Before the matrix strategy runs, a Direct stage checks whether the pair needs no NAT work at all. It runs whenever both sides reported global IPv6 addresses, or whenever both IPv4 paths are public. The stage gets `direct_window`, one second by default, counted inside the punch budget, and the matrix strategy spends whatever remains.
@@ -22,7 +24,7 @@ The addresses a `Hello` carries belong to the sender's probe socket, which is cl
 
 ## Estimating a symmetric peer's port span
 
-SymProbe's spray and BirthdayBurst both aim at the ports a symmetric peer's NAT will hand its punch sockets, so both need a span estimate from the probe samples. `k` uniform samples over a span of width `S` show an expected range of `S * (k - 1) / (k + 1)`, so the observed range widened by `range / (k - 1)` on each side estimates `S` in expectation, without a margin constant. The probability model and the candidate sampling read the same estimate, so estimation and sampling stay equally conservative. Fewer than two samples carry no range at all; the estimate then falls back to the upper ephemeral half, the range most NAT families draw from.
+SymProbe's spray and BirthdayBurst both aim at the ports a symmetric peer's NAT will hand its punch sockets, so both need a span estimate from the probe samples. `k` uniform samples over a span of width `S` show an expected range of `S * (k - 1) / (k + 1)`, so the observed range widened by twice `range / (k - 1)` on each side reads as an upper-confidence estimate of `S`. The confidence factor keeps the estimate above the true span about nine runs in ten at four samples, which is what an honest rate needs: candidates spread over an overshooting estimate hit live mappings exactly as the model states, while an undershoot would read optimistic. The probability model and the candidate sampling read the same estimate, so estimation and sampling stay equally conservative. Fewer than two samples carry no range at all; the estimate then falls back to the upper ephemeral half, the range most NAT families draw from.
 
 ## ConeExchange
 
@@ -69,7 +71,7 @@ An estimate below `min_success` fails Negotiate with `Unpunchable` before any da
 
 ## Estimates
 
-SymProbe and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
+SymProbe and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A pair routed to SymProbe on low cone confidence carries no estimate; its outcome rests on inbound filtering the probe does not measure. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
 
 ## The boundary the model states
 

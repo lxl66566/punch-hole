@@ -29,7 +29,7 @@ Durations travel as plain millisecond integers. The API accepts `Duration` and c
 
 ## Versioning
 
-Both sides must run the same `VERSION`, currently 2. Enum variants are append-only across releases, and postcard encodes them as variant indices, so reordering or removing a variant requires a version bump.
+Both sides must run the same `VERSION`, currently 3. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
 
 Adding a variant requires the bump just as much. postcard cannot tell an unknown variant index from corrupt bytes, so an old peer that receives a frame carrying a newer variant sees a plain decode error: on the signaling plane the frame is skipped and the peer burns to a phase timeout without ever learning of the mismatch. The version discipline is the only guard on that plane. The data plane checks the version byte before the body, so the first foreign-version packet fails the session with `VersionMismatch` on the spot.
 
@@ -86,6 +86,10 @@ pub struct V4Nat {
     pub reflexive: SocketAddrV4,
     /// External ports observed at the NAT, in send order. Capped at 64 entries.
     pub alloc_seq: Vec<u16>,
+    /// Distinct server IPs among the answered probe destinations. A
+    /// single-IP fan-out crossed one mapping on an address-dependent NAT,
+    /// so a cone reading built from it rests on one mapping's behavior.
+    pub distinct_probe_ips: u8,
     /// Inbound filtering evidence. A probe runs no filtering test, so the
     /// value is always `Unknown`.
     pub filtering: FilterClass,

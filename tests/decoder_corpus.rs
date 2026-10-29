@@ -24,6 +24,7 @@ fn hello_frame() -> SigFrame {
             reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 40001),
             // Every vector sits at its cap, so the encoding is maximal.
             alloc_seq: (0..64u16).map(|p| 30000 + p).collect(),
+            distinct_probe_ips: 4,
             filtering: FilterClass::AddressPortDependent,
         }),
         v6: Some(V6Nat {

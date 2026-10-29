@@ -41,7 +41,15 @@ impl Selection {
             return;
         }
         self.estimate = match self.strategy {
-            StrategyId::SymProbe => Some(sym_probe_estimate(mine, peer, self, cfg)),
+            StrategyId::SymProbe => {
+                // A pair routed here with no symmetric side came from a
+                // low-confidence cone reading: success then rests on the
+                // ambiguous NAT's inbound filtering, which the probe does
+                // not measure, so no number is stated.
+                let either_symmetric =
+                    is_symmetric(effective_class(mine)) || is_symmetric(effective_class(peer));
+                either_symmetric.then(|| sym_probe_estimate(mine, peer, self, cfg))
+            },
             StrategyId::BirthdayBurst => {
                 let (space_i, space_r) = (peer_space(mine), peer_space(peer));
                 let sized = size_burst(space_i, space_r, cfg);
@@ -64,6 +72,41 @@ pub(crate) fn effective_class(info: &NatInfo) -> NatClass {
     }
 }
 
+/// Whether a class reading separates cone from symmetric behavior.
+///
+/// A symmetric reading shows differing ports, which already proves the
+/// mapping dimension was exercised. A cone reading shows identical ports,
+/// which an address-dependent NAT also produces when the whole fan-out
+/// crossed one mapping — the case of a single answered IP — and a single
+/// answered sample says nothing either way. Public compares the reflexive
+/// address with the local one and carries its own proof.
+pub(crate) fn cone_confident(info: &NatInfo) -> bool {
+    match info.v4_class() {
+        NatClass::Cone => {
+            let v4 = info.v4.as_ref().expect("a cone reading owns v4 evidence");
+            v4.distinct_probe_ips >= 2 && v4.alloc_seq.len() >= 2
+        },
+        _ => true,
+    }
+}
+
+/// Whether the initiator of a SymProbe pair holds the shooter sockets,
+/// from the initiator's own view.
+///
+/// The symmetric side shoots. A pair routed here with no symmetric side
+/// comes from a low-confidence cone reading, and the ambiguous side
+/// shoots; with both readings ambiguous the responder shoots, a
+/// deterministic pick that keeps one shooter when the peer's view cannot
+/// break the tie.
+fn initiator_shoots(mine: &NatInfo, peer: &NatInfo) -> bool {
+    let mine_symmetric = is_symmetric(effective_class(mine));
+    let peer_symmetric = is_symmetric(effective_class(peer));
+    if mine_symmetric != peer_symmetric {
+        return mine_symmetric;
+    }
+    !cone_confident(mine) && cone_confident(peer)
+}
+
 /// Applies the selection matrix to both classes.
 pub(crate) fn select(
     mine: &NatInfo,
@@ -76,14 +119,45 @@ pub(crate) fn select(
     let peer_is_symmetric = is_symmetric(peer_class);
 
     if !i_am_symmetric && !peer_is_symmetric {
-        // Cone against cone, or public against either: one socket per side
-        // aimed at the reflexive address.
-        return Ok(Selection {
-            strategy: StrategyId::ConeExchange,
-            initiator_sockets: 1,
-            responder_sockets: 1,
+        if cone_confident(mine) && cone_confident(peer) {
+            // Cone against cone, or public against either: one socket per
+            // side aimed at the reflexive address.
+            return Ok(Selection {
+                strategy: StrategyId::ConeExchange,
+                initiator_sockets: 1,
+                responder_sockets: 1,
+                estimate: None,
+            });
+        }
+        // A cone reading from a single-IP fan-out or a single sample may
+        // be an address-dependent symmetric NAT seen through one mapping,
+        // and ConeExchange fails against that reading. SymProbe's shooter
+        // shape survives either truth, because the shooter's sockets punch
+        // whether the ambiguous side turns out to be a cone or symmetric.
+        let shooter = cfg.assistant_sockets;
+        let (initiator_sockets, responder_sockets) = if initiator_shoots(mine, peer) {
+            (shooter, 1)
+        } else {
+            (1, shooter)
+        };
+        let mut sel = Selection {
+            strategy: StrategyId::SymProbe,
+            initiator_sockets,
+            responder_sockets,
             estimate: None,
-        });
+        };
+        sel.fill_estimate(mine, peer, cfg);
+        // The same bar BirthdayBurst faces: a spray capped by budget or
+        // conntrack below min_success would burn the whole punch window on
+        // a near miss, so Negotiate refuses the pair before any socket
+        // opens.
+        if sel.estimate.is_some_and(|est| est < cfg.min_success) {
+            return Err(PunchError::Unpunchable {
+                local: mine_class,
+                peer: peer_class,
+            });
+        }
+        return Ok(sel);
     }
     if i_am_symmetric != peer_is_symmetric {
         // Exactly one side is symmetric; that side shoots, the other replies.
@@ -170,12 +244,24 @@ fn usable_peer_v6(ip: Ipv6Addr) -> bool {
         && ip.to_ipv4_mapped().is_none()
 }
 
+/// Widening multiplier on the unbiased per-side extension of a span.
+///
+/// An unbiased width is not the honest rate input: a span estimate that
+/// overshoots is modeled exactly, because candidates spread over the
+/// estimate hit live mappings with probability 1/estimate per pair, while
+/// an undershoot is optimistic by the coverage ratio. Doubling the
+/// extension lands the estimate above the true span about nine runs in
+/// ten at four samples (`r/S` is Beta(k-1, 2), so
+/// `P[S <= r * (1 + 4/(k-1))] = 1 - F(3/7) ~ 0.89`), which leaves only
+/// the thin undershoot tail optimistic.
+const SPAN_CONFIDENCE: u16 = 2;
+
 /// The port span a symmetric peer draws from, estimated from its probe.
 ///
 /// `k` uniform samples over a span of width `S` show an expected range of
-/// `S * (k - 1) / (k + 1)`, so widening the observed range by
-/// `range / (k - 1)` on each side lands the estimate on `S` in expectation
-/// without a separate margin constant. One shared estimate feeds the
+/// `S * (k - 1) / (k + 1)`, so the observed range widened by
+/// `SPAN_CONFIDENCE * range / (k - 1)` on each side reads as an
+/// upper-confidence estimate of `S`. One shared estimate feeds the
 /// probability model and candidate sampling alike, so estimation and
 /// sampling stay equally conservative. Fewer than two samples carry no
 /// range at all, so the estimate falls back to the upper ephemeral half,
@@ -187,9 +273,7 @@ pub(crate) fn span_estimate(seq: &[u16]) -> (u16, u16) {
     }
     let min = *seq.iter().min().expect("len checked");
     let max = *seq.iter().max().expect("len checked");
-    // The extension cannot leave the port range, and saturation clips both
-    // ends to what a u16 span can express.
-    let ext = (max - min) / (seq.len() - 1) as u16;
+    let ext = (max - min) / (seq.len() - 1) as u16 * SPAN_CONFIDENCE;
     (min.saturating_sub(ext), max.saturating_add(ext))
 }
 
@@ -491,13 +575,21 @@ pub(crate) fn build_plan(
     match sel.strategy {
         StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
         StrategyId::SymProbe => {
-            let i_am_symmetric = is_symmetric(effective_class(mine));
+            // The socket counts carry the shape: the shooter side holds
+            // the assistant count, the replying side one socket. A tie is
+            // one assistant socket per side, which the initiator shoots,
+            // so the derivation stays role-keyed instead of re-reading
+            // the classes the Offer may have crossed.
+            let i_shoot = match role {
+                crate::report::Role::Initiator => sel.initiator_sockets >= sel.responder_sockets,
+                crate::report::Role::Responder => sel.responder_sockets > sel.initiator_sockets,
+            };
             let peer_sockets = match role {
                 crate::report::Role::Initiator => sel.responder_sockets,
                 crate::report::Role::Responder => sel.initiator_sockets,
             };
             stages.extend(sym_cone::stage(
-                i_am_symmetric,
+                i_shoot,
                 my_sockets,
                 peer_sockets,
                 peer,
@@ -1581,20 +1673,22 @@ mod tests {
     }
 
     #[test]
-    fn spans_widen_by_the_expected_range_share() {
+    fn spans_widen_by_the_confidence_share() {
         // k samples of a uniform span of width S show an expected range of
-        // S * (k - 1) / (k + 1), so range / (k - 1) on each side lands the
-        // unbiased estimate: four samples of a 100-wide span average a
-        // 60-wide range and widen to 60 + 2 * 20 = 100.
+        // S * (k - 1) / (k + 1), so twice range / (k - 1) per side reads as
+        // an upper-confidence estimate: four samples of a 100-wide span
+        // average a 60-wide range and widen to 60 + 2 * 40 = 140, above
+        // the truth nine runs in ten.
         assert_eq!(
             span_estimate(&[30_000, 30_020, 30_060, 30_060]),
-            (29_980, 30_080)
+            (29_960, 30_100)
         );
-        assert_eq!(span_estimate(&[30_000, 30_050, 30_100]), (29_950, 30_150));
-        // Two samples stretch their range threefold in expectation.
-        assert_eq!(span_estimate(&[10, 20]), (0, 30));
+        assert_eq!(span_estimate(&[30_000, 30_050, 30_100]), (29_900, 30_200));
+        // Two samples stretch sixfold, the weakest evidence the formula
+        // accepts.
+        assert_eq!(span_estimate(&[10, 20]), (0, 40));
         // Saturation clips the extension at the port range.
-        assert_eq!(span_estimate(&[65_500, 65_530]), (65_470, u16::MAX));
+        assert_eq!(span_estimate(&[65_500, 65_530]), (65_440, u16::MAX));
     }
 
     #[test]
@@ -1653,6 +1747,42 @@ mod tests {
         // A peer socket count that already fills the bound leaves the floor
         // of one candidate.
         assert_eq!(spray_count(16, 30_000, &cfg), 1);
+    }
+
+    /// A cone reading built from a single answered IP, or from a single
+    /// sample, cannot separate a cone from an address-dependent symmetric
+    /// NAT: the pair routes to SymProbe with the ambiguous side shooting
+    /// instead of a ConeExchange that reading may doom.
+    #[test]
+    fn low_confidence_cone_readings_route_sym_probe() {
+        let cone = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        let cfg = PunchConfig::default();
+        assert_eq!(
+            select(&cone, &cone, &cfg)
+                .expect("confident cones select")
+                .strategy,
+            StrategyId::ConeExchange
+        );
+        let mut single_ip = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        single_ip
+            .v4
+            .as_mut()
+            .expect("v4 evidence")
+            .distinct_probe_ips = 1;
+        let sel = select(&single_ip, &cone, &cfg).expect("ambiguous initiator selects");
+        assert_eq!(sel.strategy, StrategyId::SymProbe);
+        assert_eq!((sel.initiator_sockets, sel.responder_sockets), (16, 1));
+        // The ambiguous responder shoots against a trusted initiator, and
+        // a pair with no symmetric side states no spray model.
+        let sel = select(&cone, &single_ip, &cfg).expect("ambiguous responder selects");
+        assert_eq!(sel.estimate, None);
+        assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 16));
+        // A single answered sample carries no range and no mapping
+        // evidence; the pair still runs, with the responder shooting.
+        let one_sample = sample_info(NatClass::Cone, &[50_000]);
+        let sel = select(&one_sample, &one_sample, &cfg).expect("thin samples select");
+        assert_eq!(sel.strategy, StrategyId::SymProbe);
+        assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 16));
     }
 
     #[test]
@@ -2906,6 +3036,7 @@ mod tests {
                 class,
                 reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), seq[0]),
                 alloc_seq: seq.to_vec(),
+                distinct_probe_ips: 2,
                 filtering: crate::nat::FilterClass::Unknown,
             }),
             v6: None,

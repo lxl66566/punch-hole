@@ -489,6 +489,7 @@ mod tests {
                 class: NatClass::EasySym { step: 2 },
                 reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 40001),
                 alloc_seq: vec![40001; crate::msg::MAX_ALLOC_SEQ * 2],
+                distinct_probe_ips: 4,
                 filtering: FilterClass::Unknown,
             }),
             v6: Some(V6Nat {
@@ -520,6 +521,7 @@ mod tests {
                 class: NatClass::Cone,
                 reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 40000),
                 alloc_seq: vec![40000; 4],
+                distinct_probe_ips: 2,
                 filtering: FilterClass::Unknown,
             }),
             v6: None,
