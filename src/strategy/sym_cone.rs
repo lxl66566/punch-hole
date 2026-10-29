@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use super::{
-    StageSpec, burst_len, distinct_ports, effective_class, observed_range, peer_space, spray_count,
+    StageSpec, burst_len, distinct_ports, effective_class, peer_space, span_estimate, spray_count,
 };
 use crate::{
     config::PunchConfig,
@@ -78,7 +78,7 @@ fn predicted(ip: Ipv4Addr, seq: &[u16], peer_sockets: u16, step: i16) -> Option<
     )
 }
 
-/// Distinct random candidates over the HardSym peer's observed span.
+/// Distinct random candidates over the HardSym peer's estimated span.
 ///
 /// The peer's live mapping ports are fixed once its pulses begin, so the
 /// stream advances through the span instead of repeating a few ports.
@@ -90,7 +90,7 @@ fn random_spray(
     cfg: &PunchConfig,
 ) -> Vec<SocketAddr> {
     let seq = peer.v4.as_ref().map_or(&[][..], |v4| &v4.alloc_seq);
-    let (lo, hi) = observed_range(seq);
+    let (lo, hi) = span_estimate(seq);
     let span = usize::from(hi - lo) + 1;
     let count = spray_count(peer_sockets as usize, peer_space(peer), cfg).min(span);
     let seed = u64::from_be_bytes(nonce[..8].try_into().expect("nonce is 16 bytes"));

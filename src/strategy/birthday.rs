@@ -2,33 +2,28 @@
 
 use std::net::{SocketAddr, SocketAddrV4};
 
-use super::{StageSpec, burst_len, distinct_ports, observed_range, size_burst};
+use super::{StageSpec, burst_len, distinct_ports, span_estimate};
 use crate::{config::PunchConfig, msg::Nonce, nat::NatInfo, socket::Family};
 
-/// Synchronized pulse bursts into the peer's observed port space.
+/// Synchronized pulse bursts into the peer's estimated port span.
 ///
-/// The shared sizing function decides both the socket count and the covered
-/// port count, so the stage executes what selection estimated. Port lists are
-/// drawn from a generator seeded by the attempt nonce and the role salt, so
-/// both sides cover the space independently while the run stays reproducible
-/// for a seed.
+/// Selection sizes the coverage over both spaces, so the stage executes
+/// what the estimate reported. Port lists are drawn from a generator seeded
+/// by the attempt nonce and the role salt, so both sides cover the space
+/// independently while the run stays reproducible for a seed.
 pub(crate) fn stage(
     my_sockets: u16,
+    my_coverage: usize,
     peer: &NatInfo,
-    space: usize,
     nonce: Nonce,
     salt: u64,
     cfg: &PunchConfig,
 ) -> Option<StageSpec> {
     let v4 = peer.v4.as_ref()?;
     let ip = *v4.reflexive.ip();
-    // Selection sized the negotiated socket count with the same pure call,
-    // so the bound count and the sized count agree whenever both sides run
-    // the same config.
-    let (_n, _m, coverage) = size_burst(space, cfg);
-    let (lo, hi) = observed_range(&v4.alloc_seq);
+    let (lo, hi) = span_estimate(&v4.alloc_seq);
     let seed = u64::from_be_bytes(nonce[..8].try_into().expect("nonce is 16 bytes")) ^ salt;
-    let targets: Vec<SocketAddr> = distinct_ports(seed, lo, hi, coverage)
+    let targets: Vec<SocketAddr> = distinct_ports(seed, lo, hi, my_coverage)
         .into_iter()
         .map(|port| SocketAddr::V4(SocketAddrV4::new(ip, port)))
         .collect();

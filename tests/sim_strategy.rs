@@ -49,13 +49,13 @@ async fn hard_sym_cone_apdf_punches_via_spray() {
     // from sources the cone never wrote to, so only the cone's own spray
     // opens the path.
     let mut cfg = PunchConfig::default();
-    // Model margin: the probe pins the HardSym space to the observed spread
-    // plus 2 * 64 margin, at most 100 + 128 = 228. With m = 16 peer sockets
-    // and target 0.99, c = ceil(ln(100) * 228 / 16) = 66 and the estimate
-    // 1 - exp(-16 * 66 / 228) >= 0.99. A narrower observed spread only
-    // raises it, so the 0.98 bar keeps float noise out of the assertion.
-    // The percent below the target is the model's residual, covered by a
-    // rerun on a fresh nonce.
+    // The span estimate is unbiased for the 100-wide range: four samples
+    // show a ~60-wide range and widen to ~100. With m = 16 peer sockets
+    // and target 0.99, c = ceil(ln(100) * space / 16) solves the estimate
+    // to 1 - exp(-m * c / space) >= 0.99 against whatever span the probe
+    // saw, so the 0.98 bar keeps float noise out of the assertion. A run
+    // whose estimate undershot the true range is covered by a rerun on a
+    // fresh nonce.
     cfg.target_success = 0.99;
     let (ra, rb) = common::punch_pair_retried(
         "hard_sym_cone_apdf",
@@ -143,10 +143,10 @@ async fn easy_sym_pair_with_gapped_allocations_punches() {
 async fn birthday_burst_narrow_range() {
     let mut cfg = PunchConfig::default();
     // The sizing is honest for its target, so the 0.5 default target leaves
-    // a coin flip. At 0.95 the sizing covers ceil(sqrt(ln(20) / 2 * space))
-    // ports, 18 on a typical 200-wide space estimate, which keeps the true
-    // chance above 0.99 on the 100-wide range. The rest is the model's
-    // residual, covered by a rerun on a fresh nonce.
+    // a coin flip. At 0.95 the solve covers ceil(sqrt(ln(20) * S_eff))
+    // ports, 13 on a typical 100-wide span estimate (S_eff = 50), which
+    // keeps the true chance above 0.95 on the 100-wide range. The rest is
+    // the estimator's variance, covered by a rerun on a fresh nonce.
     cfg.target_success = 0.95;
     let (ra, rb) = common::punch_pair_retried(
         "birthday_narrow",
@@ -194,10 +194,11 @@ async fn birthday_measured_rate_tracks_the_estimate() {
     // measures a rate near 0.5. The per-run outcomes vary with the attempt
     // nonce even at a fixed seed, which makes the count binomial: 64 runs
     // give a standard deviation near 0.06, and 0.25 covers more than four
-    // standard deviations. The margin also absorbs the span estimation
-    // slack: the model sizes against the observed span plus a 128 margin
-    // while the real range is 400 wide, a bias of a few hundredths in
-    // probability at this width.
+    // standard deviations. The margin also absorbs the span estimator's
+    // variance: the order-statistics estimate is unbiased for the 400-wide
+    // range, but an undershooting run concentrates candidates inside the
+    // true range while an overshooting run dilutes them, a swing of a few
+    // hundredths in probability at this width.
     assert!(
         (rate - 0.5).abs() <= 0.25,
         "measured rate {rate} drifted from the estimated 0.5"
@@ -227,6 +228,32 @@ async fn birthday_starved_goes_unpunchable() {
     assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
 
     // The decision happened in Negotiate: only the probe traffic crossed.
+    let spent = net.forwarded() - forwarded_before;
+    assert!(spent < 60, "data plane sent {spent} packets");
+}
+
+/// A SymProbe pair whose spray the budget caps below `min_success` refuses
+/// in Negotiate, the same bar the birthday burst faces: only the probe
+/// traffic crosses.
+#[tokio::test(start_paused = true)]
+async fn sym_probe_starved_goes_unpunchable() {
+    let net = Net::seeded("sym_probe_starved");
+    let stun = net.stun_server();
+    let mut cfg = config(&stun);
+    // The HardSym side draws from most of the ephemeral half, and a tiny
+    // budget caps the cone-side spray far below the default 0.1 bar.
+    cfg.packet_budget = 64;
+    let cfg_b = cfg.clone();
+    let a = net.host(NatSpec::random(32768..65535));
+    let b = net.host(NatSpec::cone_eif());
+
+    let forwarded_before = net.forwarded();
+    let (ra, rb) = common::punch_pair(a, cfg, b, cfg_b).await;
+    assert!(
+        matches!(ra, Err(PunchError::Unpunchable { .. })),
+        "got {ra:?}"
+    );
+    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
     let spent = net.forwarded() - forwarded_before;
     assert!(spent < 60, "data plane sent {spent} packets");
 }

@@ -20,6 +20,10 @@ Before the matrix strategy runs, a Direct stage checks whether the pair needs no
 
 The addresses a `Hello` carries belong to the sender's probe socket, which is closed by then. So the stage, like every fixed-port stage, waits for the peer's `PortUpdate`, the frame that names the live punch socket's port.
 
+## Estimating a symmetric peer's port span
+
+SymProbe's spray and BirthdayBurst both aim at the ports a symmetric peer's NAT will hand its punch sockets, so both need a span estimate from the probe samples. `k` uniform samples over a span of width `S` show an expected range of `S * (k - 1) / (k + 1)`, so the observed range widened by `range / (k - 1)` on each side estimates `S` in expectation, without a margin constant. The probability model and the candidate sampling read the same estimate, so estimation and sampling stay equally conservative. Fewer than two samples carry no range at all; the estimate then falls back to the upper ephemeral half, the range most NAT families draw from.
+
 ## ConeExchange
 
 Both sides open one socket and send Syn pulses at the peer's reflexive address. Simultaneous sending covers restricted filtering, as the primer chapter describes, and the three-way handshake confirms the path.
@@ -33,7 +37,9 @@ The spray exists for the cone side that filters on address and port. Such a cone
 The candidate ports follow the peer's effective class:
 
 - A confident easy symmetric peer gets the ports its observed sequence continues to. The window covers the peer's socket count plus a margin of sixteen for unrelated allocations behind the same NAT, and it walks at the classifier's step.
-- A hard symmetric peer gets a distinct random stream over its observed port span. The stream length solves the one-directional model for `target_success`, capped by a share of the packet budget and by the conntrack bound.
+- A hard symmetric peer gets a distinct random stream over its estimated port span. The stream length solves the one-directional model for `target_success`, capped by a share of the packet budget and by the conntrack bound.
+
+An estimate below `min_success` fails Negotiate with `Unpunchable` before any data packet is sent, the same bar BirthdayBurst faces, so a spray the budget or conntrack bound starves never burns the punch window.
 
 The allocations that land between the peer's Probe and its punch sockets move its whole sequence, often past that margin. A symmetric peer with a confident stride therefore re-queries STUN on its punch socket at engine start and announces the observed port; the cone side reads that port as the sequence's current position and moves its fitted window onto it, keeping the window's stride and length.
 
@@ -49,13 +55,13 @@ Both sides also announce their current allocation position the same way SymProbe
 
 Both sides are symmetric with at least one hard side. Prediction is out of the picture, so the strategy plays the collision game: each side opens sockets, each socket covers distinct ports drawn from the peer's observed span, and both sides pulse at once until a covered port pair collides in both directions.
 
-One sizing function feeds both the decision and the execution. The model assumes address-dependent filtering, the common CGNAT shape, under which one directional hit completes the handshake. With `n` sockets and `c` covered ports per side against a port space of `space`, the hit chance is:
+One sizing function feeds both the decision and the execution. The model assumes address-dependent filtering, the common CGNAT shape, under which one directional hit completes the handshake. A hit into side X needs the peer's coverage to land on one of X's live mappings, and sockets and coverage contribute to that only through their product — the live-mapping count — so each side opens one socket and spends its whole mapping share on coverage. The spaces are directional: A's live mappings sit inside A's own port space, so with `c_A` and `c_B` covered ports per side the hit chance is:
 
 ```text
-chance = 1 - exp(-(n_A * c_A * c_B + n_B * c_B * c_A) / space)
+chance = 1 - exp(-c_A * c_B * (1/space_A + 1/space_B))
 ```
 
-Coverage is the leverage: every mapping spent on a wider covered set buys more chance than a mapping spent on another socket. The sizing therefore opens one socket per side and raises the socket count only when coverage hits a cap. The caps are the peer's drawable port window, the conntrack bound minus reply headroom, a quarter of the packet budget, and `max_sockets`. With defaults against a full 32768-wide space, the sizing picks one socket per side covering 107 ports.
+An asymmetric pair therefore plays over the effective space `1 / (1/space_A + 1/space_B)`, which sits below the narrower side: a 300-by-20000 pair solves like a 296-wide space instead of a 20000-wide one. The balanced solve covers `ceil(sqrt(ln(1 / (1 - target)) * S_eff))` ports per side, capped by the span it shoots into, the conntrack bound minus reply headroom, and a quarter of the packet budget. When a cap binds, the estimate states the shortfall and the `min_success` gate refuses the pair. With defaults against a full 32768-wide space on both sides, the sizing covers 107 ports per side.
 
 Port lists draw from a generator seeded by the attempt nonce, so both sides cover the space independently while a run stays reproducible from its seed. Sweeps repeat the same covered set, so the per-sweep chance equals the attempt chance.
 

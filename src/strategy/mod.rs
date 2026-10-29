@@ -43,9 +43,9 @@ impl Selection {
         self.estimate = match self.strategy {
             StrategyId::SymProbe => Some(sym_probe_estimate(mine, peer, self, cfg)),
             StrategyId::BirthdayBurst => {
-                let space = burst_space(mine, peer);
-                let (n, _m, c) = size_burst(space, cfg);
-                Some(burst_hit_chance(n, c, n, c, space))
+                let (space_i, space_r) = (peer_space(mine), peer_space(peer));
+                let sized = size_burst(space_i, space_r, cfg);
+                Some(burst_hit_chance(&sized, space_i, space_r))
             },
             _ => None,
         };
@@ -100,6 +100,16 @@ pub(crate) fn select(
             estimate: None,
         };
         sel.fill_estimate(mine, peer, cfg);
+        // The same bar BirthdayBurst faces: a spray capped by budget or
+        // conntrack below min_success would burn the whole punch window on
+        // a near miss, so Negotiate refuses the pair before any socket
+        // opens.
+        if sel.estimate.is_some_and(|est| est < cfg.min_success) {
+            return Err(PunchError::Unpunchable {
+                local: mine_class,
+                peer: peer_class,
+            });
+        }
         return Ok(sel);
     }
     if let (NatClass::EasySym { .. }, NatClass::EasySym { .. }) = (mine_class, peer_class) {
@@ -113,9 +123,9 @@ pub(crate) fn select(
         // The probe cannot read a symmetric peer's filtering class, so the
         // estimate assumes address-dependent filtering, the common CGNAT
         // shape; `burst_hit_chance` states what that costs.
-        let space = burst_space(mine, peer);
-        let (n, m, c) = size_burst(space, cfg);
-        let estimate = burst_hit_chance(n, c, m, c, space);
+        let (space_i, space_r) = (peer_space(mine), peer_space(peer));
+        let sized = size_burst(space_i, space_r, cfg);
+        let estimate = burst_hit_chance(&sized, space_i, space_r);
         if estimate < cfg.min_success {
             return Err(PunchError::Unpunchable {
                 local: mine_class,
@@ -124,8 +134,8 @@ pub(crate) fn select(
         }
         Ok(Selection {
             strategy: StrategyId::BirthdayBurst,
-            initiator_sockets: n as u16,
-            responder_sockets: m as u16,
+            initiator_sockets: 1,
+            responder_sockets: 1,
             estimate: Some(estimate),
         })
     }
@@ -160,44 +170,35 @@ fn usable_peer_v6(ip: Ipv6Addr) -> bool {
         && ip.to_ipv4_mapped().is_none()
 }
 
-/// The port space a HardSym peer draws from, estimated from its probe.
+/// The port span a symmetric peer draws from, estimated from its probe.
 ///
-/// A short observed span gets a margin on both ends; no observations fall
-/// back to the upper ephemeral half.
-pub(crate) fn peer_space(peer: &NatInfo) -> usize {
-    let Some(seq) = peer.v4.as_ref().map(|v4| &v4.alloc_seq) else {
-        return DEFAULT_SPACE;
-    };
+/// `k` uniform samples over a span of width `S` show an expected range of
+/// `S * (k - 1) / (k + 1)`, so widening the observed range by
+/// `range / (k - 1)` on each side lands the estimate on `S` in expectation
+/// without a separate margin constant. One shared estimate feeds the
+/// probability model and candidate sampling alike, so estimation and
+/// sampling stay equally conservative. Fewer than two samples carry no
+/// range at all, so the estimate falls back to the upper ephemeral half,
+/// the range most NAT families draw from.
+pub(crate) fn span_estimate(seq: &[u16]) -> (u16, u16) {
+    const FALLBACK_LO: u16 = 32_768;
     if seq.len() < 2 {
-        return DEFAULT_SPACE;
-    }
-    let min = *seq.iter().min().expect("len checked") as usize;
-    let max = *seq.iter().max().expect("len checked") as usize;
-    (max - min + 1 + 2 * SPACE_MARGIN).min(u16::MAX as usize + 1)
-}
-
-const DEFAULT_SPACE: usize = 32768;
-const SPACE_MARGIN: usize = 64;
-
-/// The port span the peer's NAT drew from, widened by a margin.
-pub(crate) fn observed_range(seq: &[u16]) -> (u16, u16) {
-    const MARGIN: u16 = 32;
-    if seq.len() < 2 {
-        return (32_768, u16::MAX);
+        return (FALLBACK_LO, u16::MAX);
     }
     let min = *seq.iter().min().expect("len checked");
     let max = *seq.iter().max().expect("len checked");
-    (min.saturating_sub(MARGIN), max.saturating_add(MARGIN))
+    // The extension cannot leave the port range, and saturation clips both
+    // ends to what a u16 span can express.
+    let ext = (max - min) / (seq.len() - 1) as u16;
+    (min.saturating_sub(ext), max.saturating_add(ext))
 }
 
-/// The port span a birthday burst is sized against.
-///
-/// Each direction's hit chance scales with the span of the side being
-/// sprayed, so the wider of the two observed spans governs the pair. Both
-/// roles compute the same value from their pair of views, which keeps the
-/// sizing and the estimate equal on both sides.
-pub(crate) fn burst_space(mine: &NatInfo, peer: &NatInfo) -> usize {
-    peer_space(mine).max(peer_space(peer))
+/// The port space a symmetric peer's fresh mappings draw from: the width
+/// of its estimated span.
+pub(crate) fn peer_space(peer: &NatInfo) -> usize {
+    let seq = peer.v4.as_ref().map_or(&[][..], |v4| &v4.alloc_seq);
+    let (lo, hi) = span_estimate(seq);
+    (usize::from(hi - lo) + 1).min(u16::MAX as usize + 1)
 }
 
 /// Chance that a one-directional spray hits: `c` covered distinct ports
@@ -210,64 +211,82 @@ pub(crate) fn spray_hit_chance(m: usize, c: usize, space: usize) -> f64 {
     1.0 - (-lambda).exp()
 }
 
+/// Coverage a birthday burst is sized for, one socket per side.
+///
+/// Direction A covers ports of B's space, so each coverage belongs to the
+/// space it shoots into: `initiator_coverage` draws from the responder's
+/// span and lands on the initiator's target list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BurstSize {
+    pub initiator_coverage: usize,
+    pub responder_coverage: usize,
+}
+
 /// Chance that two synchronized bursts pair up under address-dependent
 /// filtering, the regime selection assumes for a symmetric pair.
 ///
-/// Side X holds `n_X * c_X` live mappings, one per sender and covered port,
-/// and covers `c_X` distinct ports of the peer's space. One directional hit
-/// completes the handshake, so the two expected-hit terms add up to
-/// `(n_A * c_A * c_B + n_B * c_B * c_A) / space`. A probe cannot read a
-/// symmetric peer's filtering class, so the estimate states this regime
-/// instead of measuring it. Port-strict filtering needs both directions to
-/// pair exactly, which lands near `n_A * c_A * n_B * c_B / space^2` and
+/// A hit into side X needs the peer's coverage to land on one of X's live
+/// mappings, `coverage_peer * sockets_X * coverage_X / space_X` in
+/// expectation. Sockets and coverage enter only as their product, so the
+/// sizing spends every mapping on coverage and this model carries one
+/// socket per side: the expected hits add up to
+/// `c_i * c_r * (1/space_i + 1/space_r)`. A probe cannot read a symmetric
+/// peer's filtering class, so the estimate states this regime instead of
+/// measuring it. Port-strict filtering needs both directions to pair
+/// exactly, which lands near `(c_i * c_r)^2 / (space_i * space_r)` and
 /// stays negligible at any bounded budget.
-pub(crate) fn burst_hit_chance(
-    n_a: usize,
-    c_a: usize,
-    n_b: usize,
-    c_b: usize,
-    space: usize,
-) -> f64 {
-    if space == 0 {
+pub(crate) fn burst_hit_chance(sized: &BurstSize, space_i: usize, space_r: usize) -> f64 {
+    if space_i == 0 || space_r == 0 {
         return 1.0;
     }
-    let hits_a = (n_a * c_a) as f64 * c_b as f64;
-    let hits_b = (n_b * c_b) as f64 * c_a as f64;
-    1.0 - (-(hits_a + hits_b) / space as f64).exp()
+    let hits = sized.initiator_coverage as f64 * sized.responder_coverage as f64;
+    1.0 - (-hits * (1.0 / space_i as f64 + 1.0 / space_r as f64)).exp()
 }
 
 /// Headroom between the sized burst and the conntrack bound: the peer's
 /// replies arrive from a fresh mapping port outside the target list.
 const BURST_MAPPING_HEADROOM: usize = 2;
 
-/// Sockets and coverage per side for a target success rate.
+/// The space a symmetric pair effectively plays over: one hit into either
+/// side completes the handshake, so the two directional terms add and the
+/// pair behaves like a single space of `1 / (1/a + 1/b)`.
+fn effective_space(a: usize, b: usize) -> f64 {
+    (a as f64) * (b as f64) / (a + b) as f64
+}
+
+/// Coverage per side for a target success rate.
 ///
-/// Under the address-dependent model the expected hits are `2 * n * c^2 /
-/// space`, so coverage is the leverage: a mapping spent on a wider covered
-/// set buys more hit chance than the same mapping spent on another socket.
-/// The derivation therefore opens one socket per side and raises the socket
-/// count only once coverage sits at a cap. The caps: the peer's drawable port
-/// window, the conntrack bound minus reply headroom, a packet budget share
-/// because every mapping costs one packet per rotation, and `max_sockets`.
-pub(crate) fn size_burst(space: usize, cfg: &PunchConfig) -> (usize, usize, usize) {
-    // Reaching the target needs n * c^2 >= ln(1 / (1 - target)) * space / 2
-    // expected-hit products.
-    let required = -(1.0 - cfg.target_success).ln() * space as f64 / 2.0;
-    // The drawable window is the modeled space without its two margins.
-    let span_cap = space.saturating_sub(2 * SPACE_MARGIN).max(1);
+/// Sockets and coverage contribute to the hit rate only through their
+/// product `sockets * coverage` — the live-mapping count — and the
+/// conntrack bound caps that product, so one socket per side already
+/// reaches any burst the bound admits and the solve spends every mapping
+/// on coverage. With one socket per side the requirement is
+/// `c_i * c_r >= ln(1 / (1 - target)) * S_eff` over `S_eff =
+/// effective_space(space_i, space_r)`, met by the balanced solve
+/// `c = ceil(sqrt(required * S_eff))`. Each coverage caps at the space it
+/// shoots into (there are no more ports to cover), the conntrack bound
+/// minus reply headroom, and a packet budget share because every covered
+/// port costs one packet per rotation.
+pub(crate) fn size_burst(space_i: usize, space_r: usize, cfg: &PunchConfig) -> BurstSize {
+    // Reaching the target needs c_i * c_r >= ln(1/(1-target)) * S_eff
+    // expected-hit products, carried as an integer so the estimate can
+    // verify the sizing exactly.
+    let required = -(1.0 - cfg.target_success).ln() * effective_space(space_i, space_r);
+    let need = if required.is_finite() {
+        required.ceil().max(1.0) as usize
+    } else {
+        usize::MAX
+    };
     let mapping_cap = cfg
         .max_mappings
         .saturating_sub(BURST_MAPPING_HEADROOM)
         .min(cfg.packet_budget as usize / SPRAY_BUDGET_SHARE)
         .max(1);
-    let coverage = (required.sqrt().ceil() as usize).clamp(1, span_cap.min(mapping_cap));
-    // Sockets make up the remaining hit rate once coverage is capped.
-    let max_sockets = (cfg.max_sockets as usize)
-        .min(mapping_cap / coverage)
-        .max(1);
-    let sockets =
-        ((required / (coverage as f64 * coverage as f64)).ceil() as usize).clamp(1, max_sockets);
-    (sockets, sockets, coverage)
+    let balanced = ((need as f64).sqrt().ceil() as usize).max(1);
+    BurstSize {
+        initiator_coverage: balanced.min(space_r.max(1)).min(mapping_cap),
+        responder_coverage: balanced.min(space_i.max(1)).min(mapping_cap),
+    }
 }
 
 /// Share of the packet budget a spray may spend. Retransmissions keep the
@@ -495,11 +514,18 @@ pub(crate) fn build_plan(
             stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
         },
         StrategyId::BirthdayBurst => {
-            let space = burst_space(mine, peer);
+            // Selection sized the same pure solve over the same pair of
+            // views, so the role-keyed coverage here matches what the
+            // estimate reported.
+            let sized = size_burst(peer_space(mine), peer_space(peer), cfg);
+            let coverage = match role {
+                crate::report::Role::Initiator => sized.initiator_coverage,
+                crate::report::Role::Responder => sized.responder_coverage,
+            };
             stages.extend(birthday::stage(
                 my_sockets,
+                coverage,
                 peer,
-                space,
                 nonce,
                 role as u64,
                 cfg,
@@ -1430,17 +1456,46 @@ mod tests {
     }
 
     #[test]
-    fn burst_model_prefers_coverage_and_saturates() {
-        // Every row holds 16 mappings per side; only the split differs.
-        // Lambda is 2*n*c^2/space, so 1 socket over 16 ports buys four
-        // times the hits of 4 sockets over 4 ports.
-        let narrow = burst_hit_chance(4, 4, 4, 4, 1000);
-        let wide = burst_hit_chance(1, 16, 1, 16, 1000);
-        assert!(wide > narrow);
-        // Sockets still add hits once coverage is fixed.
-        assert!(burst_hit_chance(2, 16, 2, 16, 1000) > wide);
+    fn burst_model_reads_each_directions_space() {
+        let narrow_wide = BurstSize {
+            initiator_coverage: 15,
+            responder_coverage: 15,
+        };
+        // A 300 x 20000 pair: the directional terms add, so the same
+        // coverage buys far more than a shared 20000-wide space would.
+        let directional = burst_hit_chance(&narrow_wide, 300, 20_000);
+        let shared = burst_hit_chance(&narrow_wide, 20_000, 20_000);
+        assert!(directional > 0.5, "got {directional}");
+        assert!(shared < 0.05, "got {shared}");
+        // Sockets and coverage enter the model only as their product, so
+        // splits of one product are interchangeable.
+        let balanced = burst_hit_chance(
+            &BurstSize {
+                initiator_coverage: 16,
+                responder_coverage: 16,
+            },
+            1000,
+            1000,
+        );
+        let skewed = burst_hit_chance(
+            &BurstSize {
+                initiator_coverage: 32,
+                responder_coverage: 8,
+            },
+            1000,
+            1000,
+        );
+        assert!((balanced - skewed).abs() < 1e-12);
         // Dense bursts saturate toward certainty.
-        assert!(burst_hit_chance(64, 64, 64, 64, 16) > 0.999);
+        let dense = burst_hit_chance(
+            &BurstSize {
+                initiator_coverage: 64,
+                responder_coverage: 64,
+            },
+            8,
+            8,
+        );
+        assert!(dense > 0.999);
     }
 
     #[test]
@@ -1450,11 +1505,35 @@ mod tests {
             packet_budget: 4096,
             ..PunchConfig::default()
         };
-        // Required products are ln(2) * 1000 / 2 = 347, solved by one socket
-        // per side covering ceil(sqrt(347)) = 19 ports (19^2 = 361).
-        let (n, m, c) = size_burst(1000, &cfg);
-        assert_eq!((n, m, c), (1, 1, 19));
-        assert!(burst_hit_chance(n, c, m, c, 1000) >= cfg.target_success - 1e-9);
+        // Required products are ln(2) * 500 = 347 over the effective space
+        // of two 1000-wide spans, solved by 19 covered ports per side
+        // (19^2 = 361).
+        let sized = size_burst(1000, 1000, &cfg);
+        assert_eq!(
+            (sized.initiator_coverage, sized.responder_coverage),
+            (19, 19)
+        );
+        assert!(
+            burst_hit_chance(&sized, 1000, 1000) >= cfg.target_success - 1e-9,
+            "estimate {} under the target",
+            burst_hit_chance(&sized, 1000, 1000)
+        );
+    }
+
+    /// An asymmetric pair solves per direction: the narrow side's span caps
+    /// the coverage that shoots into it, and the estimate still reaches the
+    /// target without inflating the wide side.
+    #[test]
+    fn asymmetric_pairs_solve_per_direction() {
+        let cfg = PunchConfig::default();
+        let sized = size_burst(300, 20_000, &cfg);
+        // ln(2) * effective_space(300, 20000) = ln(2) * 295.6 = 204.9,
+        // solved by 15 covered ports per side.
+        assert_eq!(
+            (sized.initiator_coverage, sized.responder_coverage),
+            (15, 15)
+        );
+        assert!(burst_hit_chance(&sized, 300, 20_000) >= cfg.target_success - 1e-9);
     }
 
     #[test]
@@ -1463,35 +1542,59 @@ mod tests {
             packet_budget: 100,
             ..PunchConfig::default()
         };
-        // The budget share caps the mappings at 25, so coverage clamps to 25
-        // and one socket stays under it: lambda = 2 * 25^2 / 32768 = 0.038.
-        let space = DEFAULT_SPACE;
-        let (n, m, c) = size_burst(space, &cfg);
-        assert_eq!((n, m, c), (1, 1, 25));
-        assert!(burst_hit_chance(n, c, m, c, space) < cfg.min_success);
+        // The budget share caps the mappings at 25, so both coverages clamp
+        // to 25 and the estimate reports the starve honestly:
+        // lambda = 25 * 25 * 2 / 32768 = 0.038.
+        let space = 32_768;
+        let sized = size_burst(space, space, &cfg);
+        assert_eq!(
+            (sized.initiator_coverage, sized.responder_coverage),
+            (25, 25)
+        );
+        assert!(burst_hit_chance(&sized, space, space) < cfg.min_success);
     }
 
     #[test]
-    fn tiny_spaces_raise_the_socket_count() {
+    fn tiny_spaces_solve_inside_the_span() {
         let cfg = PunchConfig::default();
-        // A 132-wide space leaves a 4-port drawable window, so coverage
-        // clamps and sockets make up the rate: n * 4^2 >= ln(2) * 132 / 2.
-        let (n, _m, c) = size_burst(132, &cfg);
-        assert_eq!((n, c), (3, 4));
-        assert!(burst_hit_chance(n, c, n, c, 132) >= cfg.target_success - 1e-9);
+        // A 132-wide span still offers 132 ports of coverage, so the
+        // balanced solve of ln(2) * 66 = 46 products fits at 7 ports per
+        // side with no cap binding.
+        let sized = size_burst(132, 132, &cfg);
+        assert_eq!((sized.initiator_coverage, sized.responder_coverage), (7, 7));
+        assert!(burst_hit_chance(&sized, 132, 132) >= cfg.target_success - 1e-9);
+        // A conntrack bound below the solve clamps both coverages and the
+        // estimate states the shortfall instead of hiding it.
+        let cfg = PunchConfig {
+            max_mappings: 7,
+            ..cfg
+        };
+        let sized = size_burst(132, 132, &cfg);
+        assert_eq!((sized.initiator_coverage, sized.responder_coverage), (5, 5));
+        assert!(burst_hit_chance(&sized, 132, 132) < cfg.target_success);
     }
 
     #[test]
     fn short_sequences_fall_back_to_the_upper_half() {
-        assert_eq!(observed_range(&[1234]), (32_768, u16::MAX));
-        assert_eq!(observed_range(&[]), (32_768, u16::MAX));
+        assert_eq!(span_estimate(&[1234]), (32_768, u16::MAX));
+        assert_eq!(span_estimate(&[]), (32_768, u16::MAX));
     }
 
     #[test]
-    fn observed_spans_widen_by_the_margin() {
-        assert_eq!(observed_range(&[30_000, 30_050, 30_100]), (29_968, 30_132));
-        assert_eq!(observed_range(&[10, 20]), (0, 52));
-        assert_eq!(observed_range(&[65_500, 65_530]), (65_468, 65_535));
+    fn spans_widen_by_the_expected_range_share() {
+        // k samples of a uniform span of width S show an expected range of
+        // S * (k - 1) / (k + 1), so range / (k - 1) on each side lands the
+        // unbiased estimate: four samples of a 100-wide span average a
+        // 60-wide range and widen to 60 + 2 * 20 = 100.
+        assert_eq!(
+            span_estimate(&[30_000, 30_020, 30_060, 30_060]),
+            (29_980, 30_080)
+        );
+        assert_eq!(span_estimate(&[30_000, 30_050, 30_100]), (29_950, 30_150));
+        // Two samples stretch their range threefold in expectation.
+        assert_eq!(span_estimate(&[10, 20]), (0, 30));
+        // Saturation clips the extension at the port range.
+        assert_eq!(span_estimate(&[65_500, 65_530]), (65_470, u16::MAX));
     }
 
     #[test]
@@ -1568,6 +1671,30 @@ mod tests {
             sym_probe_estimate(&sym, &cone, &sel, &cfg),
             sym_probe_estimate(&cone, &sym, &sel, &cfg)
         );
+    }
+
+    /// The SymProbe estimate faces the same `min_success` bar as the
+    /// birthday burst: a spray capped below the bar refuses the pair in
+    /// Negotiate instead of burning the punch window on a near miss.
+    #[test]
+    fn starved_sym_probe_goes_unpunchable() {
+        let sym = sample_info(NatClass::HardSym, &[31_000, 33_000, 35_000, 37_000]);
+        let cone = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        // The span reads 10001 wide; a 64-packet budget caps the spray at
+        // 16 candidates, so the estimate lands near 0.025.
+        let cfg = PunchConfig {
+            packet_budget: 64,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(
+            select(&sym, &cone, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+        // The same pair under the default budget solves to ~0.5 and runs.
+        let sel =
+            select(&sym, &cone, &PunchConfig::default()).expect("default budget reaches the bar");
+        assert_eq!(sel.strategy, StrategyId::SymProbe);
+        assert!(sel.estimate.unwrap() >= 0.1);
     }
 
     #[cfg(feature = "test-util")]
