@@ -54,6 +54,11 @@ pub struct PunchConfig {
 /// Upper bound `validate` enforces on `max_sockets`.
 pub const MAX_SOCKETS_LIMIT: u16 = 4096;
 
+/// Upper bound `validate` enforces on `packets_per_sec`. One packet per
+/// nanosecond is the finest grid a `Duration` spacing limiter can express;
+/// past it the interval would truncate to zero and stop limiting.
+pub const MAX_PACKETS_PER_SEC: u32 = 1_000_000_000;
+
 impl Default for PunchConfig {
     fn default() -> Self {
         Self {
@@ -103,6 +108,9 @@ impl PunchConfig {
         // conntrack table long before the session finishes.
         if self.max_sockets > MAX_SOCKETS_LIMIT {
             return Err(bad("max_sockets must not exceed 4096"));
+        }
+        if self.packets_per_sec > MAX_PACKETS_PER_SEC {
+            return Err(bad("packets_per_sec must not exceed 1e9"));
         }
         if self.max_mappings == 0 {
             return Err(bad("max_mappings must be positive"));
@@ -200,5 +208,19 @@ mod tests {
             ..PunchConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn oversized_packet_rate_is_rejected() {
+        let cfg = PunchConfig {
+            packets_per_sec: MAX_PACKETS_PER_SEC + 1,
+            ..PunchConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+        let boundary = PunchConfig {
+            packets_per_sec: MAX_PACKETS_PER_SEC,
+            ..PunchConfig::default()
+        };
+        assert!(boundary.validate().is_ok());
     }
 }

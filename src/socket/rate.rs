@@ -11,10 +11,16 @@ pub(crate) struct RateLimiter {
     next: Mutex<Option<tokio::time::Instant>>,
 }
 
+/// Smallest grid spacing the limiter uses. Above one packet per
+/// nanosecond, `Duration` division truncates to zero, which would turn
+/// the grid into a pass-through.
+const MIN_INTERVAL: Duration = Duration::from_nanos(1);
+
 impl RateLimiter {
     pub(crate) fn new(pps: u32) -> Self {
+        let interval = (Duration::from_secs(1) / pps.max(1)).max(MIN_INTERVAL);
         Self {
-            interval: Duration::from_secs(1) / pps.max(1),
+            interval,
             next: Mutex::new(None),
         }
     }
@@ -57,5 +63,18 @@ mod tests {
         let start = tokio::time::Instant::now();
         limiter.acquire().await;
         assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// Rates past one packet per nanosecond must keep a nonzero grid. A
+    /// truncated zero interval would let every acquire pass unstopped, so
+    /// the burst would finish without moving the clock at all.
+    #[tokio::test(start_paused = true)]
+    async fn extreme_rates_keep_a_nonzero_grid() {
+        let limiter = RateLimiter::new(u32::MAX);
+        let start = tokio::time::Instant::now();
+        for _ in 0..10 {
+            limiter.acquire().await;
+        }
+        assert!(!start.elapsed().is_zero(), "the grid still spaces packets");
     }
 }

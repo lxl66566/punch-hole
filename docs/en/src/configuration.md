@@ -34,6 +34,7 @@
 - an empty STUN list,
 - zero socket counts, rate, budget, or mappings,
 - socket counts above their bounds, including `max_sockets` past 4096,
+- a rate above one billion packets per second, the finest grid a `Duration` spacing limiter can express,
 - any zero duration,
 - a success target outside 0.0 to 1.0,
 - `min_success` above `target_success`.
