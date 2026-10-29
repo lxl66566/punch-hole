@@ -67,16 +67,40 @@ impl PortPredictor {
 fn median_delta(seq: &[u16]) -> i16 {
     let mut deltas: Vec<i16> = seq
         .windows(2)
-        // Each delta lands in the signed 16-bit wrap domain before the
-        // sort, so a jump across the port boundary ranks as the signed
-        // step it represents instead of a large positive value.
-        .map(|w| {
-            let d = i32::from(w[1]) - i32::from(w[0]);
-            ((d + 32_768).rem_euclid(65_536) - 32_768) as i16
-        })
+        .map(|w| wrap_step(i32::from(w[1]) - i32::from(w[0])))
         .collect();
     deltas.sort_unstable();
     deltas[deltas.len() / 2]
+}
+
+/// The signed step a raw port delta represents, normalized into the signed
+/// 16-bit wrap domain, so a jump across the port boundary ranks as the
+/// signed step it represents instead of a large positive value.
+fn wrap_step(delta: i32) -> i16 {
+    ((delta + 32_768).rem_euclid(65_536) - 32_768) as i16
+}
+
+/// Shifts a constant-stride window so it continues from `fresh` instead of
+/// the base it was fitted on.
+///
+/// The window's own first two ports carry its stride, so the shift moves
+/// every port by the wrap-domain distance between the two bases. Returns
+/// `None` for windows without a readable stride, which no predicted window
+/// is. A fresh base from a later observation supersedes the fitted one,
+/// because unrelated allocations behind the same NAT move the whole
+/// sequence forward.
+#[must_use]
+pub(crate) fn rebased_window(window: &[u16], fresh: u16) -> Option<Vec<u16>> {
+    if window.len() < 2 {
+        return None;
+    }
+    let step = wrap_step(i32::from(window[1]) - i32::from(window[0]));
+    if step == 0 {
+        return None;
+    }
+    let base = window[0].wrapping_sub(step as u16);
+    let shift = fresh.wrapping_sub(base);
+    Some(window.iter().map(|p| p.wrapping_add(shift)).collect())
 }
 
 #[cfg(test)]
@@ -154,5 +178,36 @@ mod tests {
     fn with_step_rejects_empty_sequences_and_zero_steps() {
         assert!(PortPredictor::with_step(&[], 2).is_none());
         assert!(PortPredictor::with_step(&[5000, 5002], 0).is_none());
+    }
+
+    #[test]
+    fn rebased_window_continues_from_the_fresh_port() {
+        // The window walks +2 from a base of 5010; a fresh base of 6000
+        // moves every port by the distance between the two bases.
+        let window = [5012, 5014, 5016, 5018];
+        assert_eq!(rebased_window(&window, 6000).expect("stride reads"), vec![
+            6002, 6004, 6006, 6008
+        ]);
+        // A negative stride rebases the same way.
+        let window = [5010, 5008, 5006];
+        assert_eq!(rebased_window(&window, 6000).expect("stride reads"), vec![
+            5998, 5996, 5994
+        ]);
+    }
+
+    #[test]
+    fn rebased_window_wraps_through_the_port_boundary() {
+        let window = [65530, 65532];
+        // The fresh base wraps past the top of the port range.
+        assert_eq!(rebased_window(&window, 2).expect("stride reads"), vec![
+            4, 6
+        ]);
+    }
+
+    #[test]
+    fn rebased_window_rejects_windows_without_a_stride() {
+        assert!(rebased_window(&[5000], 6000).is_none());
+        assert!(rebased_window(&[], 6000).is_none());
+        assert!(rebased_window(&[5000, 5000], 6000).is_none());
     }
 }

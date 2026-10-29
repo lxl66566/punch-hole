@@ -35,11 +35,15 @@ The candidate ports follow the peer's effective class:
 - A confident easy symmetric peer gets the ports its observed sequence continues to. The window covers the peer's socket count plus a margin of sixteen for unrelated allocations behind the same NAT, and it walks at the classifier's step.
 - A hard symmetric peer gets a distinct random stream over its observed port span. The stream length solves the one-directional model for `target_success`, capped by a share of the packet budget and by the conntrack bound.
 
+The allocations that land between the peer's Probe and its punch sockets move its whole sequence, often past that margin. A symmetric peer with a confident stride therefore re-queries STUN on its punch socket at engine start and announces the observed port; the cone side reads that port as the sequence's current position and moves its fitted window onto it, keeping the window's stride and length.
+
 Once traffic from the peer arrives, the spray throttles to one packet per sweep so handshake replies keep the send rate.
 
 ## PredictiveExchange
 
 Both sides are easy symmetric. Each side fits the peer's sequence, then sends into a window of predicted ports with `predictive_sockets`, eight by default. The window covers both socket counts with a fourfold margin, capped at 512 ports. Both windows start from the same fitted base, which guarantees overlap while the steps hold.
+
+Both sides also announce their current allocation position the same way SymProbe's symmetric side does, and each side moves its fitted window onto the peer's announced position, so the windows overlap on the sequences as they stand at engine start instead of where Probe left them.
 
 ## BirthdayBurst
 

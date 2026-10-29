@@ -142,7 +142,7 @@ pub struct Offer {
 
 **Accept** confirms the plan. The Responder starts counting `start_delay_ms` from the moment it sends `Accept`, and both sides anchor their clocks on that shared event.
 
-**PortUpdate** names the fresh external port of the sender's punch socket, one slot per family. The reflexive address from Probe belongs to the closed probe socket, so fixed-port stages wait for this frame. A public or IPv6 sender reads its own local address, and a cone-mapped sender re-queries STUN on the punch socket itself. The frame re-sends on the signaling retry cadence until the sender's handshake completes.
+**PortUpdate** names the fresh external port of the sender's punch socket, one slot per family. The reflexive address from Probe belongs to the closed probe socket, so fixed-port stages wait for this frame. A public or IPv6 sender reads its own local address, and a cone-mapped sender re-queries STUN on the punch socket itself. A symmetric sender with a confident stride has no single port its peer can aim at, so its V4 slot carries a different reading: the port marks the sender's current allocation position, which a prediction-bearing peer moves its fitted window onto. Both readings key on the negotiated strategy, so the frame keeps one shape. The frame re-sends on the signaling retry cadence until the sender's handshake completes.
 
 **Confirmed** announces that the sender finished the data-plane handshake and names its winning socket index. It stops the peer's pulse phase early and ends the sender-side grace responder.
 

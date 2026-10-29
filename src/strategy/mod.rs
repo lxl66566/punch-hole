@@ -8,7 +8,7 @@ mod sym_cone;
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
@@ -440,6 +440,14 @@ pub(crate) struct ExecPlan {
     pub announce_v6: bool,
     /// Resolved STUN server for a `Refresh::Stun` plan.
     pub refresh_server: Option<SocketAddr>,
+    /// The V4 matrix stage continues the peer's allocation sequence, so a
+    /// peer-announced allocation position re-bases its targets.
+    pub predicts_peer: bool,
+    /// The announced V4 port marks this side's current allocation position
+    /// for the peer's prediction instead of being the port the peer aims
+    /// at. A refresh that fails here degrades the prediction to its
+    /// probe-time base instead of failing the session.
+    pub sequence_marker: bool,
     /// The peer's IPv4 address behind its NAT, from its Hello.
     pub peer_ip: Ipv4Addr,
     /// The peer's global IPv6 addresses, from its Hello.
@@ -507,21 +515,43 @@ pub(crate) fn build_plan(
     // The announced ports are per family, so a plan that runs both a V6
     // Direct stage and a V4 matrix stage publishes both socket-0 ports. A
     // public address knows its own socket address, a v6 address needs no
-    // NAT cooperation, and a cone mapping needs a STUN query. Symmetric
-    // strategies have nothing stable to announce.
+    // NAT cooperation, and a cone mapping needs a STUN query. A
+    // symmetric side with a confident stride has no port the peer can aim
+    // at, but its current allocation position lets the peer's prediction
+    // track the drift the two phases between probe and punch leave behind,
+    // so it announces that position instead.
     let announce_v6 = stages
         .iter()
         .any(|s| s.family == Family::V6 && !s.reply_only);
+    let my_class = effective_class(mine);
+    let peer_class = effective_class(peer);
+    let my_sym = is_symmetric(my_class);
     let refresh_v4 = match sel.strategy {
         StrategyId::ConeExchange => {
-            if effective_class(mine) == NatClass::Public {
+            if my_class == NatClass::Public {
                 Refresh::Local
             } else {
                 Refresh::Stun
             }
         },
-        StrategyId::SymProbe if !is_symmetric(effective_class(mine)) => Refresh::Stun,
+        StrategyId::SymProbe if !my_sym => Refresh::Stun,
+        StrategyId::SymProbe | StrategyId::PredictiveExchange
+            if my_sym && matches!(my_class, NatClass::EasySym { .. }) =>
+        {
+            Refresh::Stun
+        },
         _ => Refresh::None,
+    };
+    // The announce of a symmetric side marks its sequence position, while
+    // every other announce names the port the peer aims at.
+    let sequence_marker = refresh_v4 == Refresh::Stun && my_sym;
+    // Prediction stages carry a fitted window over the peer's sequence:
+    // PredictiveExchange always, and the SymProbe cone side against an
+    // easy symmetric peer.
+    let predicts_peer = match sel.strategy {
+        StrategyId::PredictiveExchange => true,
+        StrategyId::SymProbe => !my_sym && matches!(peer_class, NatClass::EasySym { .. }),
+        _ => false,
     };
 
     ExecPlan {
@@ -529,6 +559,8 @@ pub(crate) fn build_plan(
         refresh_v4,
         announce_v6,
         refresh_server,
+        predicts_peer,
+        sequence_marker,
         peer_ip: peer
             .reflexive_v4()
             .map_or(Ipv4Addr::UNSPECIFIED, |a| *a.ip()),
@@ -616,6 +648,9 @@ pub(crate) struct Engine<S: UdpIo> {
     /// Sweep targets for the active stage, cached with the key they were
     /// built for: the stage index and the fresh peer port that shaped them.
     target_cache: Option<(usize, Option<u16>, Arc<Vec<SocketAddr>>)>,
+    /// Stage index and announce port the prediction targets were re-based
+    /// on, so a retransmitted announce rebuilds nothing.
+    rebased_for: Option<(usize, u16)>,
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -658,6 +693,7 @@ impl<S: UdpIo> Engine<S> {
             syn_replies: HashMap::new(),
             stale_packets: 0,
             target_cache: None,
+            rebased_for: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -777,11 +813,17 @@ impl<S: UdpIo> Engine<S> {
         self.start = Some(start);
         self.punch_deadline = (start + self.cfg.punch_timeout).min(self.overall);
         // A STUN refresh that never started has no server or no bound
-        // socket, so the V4 port can never be announced.
+        // socket, so the V4 port can never be announced. A sequence
+        // marker only sharpens the peer's prediction base, so its plan
+        // downgrades to the probe-time base instead of failing.
         if self.plan.refresh_v4 == Refresh::Stun && self.stun.is_none() {
-            return Err(PunchError::Io(std::io::Error::other(
-                "stun refresh has no server or bound socket",
-            )));
+            if self.plan.sequence_marker {
+                self.plan.refresh_v4 = Refresh::None;
+            } else {
+                return Err(PunchError::Io(std::io::Error::other(
+                    "stun refresh has no server or bound socket",
+                )));
+            }
         }
         let mut ticker = tokio::time::interval_at(start + self.cfg.tick, self.cfg.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1188,6 +1230,48 @@ impl<S: UdpIo> Engine<S> {
         Some(targets)
     }
 
+    /// Re-bases the active stage's prediction targets on the peer's
+    /// announced allocation position.
+    ///
+    /// The announce leaves the peer's NAT at its engine start, so its port
+    /// supersedes the probe-time base every fitted target still carries:
+    /// the allocations that landed between Probe and Punch moved the whole
+    /// sequence. The translated window keeps its length and stride, so the
+    /// sweep rotation keeps its schedule and only the ports move. Stages
+    /// without a fitted window, and announces from a peer nothing predicts,
+    /// change nothing.
+    fn apply_peer_base(&mut self) {
+        if !self.plan.predicts_peer {
+            return;
+        }
+        let Some(port) = self.fresh_peer.and_then(|p| p.v4) else {
+            return;
+        };
+        if self.rebased_for == Some((self.stage_idx, port)) {
+            return;
+        }
+        self.rebased_for = Some((self.stage_idx, port));
+        let stage = &self.plan.stages[self.stage_idx];
+        if stage.family != Family::V4 || stage.reply_only || stage.needs_peer_ports {
+            return;
+        }
+        let ports: Vec<u16> = stage.targets.iter().map(SocketAddr::port).collect();
+        let Some(rebased) = crate::nat::predict::rebased_window(&ports, port) else {
+            return;
+        };
+        let targets = rebased
+            .into_iter()
+            .zip(&stage.targets)
+            .map(|(port, target)| match target {
+                SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
+                SocketAddr::V6(_) => *target,
+            })
+            .collect();
+        // The cached list carries the static stage's `None` key, so
+        // `live_targets` serves it until the stage or the port changes.
+        self.target_cache = Some((self.stage_idx, None, Arc::new(targets)));
+    }
+
     async fn on_tick(&mut self, pool: &SocketPool<S>) -> Result<(), PunchError> {
         let now = tokio::time::Instant::now();
         if now >= self.stage_end(self.stage_idx) && self.stage_idx + 1 < self.plan.stages.len() {
@@ -1203,8 +1287,10 @@ impl<S: UdpIo> Engine<S> {
         {
             // Without the announced port the peer has nothing to aim at.
             // With handshake traffic already flowing, the grace path
-            // decides instead of the refresh.
-            if self.first_handshake.is_none() {
+            // decides instead of the refresh. A sequence marker that never
+            // crossed only leaves the peer's prediction on its probe-time
+            // base, so the plan continues.
+            if self.first_handshake.is_none() && !self.plan.sequence_marker {
                 return Err(PunchError::Io(std::io::Error::other(
                     "stun refresh retries exhausted",
                 )));
@@ -1235,6 +1321,7 @@ impl<S: UdpIo> Engine<S> {
 
         // Syn pulses. The handle is taken before the stage borrow, so the
         // sends below can work on `&mut self` without fighting it.
+        self.apply_peer_base();
         let targets = self.live_targets();
         let stage = &self.plan.stages[self.stage_idx];
         if !stage.reply_only
@@ -1510,6 +1597,8 @@ mod tests {
             refresh_v4: Refresh::Stun,
             announce_v6: true,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: vec![peer_v6],
         };
@@ -1574,6 +1663,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: Ipv4Addr::UNSPECIFIED,
             peer_v6: Vec::new(),
         };
@@ -1609,6 +1700,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: vec![
                 v6("2001:db8::1".parse().expect("global address")),
@@ -1668,6 +1761,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -1697,6 +1792,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -1763,6 +1860,125 @@ mod tests {
         assert_eq!(plan.refresh_v4, Refresh::Stun);
     }
 
+    /// A symmetric side with a confident stride announces its allocation
+    /// position as a sequence marker, and the side predicting that sequence
+    /// re-bases on it; a cone announce stays the port the peer aims at, and
+    /// a hard symmetric side announces nothing.
+    #[test]
+    fn prediction_plans_announce_and_rebase() {
+        use crate::report::Role;
+        let cfg = PunchConfig::default();
+        let easy = sample_info(NatClass::EasySym { step: 2 }, &[5000, 5002, 5004, 5006]);
+        let cone = sample_info(NatClass::Cone, &[6000, 6000]);
+        let hard = sample_info(NatClass::HardSym, &[5000, 5400, 5800, 6200]);
+
+        // EasySym against cone: the cone announces the port the peer aims
+        // at and predicts the easy peer's sequence; the easy side announces
+        // its position as a marker.
+        let sel = select(&easy, &cone, &cfg).expect("sym cone selects");
+        let easy_plan = build_plan(&easy, &cone, &sel, 16, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(easy_plan.refresh_v4, Refresh::Stun);
+        assert!(easy_plan.sequence_marker);
+        assert!(!easy_plan.predicts_peer);
+        let cone_plan = build_plan(&cone, &easy, &sel, 1, [0; 16], Role::Responder, None, &cfg);
+        assert_eq!(cone_plan.refresh_v4, Refresh::Stun);
+        assert!(!cone_plan.sequence_marker);
+        assert!(cone_plan.predicts_peer);
+
+        // EasySym against EasySym: both sides mark their sequence and
+        // predict the peer's.
+        let sel = select(&easy, &easy, &cfg).expect("easy pair selects");
+        let plan = build_plan(&easy, &easy, &sel, 8, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(plan.refresh_v4, Refresh::Stun);
+        assert!(plan.sequence_marker);
+        assert!(plan.predicts_peer);
+
+        // HardSym against cone: the hard side has no stride to mark, so it
+        // announces nothing.
+        let sel = select(&hard, &cone, &cfg).expect("hard cone selects");
+        let hard_plan = build_plan(&hard, &cone, &sel, 16, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(hard_plan.refresh_v4, Refresh::None);
+        assert!(!hard_plan.sequence_marker);
+        let cone_plan = build_plan(&cone, &hard, &sel, 1, [0; 16], Role::Responder, None, &cfg);
+        assert_eq!(cone_plan.refresh_v4, Refresh::Stun);
+        assert!(!cone_plan.predicts_peer, "a hard peer carries no window");
+    }
+
+    /// A peer announce translates the fitted window onto the announced
+    /// position without touching its length or order; a plan that predicts
+    /// nothing, and an announce that repeats, rebuild nothing.
+    #[test]
+    fn peer_announce_rebases_the_prediction_window() {
+        let cfg = PunchConfig::default();
+        let at = |port: u16| SocketAddr::from(([203, 0, 113, 9], port));
+        let window: Vec<SocketAddr> = (0..4).map(|i| at(5012 + i * 2)).collect();
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                window,
+                false,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            predicts_peer: true,
+            sequence_marker: false,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<tokio::net::UdpSocket> =
+            Engine::new(plan, cfg.clone(), [0; 16], tokio::time::Instant::now());
+        engine.stage_idx = 0;
+
+        // Without an announce the fitted window stands.
+        let fitted = engine.live_targets().expect("fitted window resolves");
+        assert_eq!(fitted[0], at(5012));
+
+        // The announce moves the window onto the fresh position; the
+        // stride and the order stay.
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(6000),
+                v6: None,
+            })
+            .expect("update applies");
+        engine.apply_peer_base();
+        let rebased = engine.live_targets().expect("rebased window resolves");
+        let ports: Vec<u16> = rebased.iter().map(SocketAddr::port).collect();
+        assert_eq!(ports, vec![6002, 6004, 6006, 6008]);
+        assert_eq!(rebased.len(), fitted.len());
+
+        // A retransmitted announce rebuilds nothing; a fresher port moves
+        // the window again.
+        engine.apply_peer_base();
+        let again = engine.live_targets().expect("cached window resolves");
+        assert!(Arc::ptr_eq(&rebased, &again));
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(6010),
+                v6: None,
+            })
+            .expect("update applies");
+        engine.apply_peer_base();
+        let moved = engine.live_targets().expect("moved window resolves");
+        let ports: Vec<u16> = moved.iter().map(SocketAddr::port).collect();
+        assert_eq!(ports, vec![6012, 6014, 6016, 6018]);
+
+        // A plan that predicts nothing never re-bases.
+        engine.plan.predicts_peer = false;
+        engine
+            .on_signaling(&Frame::PortUpdate {
+                v4: Some(7000),
+                v6: None,
+            })
+            .expect("update applies");
+        engine.apply_peer_base();
+        let untouched = engine.live_targets().expect("window resolves");
+        assert!(Arc::ptr_eq(&moved, &untouched));
+    }
+
     #[test]
     fn stray_packets_after_confirm_keep_the_winning_address() {
         use std::net::{Ipv4Addr, SocketAddrV4};
@@ -1781,6 +1997,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -1840,6 +2058,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -1888,6 +2108,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -1971,6 +2193,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2043,6 +2267,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2127,6 +2353,8 @@ mod tests {
             refresh_v4: Refresh::Stun,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2195,6 +2423,8 @@ mod tests {
             refresh_v4: Refresh::Stun,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2251,6 +2481,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2340,6 +2572,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
@@ -2429,6 +2663,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip,
             peer_v6: Vec::new(),
         };
@@ -2469,6 +2705,8 @@ mod tests {
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
+            predicts_peer: false,
+            sequence_marker: false,
             peer_ip: peer,
             peer_v6: Vec::new(),
         };

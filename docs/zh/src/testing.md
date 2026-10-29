@@ -31,6 +31,8 @@ let host = net.host(&sim::NatSpec::cone_apdf());  // 挂在 NAT 后面
 
 路由暴露观测钩子供断言使用：转发与丢弃计数、活跃映射表、峰值映射数，以及一个有界的等映射清空函数。设置 `SIM_TRACE` 环境变量会打印每个转发包，定位故障很快。
 
+主机附带故障注入，覆盖干净网络走不到的路径：`drop_first_send_to` 与 `fail_sends_to` 破坏上行，`external_allocations` 像同一运营商 NAT 背后的无关流量一样把序列往前推，`rebind_sequence_after` 在会话中途把端口行走跳到新基点。
+
 确定性来自两件事。所有随机数走同一个以测试名为种子的 `StdRng`，所有测试跑在 `#[tokio::test(start_paused = true)]` 下，一整场会话在墙钟的毫秒内结束。
 
 ## 回环 NAT 实验室

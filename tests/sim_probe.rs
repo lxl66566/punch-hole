@@ -388,3 +388,179 @@ async fn probe_phase_ends_at_its_deadline() {
     // time makes the deadline exact.
     assert_eq!(t.elapsed(), std::time::Duration::from_millis(600));
 }
+
+/// Wires the pair so every frame crosses, and walks `drift` hosts'
+/// allocation sequences forward once the Offer leaves, which lands the
+/// drift in the gap between Probe and the punch allocations.
+async fn drift_pair(
+    a: punch_hole::sim::Host,
+    cfg: punch_hole::PunchConfig,
+    b: punch_hole::sim::Host,
+    drift: Vec<punch_hole::sim::Host>,
+    allocations: usize,
+) -> (
+    Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>,
+    Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>,
+) {
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed = Arc::clone(&fired);
+    punch_hole::sim::connect_with(ha, hb, move |frame| {
+        if !armed.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(
+                decode_sig(frame).map(|f| f.body),
+                Ok(punch_hole::msg::Frame::Offer(_))
+            )
+        {
+            armed.store(true, std::sync::atomic::Ordering::Relaxed);
+            for host in &drift {
+                let host = host.clone();
+                tokio::spawn(async move {
+                    host.external_allocations(allocations).await;
+                });
+            }
+        }
+        Some(frame.to_vec())
+    });
+    let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
+    let b = tokio::spawn(common::run_responder(b, cfg, lb));
+    (
+        a.await.expect("initiator task panicked"),
+        b.await.expect("responder task panicked"),
+    )
+}
+
+/// External allocations on the symmetric peer's NAT during the Negotiate
+/// gap shift its sequence far past the spray's slack. The peer's announced
+/// allocation position re-bases the cone's prediction, so the pair still
+/// punches.
+#[tokio::test(start_paused = true)]
+async fn external_drift_rebases_the_sym_probe_spray() {
+    let net = Net::seeded("external_drift_rebase");
+    let stun = net.stun_server();
+    let cone = net.host(NatSpec::cone_apdf());
+    let sym = net.host(NatSpec::sequential(1));
+    let (ra, rb) = drift_pair(cone, config(&stun), sym.clone(), vec![sym], 600).await;
+    let pa = ra.expect("rebased spray punches");
+    let pb = rb.expect("peer side punches");
+    assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// The same drift with the peer's announce dropped: the cone's prediction
+/// stays on the probe-time base, the spray misses the peer's live
+/// mappings, and the port-filtered cone drops every peer pulse, so the
+/// attempt never completes.
+#[tokio::test(start_paused = true)]
+async fn external_drift_without_the_announce_misses() {
+    let net = Net::seeded("external_drift_no_announce");
+    let stun = net.stun_server();
+    let cone = net.host(NatSpec::cone_apdf());
+    let sym = net.host(NatSpec::sequential(1));
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    // The initiator side passes everything, so the responder learns the
+    // port to aim at; the responder side drops its own PortUpdate, so the
+    // initiator never sees the fresh allocation position.
+    let mut a_out = ha.to_peer;
+    let b_in = hb.from_peer;
+    let mut b_out = hb.to_peer;
+    let a_in = ha.from_peer;
+    let drift = sym.clone();
+    let mut fired = false;
+    tokio::spawn(async move {
+        while let Some(frame) = a_out.recv().await {
+            if !fired
+                && matches!(
+                    decode_sig(&frame).map(|f| f.body),
+                    Ok(punch_hole::msg::Frame::Offer(_))
+                )
+            {
+                fired = true;
+                drift.external_allocations(600).await;
+            }
+            let _ = b_in.send(frame).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(frame) = b_out.recv().await {
+            let passthrough = !matches!(
+                decode_sig(&frame).map(|f| f.body),
+                Ok(punch_hole::msg::Frame::PortUpdate { .. })
+            );
+            if passthrough {
+                let _ = a_in.send(frame).await;
+            }
+        }
+    });
+    let a = tokio::spawn(common::run_initiator(cone, config(&stun), la));
+    let b = tokio::spawn(common::run_responder(sym, config(&stun), lb));
+    let ra = a.await.expect("initiator task panicked");
+    let rb = b.await.expect("responder task panicked");
+    assert!(ra.is_err(), "a stale window never connects: {ra:?}");
+    assert!(rb.is_err(), "the peer side cannot confirm: {rb:?}");
+}
+
+/// Both sides' sequences drift during Negotiate; the announced positions
+/// keep both prediction windows anchored, so PredictiveExchange punches.
+#[tokio::test(start_paused = true)]
+async fn predictive_exchange_punches_under_external_drift() {
+    let net = Net::seeded("predictive_drift");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(1));
+    let b = net.host(NatSpec::sequential(1));
+    let (ra, rb) = drift_pair(a.clone(), config(&stun), b.clone(), vec![a, b], 600).await;
+    let pa = ra.expect("drifted easy pair punches");
+    let _ = rb.expect("peer side punches");
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
+}
+
+/// A rebind that lands mid-probe splits the observed sequence, so the
+/// stride fit fails and the class degrades to HardSym. The pair never
+/// carries a confidently wrong step into the punch.
+#[tokio::test(start_paused = true)]
+async fn mid_probe_rebind_degrades_to_hard_sym() {
+    let net = Net::seeded("mid_probe_rebind");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(2));
+    a.rebind_sequence_after(3);
+    let b = net.host(NatSpec::sequential(2));
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    let hellos: Arc<Mutex<Vec<NatInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&hellos);
+    punch_hole::sim::connect_with(ha, hb, move |frame| {
+        if let Ok(sig) = decode_sig(frame)
+            && let punch_hole::msg::Frame::Hello(info) = sig.body
+        {
+            sink.lock().expect("hello tap lock").push(info);
+        }
+        Some(frame.to_vec())
+    });
+    let a = tokio::spawn(common::run_initiator(a, config(&stun), la));
+    let b = tokio::spawn(common::run_responder(b, config(&stun), lb));
+    // The pair may punch or fail on its degraded estimate; the pinned
+    // behavior is the classification, which the Hello already carries.
+    let _ = a.await;
+    let _ = b.await;
+    let hellos = hellos.lock().expect("hello tap lock").clone();
+    let rebind_side = hellos
+        .iter()
+        .find(|info| {
+            info.v4.as_ref().is_some_and(|v4| {
+                v4.alloc_seq
+                    .windows(2)
+                    .any(|w| (i32::from(w[1]) - i32::from(w[0])).abs() > 100)
+            })
+        })
+        .expect("the rebind side reported")
+        .v4
+        .as_ref()
+        .expect("v4 evidence");
+    assert_eq!(
+        rebind_side.class,
+        NatClass::HardSym,
+        "a split sequence never carries a fitted stride"
+    );
+}

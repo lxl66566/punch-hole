@@ -31,6 +31,8 @@ A `NatSpec` combines a mapping policy and a filtering class. The mapping policie
 
 The router exposes observation hooks for assertions: forwarded and dropped counters, the live mapping table, the peak mapping count, and a bounded wait until every mapping drains. Setting the `SIM_TRACE` environment variable prints every forwarded packet, which narrows failures fast.
 
+Hosts carry fault injection for the paths a clean net never walks: `drop_first_send_to` and `fail_sends_to` break the uplink, `external_allocations` walks a NAT's sequence forward like unrelated traffic behind the same carrier NAT, and `rebind_sequence_after` jumps the port walk to a fresh base mid-session.
+
 Determinism comes from two pieces. All randomness flows through one `StdRng` seeded from the test name, and all tests run under `#[tokio::test(start_paused = true)]`, so a full session completes in milliseconds of wall time.
 
 ## The loopback NAT lab

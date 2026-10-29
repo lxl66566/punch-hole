@@ -127,6 +127,9 @@ struct NatShared {
     sym: StdMutex<HashMap<(u16, SocketAddr), MappingEntry>>,
     next_alloc: AtomicU32,
     peak: AtomicU32,
+    /// Allocation count at which the port walk jumps to a fresh base,
+    /// armed by a test and spent once.
+    rebind: StdMutex<Option<u32>>,
 }
 
 impl NatShared {
@@ -139,6 +142,7 @@ impl NatShared {
             sym: StdMutex::new(HashMap::new()),
             next_alloc: AtomicU32::new(0),
             peak: AtomicU32::new(0),
+            rebind: StdMutex::new(None),
         }
     }
 
@@ -199,6 +203,25 @@ impl NatShared {
         self.peak.fetch_max(current as u32, Ordering::Relaxed);
     }
 
+    /// Applies the armed rebind once the allocation count passes its
+    /// arming point: the walk jumps forward and the fault disarms, so the
+    /// sequence continues from a fresh base like a router rebind.
+    fn apply_rebind(&self, n: i64, rng: &StdMutex<StdRng>) -> i64 {
+        let mut fault = self.rebind.lock().expect("rebind fault lock");
+        match *fault {
+            Some(at) if n >= i64::from(at) => {
+                // The jump stays clear of the range width so the walk
+                // lands on a visibly fresh base instead of wrapping back
+                // onto the ports it just left.
+                let jump = i64::from(rng.lock().expect("rng lock").random_range(3_000..4_000u32));
+                self.next_alloc.fetch_add(jump as u32, Ordering::Relaxed);
+                *fault = None;
+                n + jump
+            },
+            _ => n,
+        }
+    }
+
     fn alloc_port(&self, rng: &StdMutex<StdRng>, used: &[u16]) -> u16 {
         let start = self.spec.port_range.start;
         let end = self.spec.port_range.end;
@@ -212,6 +235,7 @@ impl NatShared {
             },
             Mapping::Sequential { step } | Mapping::AddressSequential { step } => {
                 let n = i64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
+                let n = self.apply_rebind(n, rng);
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },
@@ -586,6 +610,42 @@ impl Host {
             .expect("uplink fault lock")
             .unreachable
             .insert(target);
+    }
+
+    /// Walks this host's NAT allocation sequence forward by `count`
+    /// mappings, like other users of the same carrier NAT allocating
+    /// between the phases of a session.
+    ///
+    /// The scratch socket closes at once, so only the sequence position
+    /// moves; no mapping survives. One distinct destination per count
+    /// keeps every allocation distinct for a per-destination NAT.
+    pub async fn external_allocations(&self, count: usize) {
+        let Ok(sock) = self
+            .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+        else {
+            return;
+        };
+        for i in 0..count {
+            // Documentation-range addresses the router forwards to nobody,
+            // varying the IP so an address-dependent NAT allocates per
+            // destination too.
+            let dst = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(198, 51, 100, (i % 254 + 1) as u8),
+                9000 + (i / 254) as u16,
+            ));
+            let _ = sock.send_to(b"x", dst).await;
+        }
+        drop(sock);
+    }
+
+    /// Jumps this host's NAT allocation sequence to a fresh base once
+    /// `allocations` mappings exist, like a router rebind that restarts
+    /// the port walk. Applies to the stepped symmetric walks only.
+    pub fn rebind_sequence_after(&self, allocations: u32) {
+        if let Some(nat) = &self.nat {
+            *nat.rebind.lock().expect("rebind fault lock") = Some(allocations);
+        }
     }
 }
 
