@@ -30,6 +30,21 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     tokio::net::UdpSocket::from_std(sock.into())
 }
 
+/// Clears the punch-time reuse options from a bound Unix socket.
+///
+/// The options speed up rebinds while the pool cycles through attempts, but
+/// a delivered winner that still carries them lets any same-euid process
+/// rebind its port and siphon its datagrams. Linux and the BSDs read the
+/// flags of the sockets already on a port when a new bind is attempted, so
+/// clearing them after bind still blocks every later grab.
+#[cfg(unix)]
+pub(crate) fn clear_reuse(sock: &tokio::net::UdpSocket) -> io::Result<()> {
+    let sock = socket2::SockRef::from(sock);
+    sock.set_reuse_address(false)?;
+    sock.set_reuse_port(false)?;
+    Ok(())
+}
+
 /// Marks the socket with `SO_EXCLUSIVEADDRUSE`.
 ///
 /// Without it, another local process can claim the bound port through its
@@ -115,6 +130,53 @@ mod tests {
         assert!(
             grabber.bind(&overlap.into()).is_err(),
             "a SO_REUSEADDR bind must not overlap an exclusive port"
+        );
+    }
+
+    /// The delivered winner must reject reuse grabs: after `clear_reuse`,
+    /// neither a `SO_REUSEADDR` overlap bind nor a `SO_REUSEPORT` duplicate
+    /// of the wildcard bind can claim the port. Linux and the BSDs demand
+    /// the reuse options on the sockets already holding the port too, so an
+    /// ordinary second socket in the same process is a faithful grabber.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleared_winner_rejects_reuse_grabs() {
+        let bound = bind(SocketAddr::from(([0, 0, 0, 0], 0))).expect("punch socket binds");
+        clear_reuse(&bound).expect("reuse options clear on a bound socket");
+        let port = bound
+            .local_addr()
+            .expect("bound socket reports its address")
+            .port();
+
+        // A SO_REUSEADDR bind overlapping the wildcard, the same shape the
+        // Windows hardening rejects.
+        let overlap = SocketAddr::from(([127, 0, 0, 1], port));
+        let grabber = socket2::Socket::new(
+            socket2::Domain::for_address(overlap),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("grabber socket creates");
+        grabber.set_reuse_address(true).expect("reuse option sets");
+        assert!(
+            grabber.bind(&overlap.into()).is_err(),
+            "a SO_REUSEADDR bind must not overlap the delivered port"
+        );
+
+        // A SO_REUSEPORT duplicate of the exact wildcard bind, the shape
+        // that shares datagrams between same-euid processes on Linux.
+        let twin = socket2::Socket::new(
+            socket2::Domain::for_address(SocketAddr::from(([0, 0, 0, 0], port))),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("twin socket creates");
+        twin.set_reuse_address(true).expect("reuse option sets");
+        twin.set_reuse_port(true).expect("reuseport option sets");
+        assert!(
+            twin.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())
+                .is_err(),
+            "a SO_REUSEPORT bind must not share the delivered port"
         );
     }
 }

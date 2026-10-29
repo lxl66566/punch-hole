@@ -40,8 +40,8 @@ Every socket belongs to the pool. The winner election cancels the receive tasks,
 
 `socket/sys.rs` centralizes the differences.
 
-- Linux and macOS bind assistant sockets with `SO_REUSEADDR` and `SO_REUSEPORT`, which speeds up rebinds between attempts.
+- Linux and macOS bind assistant sockets with `SO_REUSEADDR` and `SO_REUSEPORT`, which speeds up rebinds between attempts. Handover clears both options on the elected winner: bind conflict checks read the flags of the sockets already on a port, so after the clear no same-euid process can rebind the delivered port and siphon its datagrams. A process that grabbed the port before the clear keeps its share until it exits.
 - Windows binds exclusive sockets with `SO_EXCLUSIVEADDRUSE`, because its `SO_REUSEADDR` lets two sockets claim one port with undefined delivery. Assistant sockets rely on distinct ephemeral ports. The option guards the delivered business socket against the classic local port hijack.
-- The winner socket is kept as-is and never rebound, so port reuse only matters for fast retry cycles.
+- The winner socket is never rebound; the reuse options matter only while the pool still cycles through attempts.
 
 A connected UDP socket reports the address the OS would route through. The prober uses that trick to tell a public host from a translated one.

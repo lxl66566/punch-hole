@@ -36,6 +36,12 @@ pub trait UdpIo: Send + Sync + Sized + 'static {
         buf: &mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send;
     fn local_addr(&self) -> io::Result<SocketAddr>;
+    /// Prepares the winner for handover to the host; the pool calls this
+    /// on the elected socket before returning it. Sockets that carry no
+    /// punch-time options need nothing, hence the default.
+    fn into_delivered(self) -> io::Result<Self> {
+        Ok(self)
+    }
 }
 
 /// Address family a pool group binds on.
@@ -85,6 +91,14 @@ impl UdpIo for tokio::net::UdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         tokio::net::UdpSocket::local_addr(self)
+    }
+
+    fn into_delivered(self) -> io::Result<Self> {
+        // Windows binds exclusive sockets up front; Unix strips the
+        // punch-time reuse options at handover.
+        #[cfg(unix)]
+        sys::clear_reuse(&self)?;
+        Ok(self)
     }
 }
 
@@ -358,8 +372,10 @@ impl<S: UdpIo> SocketPool<S> {
         self.sent.load(Ordering::Relaxed)
     }
 
-    /// Elects the winner: stops every task, closes the losers, and hands out
-    /// the winner as an owned socket.
+    /// Elects the winner: stops every task, closes the losers, strips the
+    /// punch-time socket options, and hands out the winner as an owned
+    /// socket. Both failure paths return only after the tasks are joined
+    /// and the pool's sockets are dropped, so nothing outlives the session.
     pub(crate) async fn elect(mut self, family: Family, winner: u16) -> Result<S, PunchError> {
         self.cancel.cancel();
         for task in self.tasks.drain(..) {
@@ -374,11 +390,12 @@ impl<S: UdpIo> SocketPool<S> {
         }
         let sock = group.swap_remove(winner as usize);
         self.groups = [Vec::new(), Vec::new()];
-        Arc::try_unwrap(sock).map_err(|_| {
+        let sock = Arc::try_unwrap(sock).map_err(|_| {
             PunchError::Io(io::Error::other(
                 "winner socket still shared after election",
             ))
-        })
+        })?;
+        sock.into_delivered().map_err(PunchError::from)
     }
 
     /// Stops every task and closes every socket on a failed session.
