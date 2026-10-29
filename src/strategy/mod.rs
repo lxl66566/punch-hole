@@ -849,9 +849,16 @@ impl<S: UdpIo> Engine<S> {
     /// With no handshake traffic yet there is nothing to keep alive, so the
     /// session fails fast. Afterwards a working path exists and the grace
     /// mechanism decides the outcome, so the failure only stops new pulses.
+    /// A full conntrack table skips its destination for this round only:
+    /// replies to the sources already tracked keep the live path, and later
+    /// rounds retry, so a session with one working path does not drag to
+    /// its deadline.
     fn send_failed(&mut self, err: PunchError) -> Option<PunchError> {
         if self.first_handshake.is_none() {
             return Some(err);
+        }
+        if matches!(err, PunchError::ConntrackExhausted) {
+            return None;
         }
         self.send_stalled = true;
         None
@@ -1576,6 +1583,153 @@ mod tests {
 
         engine.on_tick(&pool).await.expect("stall, not an error");
         assert!(engine.send_stalled, "sends stalled after the failure");
+    }
+
+    /// A SynAck reply that hits the conntrack bound skips only that
+    /// destination: the sources already tracked keep their live path, and
+    /// the engine never stalls on a bound the session can still work
+    /// inside.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn conntrack_full_reply_skips_without_stalling() {
+        use crate::socket::{RecvEvent, SocketPool};
+
+        let cfg = PunchConfig {
+            max_mappings: 1,
+            ..PunchConfig::default()
+        };
+        let plan = ExecPlan {
+            stages: vec![StageSpec::reply(Family::V4, cfg.punch_timeout)],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = crate::sim::Net::seeded("conntrack_reply_skip");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let syn = encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 4,
+        });
+        let event = |from: SocketAddr| {
+            let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+            buf[..syn.len()].copy_from_slice(&syn);
+            RecvEvent {
+                family: Family::V4,
+                socket: 0,
+                from,
+                len: syn.len(),
+                buf,
+            }
+        };
+        let a = SocketAddr::from(([203, 0, 113, 9], 50_001));
+        let b = SocketAddr::from(([203, 0, 113, 9], 50_002));
+
+        // Source A claims the only mapping slot with its reply.
+        engine
+            .on_data(&pool, event(a))
+            .await
+            .expect("first syn answers");
+        assert_eq!(pool.sent(), 1);
+
+        // Source B overflows the bound; its reply is skipped, nothing
+        // stalls.
+        engine
+            .on_data(&pool, event(b))
+            .await
+            .expect("second syn skips the full bound");
+        assert!(!engine.send_stalled, "conntrack exhaustion is no stall");
+        assert_eq!(pool.sent(), 1);
+
+        // The tracked source keeps its live path once the window passes.
+        tokio::time::advance(cfg.confirm_retry).await;
+        engine
+            .on_data(&pool, event(a))
+            .await
+            .expect("tracked source answers again");
+        assert_eq!(pool.sent(), 2);
+    }
+
+    /// A sweep target that hits the conntrack bound is skipped for the
+    /// round; later rounds keep pulsing the destinations already covered.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn conntrack_full_sweep_skips_new_targets_without_stalling() {
+        use std::net::Ipv4Addr;
+
+        use crate::socket::SocketPool;
+
+        let addr = |port: u16| SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), port));
+        let cfg = PunchConfig {
+            max_mappings: 1,
+            ..PunchConfig::default()
+        };
+        let plan = ExecPlan {
+            stages: vec![StageSpec::send(
+                Family::V4,
+                1,
+                vec![addr(40000), addr(40001)],
+                false,
+                cfg.punch_timeout,
+            )],
+            refresh_v4: Refresh::None,
+            announce_v6: false,
+            refresh_server: None,
+            peer_ip: [203, 0, 113, 9].into(),
+            peer_v6: Vec::new(),
+        };
+        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = crate::sim::Net::seeded("conntrack_sweep_skip");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+        engine.syn_bufs[0] = vec![encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 0,
+        })];
+        // A handshake ran against the peer, so the session is past the
+        // fail-fast point, and its retransmission timer stays out of the
+        // way of the pulse accounting.
+        let now = tokio::time::Instant::now();
+        engine.observe_peer(3, addr(50_001), now, Family::V4, 0);
+        engine.candidate = Some((Family::V4, 0));
+        engine.start = Some(now);
+        engine.next_reply = now + cfg.punch_timeout;
+
+        // The first target takes the only mapping slot.
+        engine.on_tick(&pool).await.expect("first tick pulses");
+        assert_eq!(pool.sent(), 1);
+
+        // The second target overflows the bound and is skipped; the sweep
+        // still advances and nothing stalls.
+        engine.on_tick(&pool).await.expect("second tick skips");
+        assert!(!engine.send_stalled, "conntrack exhaustion is no stall");
+        assert_eq!(pool.sent(), 1);
+
+        // The rotation reaches the covered target again and pulses it.
+        engine
+            .on_tick(&pool)
+            .await
+            .expect("third tick pulses again");
+        assert!(!engine.send_stalled);
+        assert_eq!(pool.sent(), 2);
     }
 
     /// A binding response for the pending refresh only counts when it lands
