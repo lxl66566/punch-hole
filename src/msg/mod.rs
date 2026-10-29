@@ -57,7 +57,8 @@ pub enum AbortReason {
 /// One signaling frame with its timestamp envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SigFrame {
-    /// Milliseconds on the sender's own monotonic clock.
+    /// Milliseconds on the sender's own monotonic clock, counted from one
+    /// so an echo can always name a real frame.
     pub ts: u64,
     /// The ts field of the frame being answered, 0 when the frame answers none.
     pub echo: u64,

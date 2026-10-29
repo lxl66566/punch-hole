@@ -98,7 +98,7 @@ pub struct V6Nat {
 
 ```rust
 pub struct SigFrame {
-    /// 发送方自己单调时钟上的毫秒数。
+    /// 发送方自己单调时钟上的毫秒数，从 1 起算，保证 echo 总能指到真实帧。
     pub ts: u64,
     /// 被应答帧的 ts 字段，没有应答对象时为 0。
     pub echo: u64,

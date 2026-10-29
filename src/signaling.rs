@@ -74,7 +74,10 @@ impl SigIo {
     /// timestamp as its echo, and returns the encoded bytes for later raw
     /// resends.
     pub(crate) async fn send(&mut self, body: Frame) -> Result<Bytes, PunchError> {
-        let ts = self.now_ms();
+        // Timestamps count from one, so the zero echo slot stays reserved
+        // for "no echo" and a frame sent in the first millisecond still
+        // measures its RTT.
+        let ts = self.now_ms() + 1;
         let raw = Bytes::from(encode_sig(&SigFrame {
             ts,
             echo: self.last_peer_ts,
@@ -134,5 +137,38 @@ impl SigIo {
     /// the first loop closes.
     pub(crate) fn rtt(&self) -> Duration {
         self.rtt.unwrap_or(Duration::from_millis(200))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_frame_timestamp_measures_rtt() {
+        let (mut host, lib) = bridge(8);
+        let mut sig = SigIo::new(lib);
+        sig.send(Frame::Accept).await.expect("send");
+        let bytes = host.to_peer.recv().await.expect("frame");
+        let frame = decode_sig(&bytes).expect("decodes");
+        // Timestamps count from one, so the zero echo slot stays reserved.
+        assert!(frame.ts >= 1, "ts was {}", frame.ts);
+        // The peer echoes the timestamp; a first-millisecond frame still
+        // closes an RTT measurement instead of falling back to the default.
+        host.from_peer
+            .send(Bytes::from(encode_sig(&SigFrame {
+                ts: 1,
+                echo: frame.ts,
+                body: Frame::Accept,
+            })))
+            .await
+            .expect("echo send");
+        let back = sig.recv().await.expect("recv");
+        assert_eq!(back.echo, frame.ts);
+        assert!(
+            sig.rtt() < Duration::from_millis(200),
+            "rtt stayed at the default"
+        );
+        drop(host);
     }
 }
