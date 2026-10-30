@@ -182,6 +182,10 @@ pub(crate) struct SocketPool<S: UdpIo> {
     dests: RwLock<HashSet<SocketAddr>>,
     max_mappings: usize,
     sent: AtomicU32,
+    /// The most recent bind failure, reported when no socket ever bound so
+    /// the session names the real cause (for example descriptor exhaustion)
+    /// instead of a generic stopped-stream error.
+    last_bind_error: Option<io::Error>,
 }
 
 impl<S: UdpIo> SocketPool<S> {
@@ -209,17 +213,29 @@ impl<S: UdpIo> SocketPool<S> {
             dests: RwLock::new(HashSet::new()),
             max_mappings: cfg.max_mappings,
             sent: AtomicU32::new(0),
+            last_bind_error: None,
         };
         for (family, count) in [(Family::V4, v4), (Family::V6, v6)] {
             for _ in 0..count {
                 // A family that cannot bind on this host stays empty.
-                let Ok(sock) = factory.bind(family.any_addr()).await else {
-                    continue;
-                };
-                pool.push_socket(sock, family, &tx);
+                match factory.bind(family.any_addr()).await {
+                    Ok(sock) => pool.push_socket(sock, family, &tx),
+                    Err(e) => pool.last_bind_error = Some(e),
+                }
             }
         }
         Ok((pool, rx))
+    }
+
+    /// Live sockets across both families.
+    pub(crate) fn live_sockets(&self) -> usize {
+        self.groups.iter().map(Vec::len).sum()
+    }
+
+    /// The most recent bind failure, kept for diagnosis when no socket
+    /// ever bound.
+    pub(crate) fn last_bind_error(&self) -> Option<&io::Error> {
+        self.last_bind_error.as_ref()
     }
 
     fn push_socket(&mut self, sock: S, family: Family, tx: &mpsc::Sender<RecvEvent>) {
@@ -309,6 +325,10 @@ impl<S: UdpIo> SocketPool<S> {
                 if sockets == 0 || sockets * (dests.len() + 1) > self.max_mappings {
                     return Err(PunchError::ConntrackExhausted);
                 }
+                // The destination joins the table before the limiter wait
+                // below, so a send that fails or never drains has still
+                // spent its conntrack slot: the footprint is counted, never
+                // undercounted, which is the intended conservative bias.
                 dests.insert(target);
             }
         }
@@ -574,6 +594,34 @@ mod tests {
             ));
         }
         assert_eq!(pool.sent(), 0);
+        pool.shutdown().await;
+    }
+
+    /// Every failed bind must stay diagnosable: the pool keeps the last
+    /// bind error so a session with no live socket names the real cause
+    /// instead of a generic stopped-stream error.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn all_failed_binds_keep_their_cause() {
+        struct Failing;
+        impl UdpFactory for Failing {
+            type Socket = crate::sim::SimSocket;
+
+            async fn bind(&self, _addr: SocketAddr) -> io::Result<Self::Socket> {
+                Err(io::Error::other("simulated descriptor exhaustion"))
+            }
+        }
+
+        let cfg = PunchConfig::default();
+        let (pool, _rx) = SocketPool::bind(&Failing, &cfg, 2, 1)
+            .await
+            .expect("pool still constructs");
+        assert_eq!(pool.live_sockets(), 0);
+        let err = pool.last_bind_error().expect("bind failure recorded");
+        assert!(
+            err.to_string().contains("simulated descriptor exhaustion"),
+            "recorded cause carries the bind error, got {err}"
+        );
         pool.shutdown().await;
     }
 

@@ -1130,10 +1130,15 @@ impl<S: UdpIo> Engine<S> {
             tokio::select! {
                 ev = events.recv() => {
                     let Some(ev) = ev else {
-                        return Err(PunchError::Io {
-                            phase: Phase::Punch,
-                            source: std::io::Error::other("pool receive tasks stopped"),
-                        });
+                        // A pool whose every bind failed carries the real
+                        // cause; any other stop keeps the generic reason.
+                        let source = match (pool.live_sockets(), pool.last_bind_error()) {
+                            (0, Some(e)) => std::io::Error::other(format!(
+                                "pool receive tasks stopped: every bind failed: {e}"
+                            )),
+                            _ => std::io::Error::other("pool receive tasks stopped"),
+                        };
+                        return Err(PunchError::Io { phase: Phase::Punch, source });
                     };
                     self.on_data(pool, ev).await?;
                 }

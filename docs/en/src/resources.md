@@ -34,7 +34,7 @@ The default footprint of each strategy stays small on purpose:
 
 ## Cleanup
 
-Every socket belongs to the pool. The winner election cancels the receive tasks, joins them, closes the losers, and hands out the winner as an owned socket. A failed session shuts the whole pool down. A host that drops a session future hits the pool's `Drop`, which cancels the tasks best effort. The observation hooks of the simulator and the NAT lab assert the result directly: after handover, exactly one mapping per side survives.
+Every socket belongs to the pool. The winner election cancels the receive tasks, joins them, closes the losers, and hands out the winner as an owned socket. A failed session shuts the whole pool down. A host that drops a session future hits the pool's `Drop`, which cancels the tasks best effort; letting the session future run to completion remains the reliable cleanup path. A session whose every bind failed reports the recorded bind error rather than a generic stopped-stream message. The observation hooks of the simulator and the NAT lab assert the result directly: after handover, exactly one mapping per side survives.
 
 ## Platform sockets
 
