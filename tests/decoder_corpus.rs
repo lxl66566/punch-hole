@@ -9,8 +9,9 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 
 use punch_hole::{
     msg::{
-        DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_SIG_FRAME, MAX_V6_ADDRS,
-        Offer, SigFrame, StrategyId, VERSION, decode_packet, decode_sig, encode_packet, encode_sig,
+        AbortReason, DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_SIG_FRAME,
+        MAX_V6_ADDRS, Offer, SigFrame, StrategyId, VERSION, decode_packet, decode_sig,
+        encode_packet, encode_sig,
     },
     nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat},
 };
@@ -133,16 +134,74 @@ fn decoders_survive_random_and_edge_inputs() {
         nonce: [0xcd; 16],
         socket: 1023,
     });
+    // Anchors for the remaining variants, so every parse path gets its own
+    // mutation sweep: the short enum-only bodies (Accept, Abort), the
+    // Option fields of PortUpdate, and the remaining data-plane ordinals.
+    let accept = encode_sig(&SigFrame {
+        ts: 3,
+        echo: 2,
+        body: Frame::Accept,
+    });
+    let port_update = encode_sig(&SigFrame {
+        ts: 4,
+        echo: 0,
+        body: Frame::PortUpdate {
+            v4: Some(5001),
+            v6: Some(5301),
+        },
+    });
+    let confirmed = encode_sig(&SigFrame {
+        ts: 5,
+        echo: 0,
+        body: Frame::Confirmed { socket: 4095 },
+    });
+    let abort = encode_sig(&SigFrame {
+        ts: 6,
+        echo: 0,
+        body: Frame::Abort(AbortReason::BudgetExhausted),
+    });
+    let synack = encode_packet(&DataPacket::SynAck {
+        nonce: [0x66; 16],
+        socket: 2047,
+    });
+    let ack = encode_packet(&DataPacket::Ack { nonce: [0x55; 16] });
+    let keepalive = encode_packet(&DataPacket::Keepalive { nonce: [0x44; 16] });
     // The anchors round-trip before mutation, so failures point at the
     // mutation and not at the corpus itself.
     assert!(decode_sig(&hello).is_ok());
     assert!(decode_sig(&offer).is_ok());
     assert!(decode_sig(&predictive).is_ok());
+    assert!(decode_sig(&accept).is_ok());
+    assert!(decode_sig(&port_update).is_ok());
+    assert!(decode_sig(&confirmed).is_ok());
+    assert!(decode_sig(&abort).is_ok());
     assert_eq!(decode_packet(&syn).unwrap(), DataPacket::Syn {
         nonce: [0xcd; 16],
         socket: 1023
     });
-    for valid in [&hello, &offer, &predictive, &syn] {
+    assert_eq!(decode_packet(&synack).unwrap(), DataPacket::SynAck {
+        nonce: [0x66; 16],
+        socket: 2047
+    });
+    assert_eq!(decode_packet(&ack).unwrap(), DataPacket::Ack {
+        nonce: [0x55; 16]
+    });
+    assert_eq!(decode_packet(&keepalive).unwrap(), DataPacket::Keepalive {
+        nonce: [0x44; 16]
+    });
+    for valid in [
+        &hello,
+        &offer,
+        &predictive,
+        &syn,
+        &accept,
+        &port_update,
+        &confirmed,
+        &abort,
+        &synack,
+        &ack,
+        &keepalive,
+    ] {
         cases.extend(mutations(valid));
     }
 
