@@ -17,10 +17,12 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt,
+    future::Future,
     hash::{Hash, Hasher},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::Range,
+    pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU32, Ordering},
@@ -205,6 +207,9 @@ struct LabInner {
     mapping_expiry: StdMutex<Duration>,
     /// Idle time after which an unused mapping is evicted.
     idle_expiry: StdMutex<Duration>,
+    /// The upstream lab this NAT rides, when nested: the lab whose client
+    /// sockets carry the mappings' external side.
+    uplink: Option<NatLab>,
 }
 
 /// The mapping set of one lab, always behind one lock.
@@ -229,12 +234,15 @@ impl MappingTable {
     }
 }
 
-/// One live NAT mapping: its public socket and bookkeeping.
+/// One live NAT mapping: its external socket and bookkeeping.
 struct LabMapping {
     client: SocketAddr,
     /// Kept beside the socket so snapshots need no syscall.
     ext_port: u16,
-    ext: Arc<UdpSocket>,
+    /// The mapping's external side: a public socket bound on the lab's own
+    /// address, or — behind an upstream lab — an uplink client socket of
+    /// that upstream.
+    ext: Box<dyn ExtSock>,
     /// Destinations this mapping sent to, which inbound filtering checks.
     dests: Arc<StdMutex<HashSet<SocketAddr>>>,
     /// Fires when the mapping goes away; the task then drops the socket.
@@ -244,6 +252,53 @@ struct LabMapping {
     cancel: CancellationToken,
     /// Last crossing in either direction, which the idle reaper reads.
     last_seen: StdMutex<Instant>,
+}
+
+/// Object-safe send/receive view of one mapping's external socket.
+///
+/// [`UdpIo`]'s methods return `impl Future`, which no trait object can
+/// carry, so the mapping side erases the socket behind boxed futures on
+/// this trait. The trait is implemented only for the [`ExtAny`] wrapper —
+/// implementing it for the sockets themselves would put a second
+/// `send_to` into every socket's method resolution beside [`UdpIo`]'s. A
+/// test crate: the allocation lands on the forwarding path by design.
+trait ExtSock: Send + Sync {
+    fn send_to<'a>(&'a self, buf: &'a [u8], dst: SocketAddr) -> ExtFut<'a, usize>;
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> ExtFut<'a, (usize, SocketAddr)>;
+}
+
+/// The boxed future one erased external call returns.
+type ExtFut<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
+
+/// Wraps any [`UdpIo`] socket for the erased [`ExtSock`] view.
+struct ExtAny<S>(S);
+
+impl<S: UdpIo> ExtSock for ExtAny<S> {
+    fn send_to<'a>(&'a self, buf: &'a [u8], dst: SocketAddr) -> ExtFut<'a, usize> {
+        Box::pin(UdpIo::send_to(&self.0, buf, dst))
+    }
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> ExtFut<'a, (usize, SocketAddr)> {
+        Box::pin(UdpIo::recv_from(&self.0, buf))
+    }
+}
+
+/// A raw public socket viewed through [`UdpIo`].
+struct PublicSock(UdpSocket);
+
+impl UdpIo for PublicSock {
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, &target).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
 }
 
 impl NatLab {
@@ -260,35 +315,45 @@ impl NatLab {
                 return Err(e);
             },
         };
-        let inner = Arc::new(LabInner {
-            spec,
-            public_ip,
-            window,
-            gateway: Arc::new(gateway),
-            table: StdMutex::new(MappingTable {
-                map: HashMap::new(),
-                next_alloc: 0,
-                peak: 0,
-            }),
-            rng: StdMutex::new(seeded_rng(seed)),
-            cancel: CancellationToken::new(),
-            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
-            tap: StdMutex::new(None),
-            rebind: StdMutex::new(None),
-            forwarded: AtomicU32::new(0),
-            dropped_by_filter: AtomicU32::new(0),
-            dropped_by_hairpin: AtomicU32::new(0),
-            dropped_by_loss: AtomicU32::new(0),
-            idled: AtomicU32::new(0),
-            loss_permille: AtomicU32::new(0),
-            mapping_expiry: StdMutex::new(Duration::ZERO),
-            idle_expiry: StdMutex::new(Duration::ZERO),
-        });
-        tokio::spawn(gateway_loop(Arc::clone(&inner)));
-        // One reaper per lab, alive from the spawn: enabling the idle
-        // timer needs no extra synchronization.
-        tokio::spawn(idle_reaper(Arc::clone(&inner)));
-        Ok(Self { inner })
+        Ok(Self {
+            inner: start_lab(seed, spec, public_ip, window, Arc::new(gateway), None),
+        })
+    }
+
+    /// Creates one NAT device that itself rides `uplink` upstream,
+    /// building the NAT-behind-NAT shape a CGNAT gives every home router.
+    ///
+    /// No dedicated address is drawn and no port window is scanned: the
+    /// inner NAT's public side is a set of uplink client sockets of the
+    /// upstream lab, one per inner external port, so the upstream
+    /// allocates the externally visible address under its own policy. The
+    /// inner NAT's own public address is a display label only — probes
+    /// learn the true external address through STUN across the chain — and
+    /// its port window is the requested range unverified, because there is
+    /// no address to scan. The inner spec still governs the datagrams that
+    /// cross it, with its allocation policy picking the uplink client
+    /// ports wherever the OS and the upstream have them free. Releasing an
+    /// inner mapping closes its uplink socket, whose Bye releases the
+    /// upstream mapping in turn.
+    pub async fn spawn_behind(uplink: &NatLab, seed: &str, spec: NatSpec) -> io::Result<Self> {
+        let gateway = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await?;
+        // No scan backs the window in nested mode; the allocation walks
+        // the requested range and the OS decides per bind.
+        let window = spec.port_range.clone();
+        Ok(Self {
+            inner: start_lab(
+                seed,
+                spec,
+                // The label reads as unspecified because no local address
+                // belongs to a nested NAT.
+                Ipv4Addr::UNSPECIFIED,
+                window,
+                Arc::new(gateway),
+                Some(NatLab {
+                    inner: Arc::clone(&uplink.inner),
+                }),
+            ),
+        })
     }
 
     /// A cloneable factory that binds client sockets behind this NAT.
@@ -300,6 +365,10 @@ impl NatLab {
     }
 
     /// The public address every mapping of this lab sends from.
+    ///
+    /// A lab spawned behind an upstream has no address of its own: the
+    /// externally visible address is whatever the upstream allocates, and
+    /// this one reads `0.0.0.0` as a label.
     #[must_use]
     pub fn public_ip(&self) -> Ipv4Addr {
         self.inner.public_ip
@@ -309,7 +378,9 @@ impl NatLab {
     ///
     /// Discovery moves the window past ports the OS excludes and verifies
     /// at most [`MAX_WINDOW_PORTS`] of them, so tests read port positions
-    /// relative to this range.
+    /// relative to this range. A lab spawned behind an upstream scanned
+    /// nothing — the window is the requested range, and the OS decides
+    /// per bind.
     #[must_use]
     pub fn port_window(&self) -> Range<u16> {
         self.inner.window.clone()
@@ -428,7 +499,9 @@ impl Drop for NatLab {
         // children, so their receive loops wind down with them.
         self.inner.cancel.cancel();
         // Releasing the table drops the table-side references, so the
-        // public sockets close once the receive loops exit.
+        // public sockets close once the receive loops exit; a nested
+        // lab's closing uplink sockets Bye the upstream, releasing its
+        // mappings in turn.
         self.inner
             .table
             .lock()
@@ -436,9 +509,53 @@ impl Drop for NatLab {
             .map
             .clear();
         // The drawn address returns to the registry, so a long-lived
-        // process can spawn another lab on it.
-        release_lab_ip(self.inner.public_ip);
+        // process can spawn another lab on it. A nested lab drew none.
+        if self.inner.uplink.is_none() {
+            release_lab_ip(self.inner.public_ip);
+        }
     }
+}
+
+/// Assembles one lab's shared state and starts its gateway and reaper
+/// loops, for a flat spawn or a nested one.
+fn start_lab(
+    seed: &str,
+    spec: NatSpec,
+    public_ip: Ipv4Addr,
+    window: Range<u16>,
+    gateway: Arc<UdpSocket>,
+    uplink: Option<NatLab>,
+) -> Arc<LabInner> {
+    let inner = Arc::new(LabInner {
+        spec,
+        public_ip,
+        window,
+        gateway,
+        table: StdMutex::new(MappingTable {
+            map: HashMap::new(),
+            next_alloc: 0,
+            peak: 0,
+        }),
+        rng: StdMutex::new(seeded_rng(seed)),
+        cancel: CancellationToken::new(),
+        faults: Arc::new(StdMutex::new(UplinkFaults::default())),
+        tap: StdMutex::new(None),
+        rebind: StdMutex::new(None),
+        forwarded: AtomicU32::new(0),
+        dropped_by_filter: AtomicU32::new(0),
+        dropped_by_hairpin: AtomicU32::new(0),
+        dropped_by_loss: AtomicU32::new(0),
+        idled: AtomicU32::new(0),
+        loss_permille: AtomicU32::new(0),
+        mapping_expiry: StdMutex::new(Duration::ZERO),
+        idle_expiry: StdMutex::new(Duration::ZERO),
+        uplink,
+    });
+    tokio::spawn(gateway_loop(Arc::clone(&inner)));
+    // One reaper per lab, alive from the spawn: enabling the idle
+    // timer needs no extra synchronization.
+    tokio::spawn(idle_reaper(Arc::clone(&inner)));
+    inner
 }
 
 /// Draws one lab address together with its bindable port window.
@@ -610,24 +727,25 @@ fn add_dest(mapping: &LabMapping, dst: SocketAddr) {
     mapping.dests.lock().expect("dests lock").insert(dst);
 }
 
-/// Binds the public socket of one fresh mapping under the port policy.
+/// Binds the external socket of one fresh mapping under the port policy.
 fn allocate_mapping(
     inner: &Arc<LabInner>,
     table: &mut MappingTable,
     client: SocketAddr,
 ) -> io::Result<Arc<LabMapping>> {
-    // Preserve claims the client's internal port exactly when it is free;
+    // Preserve claims the client's internal port exactly when it binds;
     // the walk below takes over only on collision.
     if let Allocation::Preserve = inner.spec.allocation
-        && let Ok(sock) = bind_public(inner.public_ip, client.port())
+        && let Ok((ext, ext_port)) = bind_ext(inner, client.port())
     {
-        return Ok(build_mapping(inner, client, sock));
+        return Ok(build_mapping(inner, client, ext, ext_port));
     }
     let start = inner.window.start;
     let end = inner.window.end;
     let len = u64::from(end - start);
     // Candidates are tried until one binds, which covers a port stolen
-    // after the window discovery.
+    // after the window discovery, or held by another uplink socket in
+    // nested mode.
     let mut budget = len as usize + 8;
     loop {
         if budget == 0 {
@@ -673,20 +791,41 @@ fn allocate_mapping(
                 start + (n % len) as u16
             },
         };
-        let Ok(sock) = bind_public(inner.public_ip, port) else {
+        let Ok((ext, ext_port)) = bind_ext(inner, port) else {
             continue;
         };
-        return Ok(build_mapping(inner, client, sock));
+        return Ok(build_mapping(inner, client, ext, ext_port));
     }
 }
 
-/// Wraps one bound public socket into a live mapping and starts its
+/// Binds one external socket at `port`: a public socket on the lab's own
+/// address for a flat NAT, or an uplink client socket of the upstream lab
+/// for a nested one.
+fn bind_ext(inner: &Arc<LabInner>, port: u16) -> io::Result<(Box<dyn ExtSock>, u16)> {
+    match &inner.uplink {
+        None => {
+            let sock = bind_public(inner.public_ip, port)?;
+            let ext_port = sock
+                .local_addr()
+                .expect("bound socket reports its address")
+                .port();
+            Ok((Box::new(ExtAny(PublicSock(sock))), ext_port))
+        },
+        Some(uplink) => {
+            let sock = bind_uplink(uplink, port)?;
+            Ok((Box::new(ExtAny(sock)), port))
+        },
+    }
+}
+
+/// Wraps one bound external socket into a live mapping and starts its
 /// receive loop.
-fn build_mapping(inner: &Arc<LabInner>, client: SocketAddr, sock: UdpSocket) -> Arc<LabMapping> {
-    let ext_port = sock
-        .local_addr()
-        .expect("bound socket reports its address")
-        .port();
+fn build_mapping(
+    inner: &Arc<LabInner>,
+    client: SocketAddr,
+    ext: Box<dyn ExtSock>,
+    ext_port: u16,
+) -> Arc<LabMapping> {
     trace(format_args!(
         "LAB alloc client={client} ext={}",
         SocketAddr::V4(SocketAddrV4::new(inner.public_ip, ext_port))
@@ -694,7 +833,7 @@ fn build_mapping(inner: &Arc<LabInner>, client: SocketAddr, sock: UdpSocket) -> 
     let mapping = Arc::new(LabMapping {
         client,
         ext_port,
-        ext: Arc::new(sock),
+        ext,
         dests: Arc::new(StdMutex::new(HashSet::new())),
         last_seen: StdMutex::new(Instant::now()),
         // A child of the lab token, so the lab's drop releases every
@@ -1067,16 +1206,33 @@ impl UdpFactory for LabHost {
         // The private network behind the lab is loopback; any requested
         // IPv4 address maps onto it and the requested port survives.
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, addr.port())).await?;
-        let gateway = self.inner.gateway.local_addr()?;
-        let frame = || vec![0u8; FRAME_HEADER + MAX_DATAGRAM];
-        Ok(LabSocket {
-            sock,
-            gateway,
-            faults: Arc::clone(&self.inner.faults),
-            send_wire: tokio::sync::Mutex::new(frame()),
-            recv_wire: tokio::sync::Mutex::new(frame()),
-        })
+        lab_socket(&self.inner, sock)
     }
+}
+
+/// Wraps one bound client socket into a lab socket framed for `inner`'s
+/// gateway.
+fn lab_socket(inner: &Arc<LabInner>, sock: UdpSocket) -> io::Result<LabSocket> {
+    let gateway = inner.gateway.local_addr()?;
+    let frame = || vec![0u8; FRAME_HEADER + MAX_DATAGRAM];
+    Ok(LabSocket {
+        sock,
+        gateway,
+        faults: Arc::clone(&inner.faults),
+        send_wire: tokio::sync::Mutex::new(frame()),
+        recv_wire: tokio::sync::Mutex::new(frame()),
+    })
+}
+
+/// Binds one uplink client socket of the upstream lab at an explicit
+/// port, as a nested lab's external side.
+///
+/// The OS keeps the port honest: a port the upstream host already holds
+/// fails the bind, which moves the nested allocation on.
+fn bind_uplink(uplink: &NatLab, port: u16) -> io::Result<LabSocket> {
+    let sock = std::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))?;
+    sock.set_nonblocking(true)?;
+    lab_socket(&uplink.inner, UdpSocket::from_std(sock)?)
 }
 
 /// One client socket behind a lab NAT: a real loopback socket that frames
@@ -2096,6 +2252,135 @@ mod tests {
         }
 
         // A socket outliving the lab drops without a panic.
+        drop(client);
+    }
+
+    /// A nested lab's mapping rides an uplink client socket of the
+    /// upstream lab: the outer mapping appears with the inner one, and
+    /// releasing the inner one releases the outer through the closing
+    /// uplink socket's Bye.
+    #[tokio::test]
+    async fn nested_mapping_release_travels_upstream() {
+        let outer = NatLab::spawn(
+            "nested_release_outer",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("outer spawns");
+        let inner = NatLab::spawn_behind(
+            &outer,
+            "nested_release_inner",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("inner spawns");
+        assert_eq!(inner.public_ip(), Ipv4Addr::UNSPECIFIED, "display label");
+        let d = dest().await;
+        {
+            let client = inner
+                .host()
+                .bind(Family::V4.any_addr())
+                .await
+                .expect("client binds");
+            client
+                .send_to(b"x", d.local_addr().expect("dest addr"))
+                .await
+                .expect("send");
+            wait_mappings(&inner, 1).await;
+            wait_mappings(&outer, 1).await;
+            assert_eq!(
+                outer.mapping_count(),
+                1,
+                "the outer holds the uplink mapping"
+            );
+        }
+        // The client's Bye releases the inner mapping; the closing uplink
+        // socket's Bye releases the outer one.
+        inner.wait_mappings_drained().await;
+        outer.wait_mappings_drained().await;
+        assert_eq!(outer.mapping_count(), 0, "the release traveled upstream");
+    }
+
+    /// Nested labs drop cleanly in either order: inner first sends the
+    /// upstream the Byes, outer first leaves the inner's Byes nowhere to
+    /// land.
+    #[tokio::test]
+    async fn nested_labs_drop_in_either_order() {
+        let d = dest().await;
+        // Inner before outer.
+        let outer = NatLab::spawn(
+            "drop_order_outer",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("outer spawns");
+        let inner = NatLab::spawn_behind(
+            &outer,
+            "drop_order_inner",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("inner spawns");
+        let client = inner
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        client
+            .send_to(b"x", d.local_addr().expect("dest addr"))
+            .await
+            .expect("send");
+        wait_mappings(&outer, 1).await;
+        drop(inner);
+        outer.wait_mappings_drained().await;
+        assert_eq!(outer.mapping_count(), 0);
+        drop(client);
+        drop(outer);
+
+        // Outer before inner.
+        let outer = NatLab::spawn(
+            "drop_order_outer_2",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("outer spawns");
+        let inner = NatLab::spawn_behind(
+            &outer,
+            "drop_order_inner_2",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("inner spawns");
+        let client = inner
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        client
+            .send_to(b"x", d.local_addr().expect("dest addr"))
+            .await
+            .expect("send");
+        wait_mappings(&inner, 1).await;
+        drop(outer);
+        drop(inner);
         drop(client);
     }
 }

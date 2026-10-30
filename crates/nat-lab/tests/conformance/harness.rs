@@ -38,6 +38,12 @@ pub trait Engine {
     /// Binds one public-side socket on an IP no destination uses.
     async fn foreign_socket(&self) -> io::Result<Self::Public>;
 
+    /// Spawns a second engine whose NAT rides this engine's NAT upstream,
+    /// building the NAT-behind-NAT chain. The returned engine shares the
+    /// public side: its sockets, counters, and STUN responders all sit on
+    /// the true public network.
+    async fn spawn_nested(&self, seed: &'static str, spec: NatSpec) -> Self;
+
     /// The addresses of the engine's STUN responders.
     async fn stun_addrs(&self) -> Vec<SocketAddr>;
 
@@ -213,6 +219,18 @@ impl Engine for SimEng {
         self.net.public_host().bind(Family::V4.any_addr()).await
     }
 
+    async fn spawn_nested(&self, _seed: &'static str, spec: NatSpec) -> Self {
+        // The seed only names the lab's generator; the simulator shares
+        // this network's already-seeded one.
+        SimEng {
+            net: self.net.clone(),
+            nat_host: self.net.host_behind(&self.nat_host, spec.clone()),
+            public_host: self.public_host.clone(),
+            spec,
+            stun: OnceLock::new(),
+        }
+    }
+
     async fn stun_addrs(&self) -> Vec<SocketAddr> {
         parse_addrs(&self.stun().addrs)
     }
@@ -326,6 +344,15 @@ impl Engine for LabEng {
     async fn foreign_socket(&self) -> io::Result<Plain> {
         // 127.0.0.2 sits in the loopback space no lab or responder draws.
         plain_at(Ipv4Addr::new(127, 0, 0, 2)).await
+    }
+
+    async fn spawn_nested(&self, seed: &'static str, spec: NatSpec) -> Self {
+        Self {
+            lab: NatLab::spawn_behind(&self.lab, seed, spec)
+                .await
+                .expect("nested lab spawns"),
+            stun: OnceLock::new(),
+        }
     }
 
     async fn stun_addrs(&self) -> Vec<SocketAddr> {

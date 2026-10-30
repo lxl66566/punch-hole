@@ -18,8 +18,12 @@
 //! datagram a client sends to its own NAT's external address loops back to
 //! the sibling behind the same NAT as if from outside (RFC 4787 §6), or —
 //! with hairpinning off — drops with a counter, like the broken no-loopback
-//! NATs a puncher must survive. A suite that asserts mapping, allocation,
-//! filtering, and hairpinning behavior can parameterize over the engine and
+//! NATs a puncher must survive. Both engines also stack one NAT behind an
+//! upstream one ([`Net::host_behind`], [`NatLab::spawn_behind`]) — the
+//! shape a CGNAT gives every home router — where the upstream allocates
+//! the externally visible address and the inner NAT's public address is a
+//! display label. A suite that asserts mapping, allocation, filtering,
+//! hairpinning, and stacking behavior can parameterize over the engine and
 //! keep one set of expectations.
 //!
 //! # Example

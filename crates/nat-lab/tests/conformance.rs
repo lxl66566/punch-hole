@@ -603,6 +603,16 @@ conformance!(
     hairpin_disabled_drops_the_loop
 );
 
+conformance!(
+    sim_cgnat_sibling_loopback_crosses_the_chain,
+    lab_cgnat_sibling_loopback_crosses_the_chain,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::AddressDependent
+    ),
+    cgnat_sibling_loopback_crosses_the_chain
+);
+
 /// Endpoint-independent mapping with random allocation: one unpredictable
 /// port per socket, shared by every destination. The old single-axis API
 /// could not express the pair — its random shape forced a fresh mapping
@@ -908,7 +918,9 @@ async fn hairpin_loops_a_client_back_to_its_sibling(e: impl Engine) {
 
     // A sends to B's learned external. B's mapping already sent to A's
     // external through the filtered attempt, so the loop passes and B
-    // reads A's external address as the source.
+    // reads A's external address as the source. The explicit hairpin path
+    // delivers once: the private-destination emission cannot re-cross the
+    // NAT scan.
     a.send_to(b"hello", ext_b).await.expect("a sends");
     let (payload, from) = recv_from(&b).await;
     assert_eq!(payload, b"hello");
@@ -916,6 +928,7 @@ async fn hairpin_loops_a_client_back_to_its_sibling(e: impl Engine) {
         from, ext_a,
         "the looped datagram carries A's external address"
     );
+    assert_silent(&b, NON_DELIVERY).await;
 }
 
 /// With hairpinning disabled, a datagram sent to the sibling's external
@@ -949,6 +962,81 @@ async fn hairpin_disabled_drops_the_loop(e: impl Engine) {
             .any(|(local, _)| *local == a.local_addr().expect("a addr")),
         "the sender's mapping survives the disabled loop"
     );
+}
+
+/// Sends one binding request through `client`'s NAT chain and returns the
+/// XOR-MAPPED address the responder reports: the true external address,
+/// whatever the chain of NATs assigned.
+async fn stun_external<E: Engine, S: UdpIo>(e: &E, client: &S) -> SocketAddr {
+    let primary = e.stun_addrs().await.remove(0);
+    let tid = [0x3a; 12];
+    client
+        .send_to(&binding_request(tid), primary)
+        .await
+        .expect("binding request sends");
+    let (reply, _) = recv_from(client).await;
+    xor_mapped(&reply, &tid).expect("reply decodes")
+}
+
+/// The CGNAT shape: the engine under test is the outer carrier NAT, and
+/// two inner cone NATs ride it through [`Engine::spawn_nested`]. Each
+/// client learns its true external address through its own chain via
+/// STUN; A's datagram to B's learned address hairpins at the outer,
+/// crosses both inner NATs, and reaches B carrying A's learned external
+/// address as the source. The outer's filter applies to the loop: B's
+/// early datagram toward A is dropped because A has not yet sent to B's
+/// external, and once A has, the reply passes both directions.
+async fn cgnat_sibling_loopback_crosses_the_chain(e: impl Engine) {
+    let inner = spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent,
+    );
+    let ea = e.spawn_nested("cgnat_sibling_a", inner.clone()).await;
+    let eb = e.spawn_nested("cgnat_sibling_b", inner).await;
+    let a = ea.client().await.expect("a binds");
+    let b = eb.client().await.expect("b binds");
+
+    let ext_a = stun_external(&ea, &a).await;
+    let ext_b = stun_external(&eb, &b).await;
+    assert_ne!(ext_a, ext_b, "the outer NAT separates the two chains");
+
+    // B's early datagram toward A's external is filtered at the outer:
+    // A's uplink mapping has not sent to B's external yet.
+    b.send_to(b"early", ext_a).await.expect("b sends");
+    assert_silent(&a, NON_DELIVERY).await;
+    e.wait_filter_drops(1).await;
+    if let Some(drops) = e.filter_drops() {
+        assert_eq!(drops, 1, "the outer filter drops the premature loop");
+    }
+
+    // A's datagram to B's learned address crosses both NATs and arrives
+    // with A's learned external as the source, exactly once: the looped
+    // delivery is injected as a private-destination datagram, so no NAT
+    // scan re-translates or duplicates it.
+    a.send_to(b"hello", ext_b).await.expect("a sends");
+    let (payload, from) = recv_from(&b).await;
+    assert_eq!(payload, b"hello");
+    assert_eq!(from, ext_a, "the loop carries A's learned external address");
+    assert_silent(&b, NON_DELIVERY).await;
+
+    // The reverse direction now passes: each uplink mapping has sent to
+    // the sibling's external through the earlier crossings.
+    b.send_to(b"reply", ext_a).await.expect("b sends");
+    let (payload, from) = recv_from(&a).await;
+    assert_eq!(payload, b"reply");
+    assert_eq!(
+        from, ext_b,
+        "the reply carries B's learned external address"
+    );
+
+    // The chains release together: closing the inner clients walks the
+    // Byes up through both layers.
+    drop(a);
+    drop(b);
+    ea.wait_drained().await;
+    eb.wait_drained().await;
+    e.wait_drained().await;
+    assert_eq!(e.mapping_count(), 0, "every layer drained");
 }
 
 /// The simulator keeps a closed socket's mapping in the table for the

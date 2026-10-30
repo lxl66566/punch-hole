@@ -31,6 +31,8 @@ A `NatSpec` crosses two orthogonal RFC 4787 axes with a filtering class: the map
 
 One more `NatSpec` field decides hairpinning (RFC 4787 §6): a datagram a client sends to its own NAT's external address loops back through the target mapping, arriving as if from outside — the source is the sender's translated address, and the target mapping's filter applies to it, so an unsolicited loop is filtered and counted like any inbound one. `hairpin: false` models the broken no-loopback NAT instead: the sender's mapping still opens, the datagram is dropped, and the engine's `dropped_by_hairpin` counter ticks.
 
+Both engines also stack one NAT behind an upstream: `net.host_behind(&uplink_host, spec)` and `NatLab::spawn_behind(&uplink, seed, spec)` build the shape a CGNAT gives every home router. The inner NAT's public side is realized as a set of client sockets of the upstream host, one per inner external port, so an outbound datagram opens the inner mapping and then leaves through that uplink socket, letting the upstream allocate the externally visible address under its own policy. The inner NAT's own public address is a display label only — probes learn the true external address through STUN across the chain — and inbound rides the uplink socket's receive path, so an inner filter sees the source the outer NAT assigned. The nested spec still governs the datagrams that cross it — mapping, allocation, filtering, and hairpinning — with its allocation policy picking the uplink client ports wherever the upstream host has them free, and releasing an inner mapping releases the upstream mapping with it.
+
 The router exposes observation hooks for assertions: forwarded and dropped counters, the live mapping table, the peak mapping count, and a bounded wait until every mapping drains. Setting the `NAT_LAB_TRACE` environment variable prints every forwarded packet, which narrows failures fast.
 
 Hosts carry fault injection for the paths a clean net never walks: `drop_first_send_to` and `fail_sends_to` break the uplink, `external_allocations` walks a NAT's sequence forward like unrelated traffic behind the same carrier NAT, and `rebind_sequence_after` jumps the port walk to a fresh base mid-session.
@@ -39,7 +41,7 @@ Determinism comes from two pieces. All randomness flows through one `StdRng` see
 
 ## The loopback NAT lab
 
-The lab in `nat_lab::lab` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process.
+The lab in `nat_lab::lab` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process. A lab spawned behind an upstream draws no address of its own — its public address reads `0.0.0.0` as a label — and its per-mapping external sockets are uplink client sockets of the upstream lab, so the OS keeps the port allocation honest.
 
 What the lab covers and the simulator cannot:
 

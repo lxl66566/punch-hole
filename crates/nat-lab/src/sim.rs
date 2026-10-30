@@ -22,8 +22,10 @@ use std::{
 
 use rand::{prelude::*, rngs::StdRng};
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
+    MAX_DATAGRAM,
     socket::{UdpFactory, UdpIo},
     stun::Grid,
 };
@@ -249,6 +251,13 @@ struct MappingEntry {
     ext_port: u16,
     /// Destinations this mapping sent to, which inbound filtering checks.
     dests: HashSet<SocketAddr>,
+    /// The uplink client socket of this mapping on the upstream host: the
+    /// external side of a nested NAT. `None` for a flat NAT, whose
+    /// external side is the router itself.
+    uplink: Option<Arc<SimSocket>>,
+    /// Fires when the mapping goes away, ending the uplink task so the
+    /// uplink socket closes and the upstream mapping releases with it.
+    cancel: Option<CancellationToken>,
 }
 
 struct NatShared {
@@ -266,6 +275,8 @@ struct NatShared {
     /// Allocation count at which the stepped port walk jumps to a fresh
     /// base, armed by a test and spent once.
     rebind: StdMutex<Option<u32>>,
+    /// The upstream host this NAT rides, when nested.
+    uplink: Option<UplinkHost>,
 }
 
 /// What becomes of one translated datagram aimed at this NAT's own
@@ -284,8 +295,32 @@ enum HairpinFate {
     Deliver(SocketAddr),
 }
 
+/// The upstream host a nested NAT rides, reduced to what binding the
+/// per-mapping uplink sockets needs: the router channel, the upstream NAT
+/// if any, the upstream host's private address, and its faults.
+struct UplinkHost {
+    tx: mpsc::UnboundedSender<Msg>,
+    nat: Option<Arc<NatShared>>,
+    local_ip: Ipv4Addr,
+    faults: Arc<StdMutex<UplinkFaults>>,
+}
+
+impl UplinkHost {
+    /// Reduces one host handle to its uplink essentials.
+    fn of(host: &Host) -> Self {
+        Self {
+            tx: host.inner.tx.clone(),
+            nat: host.nat.clone(),
+            local_ip: host.local_ip,
+            faults: Arc::clone(&host.faults),
+        }
+    }
+}
+
 impl NatShared {
-    fn new(spec: NatSpec, index: u32) -> Self {
+    fn new(spec: NatSpec, index: u32, uplink: Option<UplinkHost>) -> Self {
+        // For a nested NAT the public address is a display label only: the
+        // externally visible address is whatever the upstream allocates.
         let public_ip = Ipv4Addr::new(100, 64, index as u8, 1);
         Self {
             spec,
@@ -296,32 +331,134 @@ impl NatShared {
             filter_drops: AtomicU32::new(0),
             hairpin_drops: AtomicU32::new(0),
             rebind: StdMutex::new(None),
+            uplink,
         }
     }
 
     fn translate_outbound(
-        &self,
-        rng: &StdMutex<StdRng>,
+        self: &Arc<Self>,
+        inner_net: &Arc<Inner>,
         local: SocketAddr,
         dst: SocketAddr,
-    ) -> SocketAddr {
+    ) -> io::Result<SocketAddr> {
         let key = ReuseKey::new(self.spec.mapping, local, dst);
         let mut mappings = self.mappings.lock().expect("mapping lock");
         // External ports of the live mappings, which a fresh allocation
         // avoids.
         let used: Vec<u16> = mappings.values().map(|e| e.ext_port).collect();
         if let std::collections::hash_map::Entry::Vacant(e) = mappings.entry(key) {
-            let entry = MappingEntry {
-                local,
-                ext_port: self.alloc_port(rng, &used, local),
-                dests: HashSet::new(),
-            };
-            e.insert(entry);
+            e.insert(self.build_entry(inner_net, local, &used)?);
             self.note_mapping_count(mappings.len());
         }
         let entry = mappings.get_mut(&key).expect("entry just inserted");
         entry.dests.insert(dst);
-        SocketAddr::V4(SocketAddrV4::new(self.public_ip, entry.ext_port))
+        Ok(SocketAddr::V4(SocketAddrV4::new(
+            self.public_ip,
+            entry.ext_port,
+        )))
+    }
+
+    /// Builds one fresh mapping: a plain allocation for a flat NAT, or —
+    /// behind an upstream — an uplink client socket bound on the upstream
+    /// host at the external port, plus the receive task that feeds its
+    /// inbound.
+    ///
+    /// The external port is the uplink client's local port, so the inner
+    /// spec's allocation picks it; a port the upstream host already holds
+    /// moves the walk or the draw to the next candidate, like the lab's
+    /// bind retry.
+    fn build_entry(
+        self: &Arc<Self>,
+        inner_net: &Arc<Inner>,
+        local: SocketAddr,
+        used: &[u16],
+    ) -> io::Result<MappingEntry> {
+        let Some(up) = &self.uplink else {
+            return Ok(MappingEntry {
+                local,
+                ext_port: self.alloc_port(&inner_net.rng, used, local),
+                uplink: None,
+                cancel: None,
+                dests: HashSet::new(),
+            });
+        };
+        let len = u64::from(self.spec.port_range.end - self.spec.port_range.start);
+        let mut budget = len as usize + 8;
+        loop {
+            if budget == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "no uplink port of the range binds",
+                ));
+            }
+            budget -= 1;
+            let port = self.alloc_port(&inner_net.rng, used, local);
+            let Ok(sock) = bind_uplink_port(up, inner_net, port) else {
+                continue;
+            };
+            let uplink = Arc::new(sock);
+            let cancel = CancellationToken::new();
+            tokio::spawn(uplink_loop(
+                Arc::clone(self),
+                inner_net.tx.clone(),
+                Arc::clone(&uplink),
+                cancel.clone(),
+            ));
+            return Ok(MappingEntry {
+                local,
+                ext_port: port,
+                uplink: Some(uplink),
+                cancel: Some(cancel),
+                dests: HashSet::new(),
+            });
+        }
+    }
+
+    /// The uplink socket of the mapping one outbound datagram uses, when
+    /// this NAT rides an upstream. The datagram leaves through it, so the
+    /// upstream NAT translates it under its own policy.
+    fn uplink_socket(&self, local: SocketAddr, dst: SocketAddr) -> Option<Arc<SimSocket>> {
+        let key = ReuseKey::new(self.spec.mapping, local, dst);
+        self.mappings
+            .lock()
+            .expect("mapping lock")
+            .get(&key)
+            .and_then(|entry| entry.uplink.clone())
+    }
+
+    /// Delivers one datagram that arrived on an uplink socket to its
+    /// mapping's client, under the mapping's filter.
+    ///
+    /// The source is whatever the upstream NAT assigned the correspondent,
+    /// so the inner filter sees the apparent external address — correct
+    /// RFC semantics for stacked translation.
+    fn uplink_inbound(
+        &self,
+        tx: &mpsc::UnboundedSender<Msg>,
+        uplink: &Arc<SimSocket>,
+        from: SocketAddr,
+        payload: &[u8],
+    ) {
+        let mappings = self.mappings.lock().expect("mapping lock");
+        let Some(entry) = mappings.values().find(|entry| {
+            entry
+                .uplink
+                .as_ref()
+                .is_some_and(|sock| Arc::ptr_eq(sock, uplink))
+        }) else {
+            return;
+        };
+        if self.allows(entry, from) {
+            // The private destination matches no NAT, so the router hands
+            // the datagram to the client unchanged.
+            let _ = tx.send(Msg::Packet {
+                src: from,
+                dst: entry.local,
+                payload: payload.to_vec(),
+            });
+        } else {
+            self.filter_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn note_mapping_count(&self, current: usize) {
@@ -392,6 +529,11 @@ impl NatShared {
     }
 
     fn translate_inbound(&self, dst: SocketAddr, src: SocketAddr) -> Option<SocketAddr> {
+        // A nested NAT's inbound rides its uplink sockets; its own public
+        // address is a display label no datagram routes to.
+        if self.uplink.is_some() {
+            return None;
+        }
         // Only traffic aimed at this NAT's public address crosses it.
         let SocketAddr::V4(dst_v4) = dst else {
             return None
@@ -464,10 +606,21 @@ impl NatShared {
     }
 
     fn forget_local(&self, local: SocketAddr) {
-        self.mappings
-            .lock()
-            .expect("mapping lock")
-            .retain(|_, entry| entry.local != local);
+        let canceled = {
+            let mut mappings = self.mappings.lock().expect("mapping lock");
+            let canceled: Vec<CancellationToken> = mappings
+                .values()
+                .filter(|entry| entry.local == local)
+                .filter_map(|entry| entry.cancel.clone())
+                .collect();
+            mappings.retain(|_, entry| entry.local != local);
+            canceled
+        };
+        // Ending a mapping's uplink task closes the uplink socket, whose
+        // unregister releases the upstream mapping of a nested NAT.
+        for token in canceled {
+            token.cancel();
+        }
     }
 
     fn snapshot(&self) -> Vec<(SocketAddr, SocketAddr)> {
@@ -482,6 +635,80 @@ impl NatShared {
                 )
             })
             .collect()
+    }
+}
+
+/// Claims `addr` in the network's bound-address registry, so two binds of
+/// one address never overwrite each other silently in the router.
+fn claim_bound(inner_net: &Arc<Inner>, addr: SocketAddr) -> bool {
+    inner_net.bound.lock().expect("bound lock").insert(addr)
+}
+
+/// Returns one bound address to the registry.
+fn release_bound(inner_net: &Arc<Inner>, addr: SocketAddr) {
+    inner_net.bound.lock().expect("bound lock").remove(&addr);
+}
+
+/// Binds one uplink client socket of the upstream host at an explicit
+/// local port: the external side of a nested NAT's mapping.
+///
+/// The inner external port is the uplink client's local port, and the
+/// bound-address registry keeps two nested NATs on one upstream host from
+/// silently overwriting each other's registry entry; a taken port fails
+/// the bind, which moves the nested allocation on.
+fn bind_uplink_port(up: &UplinkHost, inner_net: &Arc<Inner>, port: u16) -> io::Result<SimSocket> {
+    let local = SocketAddr::V4(SocketAddrV4::new(up.local_ip, port));
+    if !claim_bound(inner_net, local) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "uplink port already bound",
+        ));
+    }
+    let (tx, rx) = mpsc::channel(32);
+    if up
+        .tx
+        .send(Msg::Register {
+            addr: local,
+            inbox: tx,
+        })
+        .is_err()
+    {
+        release_bound(inner_net, local);
+        return Err(io::Error::other("router stopped"));
+    }
+    Ok(SimSocket {
+        inner: Arc::clone(inner_net),
+        nat: up.nat.clone(),
+        local,
+        inbox: Mutex::new(rx),
+        faults: Arc::clone(&up.faults),
+    })
+}
+
+/// Serves one nested mapping's uplink socket: the receive side of the
+/// nested NAT's external interface.
+///
+/// The upstream NAT delivers datagrams for the uplink socket's mapped
+/// address here; each crosses its mapping's filter and reaches the client
+/// with the upstream-assigned source. The task ends when the mapping goes
+/// away, which closes the uplink socket, whose unregister releases the
+/// upstream mapping in turn.
+async fn uplink_loop(
+    nat: Arc<NatShared>,
+    tx: mpsc::UnboundedSender<Msg>,
+    uplink: Arc<SimSocket>,
+    cancel: CancellationToken,
+) {
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    loop {
+        let recv = uplink.recv_from(&mut buf);
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            result = recv => match result {
+                Ok((len, from)) => nat.uplink_inbound(&tx, &uplink, from, &buf[..len]),
+                Err(_) => break,
+            },
+        }
     }
 }
 
@@ -522,11 +749,19 @@ struct Inner {
     dropped: AtomicU32,
     port_counter: AtomicU32,
     subnet_counter: AtomicU32,
+    /// Socket addresses currently registered with the router, so two
+    /// binds of one address fail loudly instead of overwriting the
+    /// registry entry.
+    bound: StdMutex<HashSet<SocketAddr>>,
     /// Delay between a socket closing and its mappings going away.
     mapping_expiry: StdMutex<std::time::Duration>,
 }
 
 /// One virtual network. Create with [`Net::seeded`].
+///
+/// Cloning shares the same network, so a stacked-NAT test can hold one
+/// handle per layer while every layer rides one router.
+#[derive(Clone)]
 pub struct Net {
     inner: Arc<Inner>,
 }
@@ -555,6 +790,7 @@ impl Net {
             dropped: AtomicU32::new(0),
             port_counter: AtomicU32::new(20_000),
             subnet_counter: AtomicU32::new(1),
+            bound: StdMutex::new(HashSet::new()),
             mapping_expiry: StdMutex::new(std::time::Duration::ZERO),
         });
         let router_inner = Arc::clone(&inner);
@@ -568,6 +804,7 @@ impl Net {
                     },
                     Msg::Unregister { addr } => {
                         registry.remove(&addr);
+                        router_inner.bound.lock().expect("bound lock").remove(&addr);
                         let nats: Vec<_> = router_inner.nats.lock().expect("nat list lock").clone();
                         let expiry = *router_inner.mapping_expiry.lock().expect("expiry lock");
                         if expiry.is_zero() {
@@ -626,7 +863,43 @@ impl Net {
     #[must_use]
     pub fn host(&self, spec: NatSpec) -> Host {
         let index = self.inner.subnet_counter.fetch_add(1, Ordering::Relaxed);
-        let nat = Arc::new(NatShared::new(spec, index));
+        let nat = Arc::new(NatShared::new(spec, index, None));
+        self.inner
+            .nats
+            .lock()
+            .expect("nat list lock")
+            .push(Arc::clone(&nat));
+        let local_ip = Ipv4Addr::new(192, 168, index as u8, 2);
+        Host {
+            inner: Arc::clone(&self.inner),
+            nat: Some(nat),
+            local_ip,
+            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
+        }
+    }
+
+    /// Attaches a host behind a new NAT that itself rides `uplink`
+    /// upstream, building the NAT-behind-NAT shape a CGNAT gives every
+    /// home router.
+    ///
+    /// The nested NAT's public side is realized as client sockets of the
+    /// uplink host, one per inner external port: an outbound datagram
+    /// opens the mapping, then leaves through that uplink socket, so the
+    /// upstream NAT allocates the externally visible address under its own
+    /// policy. The nested NAT's own public address is a display label
+    /// only; probes learn the true external address through STUN across
+    /// the chain. The nested spec still governs the datagrams that cross
+    /// it — mapping, allocation, filtering, and hairpinning — with its
+    /// allocation policy picking the uplink client ports wherever the
+    /// upstream host has them free. Inbound rides the uplink socket's
+    /// receive path, so an inner filter sees the source the upstream
+    /// assigned, and releasing an inner mapping releases the upstream
+    /// mapping with it. `uplink` may itself sit behind a NAT, so chains
+    /// recurse, or be a public host.
+    #[must_use]
+    pub fn host_behind(&self, uplink: &Host, spec: NatSpec) -> Host {
+        let index = self.inner.subnet_counter.fetch_add(1, Ordering::Relaxed);
+        let nat = Arc::new(NatShared::new(spec, index, Some(UplinkHost::of(uplink))));
         self.inner
             .nats
             .lock()
@@ -898,14 +1171,25 @@ impl UdpFactory for Host {
         }
         let port = self.inner.port_counter.fetch_add(1, Ordering::Relaxed) as u16;
         let local = SocketAddr::V4(SocketAddrV4::new(self.local_ip, port));
+        if !claim_bound(&self.inner, local) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "address already bound",
+            ));
+        }
         let (tx, rx) = mpsc::channel(32);
-        self.inner
+        if self
+            .inner
             .tx
             .send(Msg::Register {
                 addr: local,
                 inbox: tx,
             })
-            .map_err(|_| io::Error::other("router stopped"))?;
+            .is_err()
+        {
+            release_bound(&self.inner, local);
+            return Err(io::Error::other("router stopped"));
+        }
         Ok(SimSocket {
             inner: Arc::clone(&self.inner),
             nat: self.nat.clone(),
@@ -927,38 +1211,55 @@ pub struct SimSocket {
 
 impl UdpIo for SimSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        {
-            let mut faults = self.faults.lock().expect("uplink fault lock");
-            if faults.unreachable.contains(&target) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NetworkUnreachable,
-                    "sim uplink fault: destination unreachable",
-                ));
+        // One hop per NAT of the stack: each hop checks its own host's
+        // uplink faults, translates, resolves the hairpin fate, then
+        // either emits or hands the datagram to its mapping's uplink
+        // socket, whose own NAT repeats the rule.
+        let mut hop: Option<Arc<SimSocket>> = None;
+        loop {
+            let sock = hop.as_deref().unwrap_or(self);
+            {
+                let mut faults = sock.faults.lock().expect("uplink fault lock");
+                if faults.unreachable.contains(&target) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NetworkUnreachable,
+                        "sim uplink fault: destination unreachable",
+                    ));
+                }
+                if faults.drop_first.remove(&target) {
+                    // The datagram reports success and never reaches the
+                    // NAT, so the destination holds no mapping yet.
+                    return Ok(buf.len());
+                }
             }
-            if faults.drop_first.remove(&target) {
-                // The datagram reports success and never reaches the NAT,
-                // so the destination holds no mapping yet.
+            let Some(nat) = &sock.nat else {
+                self.emit(buf, sock.local, target)?;
+                return Ok(buf.len());
+            };
+            // The mapping opens and refreshes before its fate, like the
+            // loss hook's order.
+            let src = nat.translate_outbound(&self.inner, sock.local, target)?;
+            match nat.hairpin_fate(src, target) {
+                // Delivered as if from outside: the private destination
+                // matches no NAT, so the router applies its loss roll and
+                // hands the datagram to the target unchanged.
+                HairpinFate::Deliver(local) => {
+                    self.emit(buf, src, local)?;
+                    return Ok(buf.len());
+                },
+                // The NAT dropped the datagram after the translation; the
+                // fate call already counted it.
+                HairpinFate::Disabled | HairpinFate::Filtered => return Ok(buf.len()),
+                HairpinFate::None => {},
+            }
+            let next = nat.uplink_socket(sock.local, target);
+            if let Some(uplink) = next {
+                hop = Some(uplink);
+            } else {
+                self.emit(buf, src, target)?;
                 return Ok(buf.len());
             }
         }
-        let Some(nat) = &self.nat else {
-            self.emit(buf, self.local, target)?;
-            return Ok(buf.len());
-        };
-        // The mapping opens and refreshes before its fate, like the loss
-        // hook's order.
-        let src = nat.translate_outbound(&self.inner.rng, self.local, target);
-        match nat.hairpin_fate(src, target) {
-            // Delivered as if from outside: the private destination
-            // matches no NAT, so the router applies its loss roll and
-            // hands the datagram to the target unchanged.
-            HairpinFate::Deliver(local) => self.emit(buf, src, local)?,
-            // The NAT dropped the datagram after the translation; the
-            // fate call already counted it.
-            HairpinFate::Disabled | HairpinFate::Filtered => return Ok(buf.len()),
-            HairpinFate::None => self.emit(buf, src, target)?,
-        }
-        Ok(buf.len())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {

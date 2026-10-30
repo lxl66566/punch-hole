@@ -9,6 +9,8 @@ Testing NAT traversal needs a NAT on the other side of the wire. `nat-lab` provi
 
 Both engines translate and filter datagrams according to one `NatSpec`: a mapping behavior per RFC 4787 (`MappingBehavior::EndpointIndependent`, `AddressDependent`, `AddressPortDependent`) crossed with an allocation policy (`Allocation::Increment { step }`, `Random`, `Preserve`) and an inbound filtering class (endpoint-independent, address-dependent, address-and-port-dependent) over a port range, plus a hairpinning switch that decides whether datagrams aimed at the NAT's own external address loop back to the sibling behind it (RFC 4787 §6) or drop as on a broken no-loopback NAT.
 
+Both engines also stack: a NAT can ride behind an upstream NAT — the shape a CGNAT gives every home router. The inner NAT's public side is a set of client sockets of the upstream host, one per inner external port, so the upstream allocates the externally visible address under its own policy; the inner NAT's own public address is a display label only, and probes learn the true external one through STUN across the chain.
+
 The built-in STUN responders of both engines support RFC 5780 behavior discovery: each answers on a two-IP, multi-port grid, honors CHANGE-REQUEST (the reply leaves the flag-selected alternate socket), and reports RESPONSE-ORIGIN and OTHER-ADDRESS beside XOR-MAPPED-ADDRESS. The handles expose the alternate addresses as `other_addrs`.
 
 ## Usage
@@ -17,13 +19,19 @@ The built-in STUN responders of both engines support RFC 5780 behavior discovery
 // Deterministic: a virtual NAT queried through the built-in STUN server.
 let net = nat_lab::Net::seeded("cone_cone_success");
 let stun = net.stun_server();
-let host = net.host(nat_lab::NatSpec::cone_apdf());
+let host = net.host(nat_lab::NatSpec::cone_apdf());  // behind a NAT
 let sock = host.bind(nat_lab::Family::V4.any_addr()).await?;
 
 // Realistic: a loopback NAT over real sockets, with a matching responder.
 let stun = nat_lab::stun_responder()?;
 let nat = nat_lab::NatLab::spawn("demo", nat_lab::NatSpec::cone_apdf()).await?;
 let sock = nat.host().bind(nat_lab::Family::V4.any_addr()).await?;
+
+// Stacked: a home-router NAT behind a carrier-grade NAT, on either engine.
+let uplink = net.host(nat_lab::NatSpec::cone_eif());               // the ISP side
+let home = net.host_behind(&uplink, nat_lab::NatSpec::cone_apdf()); // the home router
+let outer = nat_lab::NatLab::spawn("isp", nat_lab::NatSpec::cone_eif()).await?;
+let inner = nat_lab::NatLab::spawn_behind(&outer, "home", nat_lab::NatSpec::cone_apdf()).await?;
 ```
 
 Consumer code sees hosts and sockets through two small traits, `UdpFactory` and `UdpIo` (four methods total). Adapting another socket abstraction onto the seam is a few lines; see `src/socket.rs`.
@@ -34,4 +42,4 @@ Both engines expose the same fault surface: data-plane loss (`set_loss`) with a 
 
 ## Non-goals
 
-No signaling, no identity system, no relay, and no async-runtime interception: determinism comes from the seam, and the loopback engine keeps real wall-clock timing on purpose. Multi-layer (stacked) NATs and carrier-grade shared-address scenarios are roadmap items.
+No signaling, no identity system, no relay, and no async-runtime interception: determinism comes from the seam, and the loopback engine keeps real wall-clock timing on purpose. Stacks are two layers deep by design — the engine models a NAT behind an upstream NAT, not a general topology DSL.
