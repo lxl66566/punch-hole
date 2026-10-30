@@ -1,14 +1,13 @@
 //! Loopback NAT lab: one emulated NAT device over real OS sockets.
 //!
-//! Feature `test-util`. A `NatLab` is a userspace NAT forwarder that lives
-//! on the 127.0.0.0/8 loopback space. Client sockets are real OS sockets;
-//! every outbound datagram crosses a gateway task that applies the mapping
-//! and filtering policy of a [`NatSpec`] and leaves through a per-mapping
-//! public socket bound on the lab's dedicated loopback address. The
-//! production path runs unmodified: real STUN probes, classification,
-//! strategy, and punch all observe a translated address, which the pure
-//! simulator covers only without the OS and the plain loopback smoke tests
-//! cover only without a NAT.
+//! A [`NatLab`] is a userspace NAT forwarder that lives on the 127.0.0.0/8
+//! loopback space. Client sockets are real OS sockets; every outbound
+//! datagram crosses a gateway task that applies the mapping and filtering
+//! policy of a [`NatSpec`] and leaves through a per-mapping public socket
+//! bound on the lab's dedicated loopback address. The code under test runs
+//! unmodified: real STUN probes, classification, strategy, and punch all
+//! observe a translated address, which the pure simulator covers only
+//! without the OS and plain loopback tests cover only without a NAT.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
@@ -28,9 +27,8 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    msg::MAX_DATA_PACKET,
-    nat::FilterClass,
-    sim::{Mapping, NatSpec},
+    MAX_DATAGRAM,
+    sim::{FilterClass, Mapping, NatSpec},
     socket::{UdpFactory, UdpIo},
 };
 
@@ -290,7 +288,7 @@ fn snapshot(table: &MappingTable, public_ip: Ipv4Addr) -> Vec<(SocketAddr, Socke
 /// order per sender, so a probing socket reads the same allocation
 /// sequence it would read behind a real NAT.
 async fn gateway_loop(inner: Arc<LabInner>) {
-    let mut buf = [0u8; FRAME_HEADER + MAX_DATA_PACKET];
+    let mut buf = [0u8; FRAME_HEADER + MAX_DATAGRAM];
     loop {
         let (len, from) = match inner.gateway.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -441,8 +439,8 @@ fn allocate_mapping(
 /// Inbound datagrams pass the filter check and reach the client as In
 /// frames through the gateway socket; filter failures count as drops.
 async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
-    let mut buf = [0u8; MAX_DATA_PACKET];
-    let mut wire = [0u8; FRAME_HEADER + MAX_DATA_PACKET];
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut wire = [0u8; FRAME_HEADER + MAX_DATAGRAM];
     loop {
         let recv = mapping.ext.recv_from(&mut buf);
         tokio::select! {
@@ -481,7 +479,7 @@ async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
 fn allows(filtering: FilterClass, dests: &StdMutex<HashSet<SocketAddr>>, src: SocketAddr) -> bool {
     let dests = dests.lock().expect("dests lock");
     match filtering {
-        FilterClass::EndpointIndependent | FilterClass::Unknown => true,
+        FilterClass::EndpointIndependent => true,
         FilterClass::AddressDependent => dests.iter().any(|d| d.ip() == src.ip()),
         FilterClass::AddressPortDependent => dests.contains(&src),
     }
@@ -544,22 +542,33 @@ impl UdpFactory for LabHost {
         // IPv4 address maps onto it and the requested port survives.
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, addr.port())).await?;
         let gateway = self.inner.gateway.local_addr()?;
-        Ok(LabSocket { sock, gateway })
+        let frame = || vec![0u8; FRAME_HEADER + MAX_DATAGRAM];
+        Ok(LabSocket {
+            sock,
+            gateway,
+            send_wire: tokio::sync::Mutex::new(frame()),
+            recv_wire: tokio::sync::Mutex::new(frame()),
+        })
     }
 }
 
 /// One client socket behind a lab NAT: a real loopback socket that frames
 /// its datagrams for the gateway.
+///
+/// The frame buffers live on the heap, one per direction, so the async
+/// methods stay small no matter how large a datagram the lab forwards.
 pub struct LabSocket {
     sock: UdpSocket,
     gateway: SocketAddr,
+    send_wire: tokio::sync::Mutex<Vec<u8>>,
+    recv_wire: tokio::sync::Mutex<Vec<u8>>,
 }
 
 impl UdpIo for LabSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         // The gateway's receive buffer fits one framed data packet, so a
         // longer payload has no path through the lab.
-        if buf.len() > MAX_DATA_PACKET {
+        if buf.len() > MAX_DATAGRAM {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "payload over the lab frame cap",
@@ -571,7 +580,7 @@ impl UdpIo for LabSocket {
                 "the lab is IPv4 only",
             ));
         };
-        let mut wire = [0u8; FRAME_HEADER + MAX_DATA_PACKET];
+        let mut wire = self.send_wire.lock().await;
         write_header(&mut wire, TAG_OUT, SocketAddrV4::new(ip, target.port()));
         wire[FRAME_HEADER..FRAME_HEADER + buf.len()].copy_from_slice(buf);
         self.sock
@@ -581,7 +590,7 @@ impl UdpIo for LabSocket {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut wire = [0u8; FRAME_HEADER + MAX_DATA_PACKET];
+        let mut wire = self.recv_wire.lock().await;
         loop {
             let (len, _) = self.sock.recv_from(&mut wire).await?;
             // The gateway is the only sender here and sends only In
@@ -780,7 +789,7 @@ async fn stun_loop(sock: UdpSocket) {
     loop {
         match sock.recv_from(&mut buf).await {
             Ok((len, from)) => {
-                if let Some(reply) = binding_reply(&buf[..len], from) {
+                if let Some(reply) = crate::stun::binding_reply(&buf[..len], from) {
                     let _ = sock.send_to(&reply, from).await;
                 }
             },
@@ -788,33 +797,6 @@ async fn stun_loop(sock: UdpSocket) {
             Err(_) => break,
         }
     }
-}
-
-/// Minimal binding response, v4 XOR-MAPPED only.
-fn binding_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
-    const COOKIE: [u8; 4] = 0x2112_a442u32.to_be_bytes();
-    if request.len() < 20
-        || u16::from_be_bytes([request[0], request[1]]) != 0x0001
-        || request[4..8] != COOKIE
-    {
-        return None;
-    }
-    let IpAddr::V4(ip) = from.ip() else {
-        return None;
-    };
-    let xip: Vec<u8> = ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k).collect();
-    let mut out = Vec::with_capacity(32);
-    out.extend_from_slice(&0x0101u16.to_be_bytes());
-    out.extend_from_slice(&12u16.to_be_bytes());
-    out.extend_from_slice(&COOKIE);
-    out.extend_from_slice(&request[8..20]);
-    out.extend_from_slice(&0x0020u16.to_be_bytes());
-    out.extend_from_slice(&8u16.to_be_bytes());
-    out.push(0);
-    out.push(0x01);
-    out.extend_from_slice(&(from.port() ^ 0x2112).to_be_bytes());
-    out.extend_from_slice(&xip);
-    Some(out)
 }
 
 #[cfg(test)]

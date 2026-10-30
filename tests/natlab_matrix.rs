@@ -11,13 +11,12 @@ use std::{
     time::Duration,
 };
 
+use nat_lab::{LabHost, LabSocket, NatLab, StunServer, lab as natlab, sim::NatSpec};
 use punch_hole::{
     NatClass, PunchConfig, Punched, Puncher, StrategyId,
     error::PunchError,
     msg::{DATA_MAGIC, MAX_DATA_PACKET},
-    natlab::{self, LabHost, LabSocket, NatLab, StunServer},
     signaling,
-    sim::{self, NatSpec},
     socket::UdpIo,
 };
 
@@ -60,7 +59,7 @@ async fn try_punch_pair(
 ) {
     let (ha, la) = signaling::bridge(64);
     let (hb, lb) = signaling::bridge(64);
-    sim::connect(ha, hb);
+    signaling::connect(ha, hb);
     let a = tokio::spawn(async move {
         Puncher::with_factory(cfg_a, host_a)
             .expect("config valid")

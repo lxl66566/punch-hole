@@ -2,11 +2,8 @@
 
 #![allow(dead_code, clippy::field_reassign_with_default)]
 
-use punch_hole::{
-    PunchConfig, Punched, Puncher,
-    error::PunchError,
-    sim::{Host, Net, SimSocket, StunServer},
-};
+use nat_lab::sim::{Host, Net, SimSocket, StunServer};
+use punch_hole::{PunchConfig, Punched, Puncher, error::PunchError};
 
 pub fn config(stun: &StunServer) -> PunchConfig {
     let mut cfg = PunchConfig::default();
@@ -48,7 +45,7 @@ pub async fn punch_pair(
 ) {
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
-    punch_hole::sim::connect(ha, hb);
+    punch_hole::signaling::connect(ha, hb);
     let a = tokio::spawn(run_initiator(host_a, cfg_a, la));
     let b = tokio::spawn(run_responder(host_b, cfg_b, lb));
     (
@@ -105,7 +102,7 @@ pub fn connect_then_blackhole(
     a: punch_hole::signaling::HostEnd,
     b: punch_hole::signaling::HostEnd,
 ) {
-    punch_hole::sim::connect_with(a, b, |frame| {
+    punch_hole::signaling::connect_with(a, b, |frame| {
         let setup = punch_hole::msg::decode_sig(frame).is_ok_and(|f| {
             matches!(
                 f.body,
@@ -118,7 +115,7 @@ pub fn connect_then_blackhole(
     });
 }
 
-use punch_hole::sim::NatSpec;
+use nat_lab::sim::NatSpec;
 
 /// One cone behind one cone NAT, the standard happy path setup.
 ///

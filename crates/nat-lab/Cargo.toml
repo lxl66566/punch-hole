@@ -1,0 +1,37 @@
+[package]
+name         = "nat-lab"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.88"
+description  = "Emulated NAT devices for testing UDP traversal code: a deterministic virtual network and a loopback NAT over real OS sockets"
+repository   = "https://github.com/lxl66566/punch-hole"
+license      = "MIT OR Apache-2.0"
+readme       = "README.md"
+keywords     = ["nat", "udp", "network", "testing", "p2p"]
+categories   = ["development-tools::testing", "network-programming"]
+include      = ["/LICENSE-*", "/README.md", "/src/**", "/tests/**", "/examples/**"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+rand       = "0.10.3"
+tokio      = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full", "test-util"] }
+
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[lints.rust]
+unused_qualifications = "warn"
+unsafe_code           = "deny"

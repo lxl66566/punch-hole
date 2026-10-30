@@ -7,11 +7,8 @@
 mod common;
 
 use common::config;
-use punch_hole::{
-    NatClass, PunchConfig, StrategyId,
-    error::PunchError,
-    sim::{Mapping, NatSpec, Net},
-};
+use nat_lab::sim::{Mapping, NatSpec, Net};
+use punch_hole::{NatClass, PunchConfig, StrategyId, error::PunchError};
 
 #[tokio::test(start_paused = true)]
 async fn cone_cone_success() {
@@ -460,7 +457,7 @@ async fn address_dependent_pair_routes_sym_probe() {
     let stun = net.stun_server();
     let spec = NatSpec {
         mapping: Mapping::AddressSequential { step: 2 },
-        filtering: punch_hole::FilterClass::EndpointIndependent,
+        filtering: nat_lab::FilterClass::EndpointIndependent,
         port_range: 30000..40000,
     };
     let (ra, rb) = common::punch_pair(

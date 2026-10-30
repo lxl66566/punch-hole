@@ -1,11 +1,11 @@
-//! Deterministic NAT simulator for integration tests.
+//! Deterministic virtual network with simulated NAT devices.
 //!
-//! Feature `test-util`. A `Net` owns one router task and a virtual IPv4
-//! space. Hosts attach directly or behind a `NatSpec`, STUN servers answer
-//! binding requests, and every packet crosses the router, which applies
-//! translation, filtering, and loss. All randomness flows through one seeded
-//! generator, and tests run under paused tokio time, so a run reproduces from
-//! its seed.
+//! A [`Net`] owns one router task and a virtual IPv4 space. Hosts attach
+//! directly or behind a [`NatSpec`], STUN servers answer binding requests,
+//! and every packet crosses the router, which applies translation,
+//! filtering, and loss. All randomness flows through one seeded generator,
+//! and tests run under paused tokio time, so a run reproduces from its seed.
+//! Hosts plug into consumer code through the [`UdpFactory`] seam.
 // Trait signatures stay async even when a virtual operation never yields.
 #![allow(clippy::unused_async_trait_impl)]
 
@@ -23,10 +23,18 @@ use std::{
 use rand::{prelude::*, rngs::StdRng};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{
-    nat::FilterClass,
-    socket::{UdpFactory, UdpIo},
-};
+use crate::socket::{UdpFactory, UdpIo};
+
+/// Inbound filtering behavior of a simulated NAT, per RFC 4787.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterClass {
+    /// Any source may reach the mapping.
+    EndpointIndependent,
+    /// Only sources on an address the mapping already sent to.
+    AddressDependent,
+    /// Only sources the mapping already sent to, address and port.
+    AddressPortDependent,
+}
 
 /// Outbound mapping behavior of a simulated NAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +287,7 @@ impl NatShared {
 
     fn allows(&self, entry: &MappingEntry, src: SocketAddr) -> bool {
         match self.spec.filtering {
-            FilterClass::EndpointIndependent | FilterClass::Unknown => true,
+            FilterClass::EndpointIndependent => true,
             FilterClass::AddressDependent => entry.dests.iter().any(|d| d.ip() == src.ip()),
             FilterClass::AddressPortDependent => entry.dests.contains(&src),
         }
@@ -432,7 +440,7 @@ impl Net {
                             .iter()
                             .find_map(|nat| nat.translate_inbound(dst, src));
                         let deliver = target.unwrap_or(dst);
-                        if std::env::var_os("SIM_TRACE").is_some() {
+                        if std::env::var_os("NAT_LAB_TRACE").is_some() {
                             eprintln!("PKT {src} -> {dst} deliver={deliver} len={}", payload.len());
                         }
                         if let Some(inbox) = registry.get(&deliver) {
@@ -491,7 +499,7 @@ impl Net {
             let router_tx = self.inner.tx.clone();
             tokio::spawn(async move {
                 while let Some((from, payload)) = rx.recv().await {
-                    if let Some(reply) = stun_reply(&payload, from) {
+                    if let Some(reply) = crate::stun::binding_reply(&payload, from) {
                         let _ = router_tx.send(Msg::Packet {
                             src: addr,
                             dst: from,
@@ -741,71 +749,4 @@ impl Drop for SimSocket {
         // the configured expiry.
         let _ = self.inner.tx.send(Msg::Unregister { addr: self.local });
     }
-}
-
-/// Wires two host ends together losslessly, acting as the host transport.
-pub fn connect(a: crate::signaling::HostEnd, b: crate::signaling::HostEnd) {
-    connect_with(a, b, |frame| Some(frame.to_vec()));
-}
-
-/// Wires two host ends through a per-frame tap.
-///
-/// The tap sees each frame as bytes; returning `None` drops it, and the
-/// returned buffer replaces it. Loss, duplication, and version-mangling tests
-/// build their taps on this hook.
-pub fn connect_with(
-    a: crate::signaling::HostEnd,
-    b: crate::signaling::HostEnd,
-    tap: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
-) {
-    let tap = Arc::new(tap);
-    let mut a_to_b = a.to_peer;
-    let b_from_a = b.from_peer;
-    let forward_tap = Arc::clone(&tap);
-    tokio::spawn(async move {
-        while let Some(frame) = a_to_b.recv().await {
-            if let Some(bytes) = forward_tap(&frame) {
-                let _ = b_from_a.send(bytes.into()).await;
-            }
-        }
-    });
-    let mut b_to_a = b.to_peer;
-    let a_from_b = a.from_peer;
-    tokio::spawn(async move {
-        while let Some(frame) = b_to_a.recv().await {
-            if let Some(bytes) = tap(&frame) {
-                let _ = a_from_b.send(bytes.into()).await;
-            }
-        }
-    });
-}
-
-/// Builds a STUN binding response for a valid request.
-fn stun_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
-    const COOKIE: [u8; 4] = 0x2112_a442u32.to_be_bytes();
-    if request.len() < 20
-        || u16::from_be_bytes([request[0], request[1]]) != 0x0001
-        || request[4..8] != COOKIE
-    {
-        return None;
-    }
-    let port = from.port() ^ 0x2112;
-    let ip = match from.ip() {
-        std::net::IpAddr::V4(ip) => ip,
-        std::net::IpAddr::V6(_) => return None,
-    };
-    let xip: Vec<u8> = ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k).collect();
-
-    let mut out = Vec::with_capacity(32);
-    out.extend_from_slice(&0x0101u16.to_be_bytes());
-    out.extend_from_slice(&12u16.to_be_bytes());
-    out.extend_from_slice(&COOKIE);
-    out.extend_from_slice(&request[8..20]);
-    out.extend_from_slice(&0x0020u16.to_be_bytes());
-    out.extend_from_slice(&8u16.to_be_bytes());
-    out.push(0);
-    out.push(0x01);
-    out.extend_from_slice(&port.to_be_bytes());
-    out.extend_from_slice(&xip);
-    Some(out)
 }

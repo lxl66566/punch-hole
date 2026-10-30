@@ -11,11 +11,11 @@ use std::{
 };
 
 use common::config;
+use nat_lab::sim::{FilterClass, Mapping, NatSpec, Net};
 use punch_hole::{
-    AbortReason, FilterClass, PunchConfig, Puncher,
+    AbortReason, PunchConfig, Puncher,
     error::{Phase, PunchError},
     msg::{DataPacket, Frame, Offer, SigFrame, decode_sig, encode_packet, encode_sig},
-    sim::{Mapping, NatSpec, Net},
     socket::{UdpFactory, UdpIo},
 };
 use rand::SeedableRng;
@@ -48,7 +48,7 @@ async fn signaling_retransmission_waits_a_full_cadence() {
     let stamps: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&stamps);
     let start = tokio::time::Instant::now();
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         if let Ok(sig) = decode_sig(frame)
             && let Frame::Hello(_) = sig.body
         {
@@ -81,7 +81,7 @@ async fn both_sides_initiator_abort_with_role_conflict() {
     let b = net.host(NatSpec::cone_eif());
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
-    punch_hole::sim::connect(ha, hb);
+    punch_hole::signaling::connect(ha, hb);
 
     let a = tokio::spawn(common::run_initiator(a, config(&stun), la));
     let b = tokio::spawn(common::run_initiator(b, config(&stun), lb));
@@ -99,7 +99,7 @@ async fn version_mismatch_fails_both_sides() {
     let b = net.host(NatSpec::cone_eif());
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
-    punch_hole::sim::connect_with(ha, hb, |frame| {
+    punch_hole::signaling::connect_with(ha, hb, |frame| {
         let mut bytes = frame.to_vec();
         bytes[0] = 9;
         Some(bytes)
@@ -131,8 +131,9 @@ async fn garbage_frame_is_ignored() {
     let (hb, lb) = punch_hole::signaling::bridge(64);
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tap_seen = Arc::clone(&seen);
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         // Replace the second frame that crosses in either direction. The
+
         // version byte stays valid so the garbage reaches the body decoder.
         if tap_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             Some(vec![punch_hole::msg::VERSION, 0xff, 0xfe])
@@ -160,7 +161,7 @@ async fn lossy_bridge_still_completes() {
     // 30 percent frame loss on the host channel, decided by a private
     // generator so the net's seed stays untouched.
     let rng = Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(0x00c0_ffee)));
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         use rand::prelude::*;
         let keep = rng.lock().expect("loss rng").random::<f32>() >= 0.3;
         keep.then(|| frame.to_vec())
@@ -185,7 +186,7 @@ async fn negotiate_deadline_is_not_the_overall_wall() {
     let (hb, lb) = punch_hole::signaling::bridge(64);
     // Hellos cross so Exchange completes; every later frame is dropped, so
     // both sides wait for a peer that never confirms.
-    punch_hole::sim::connect_with(ha, hb, |frame| {
+    punch_hole::signaling::connect_with(ha, hb, |frame| {
         let hello = decode_sig(frame).is_ok_and(|f| matches!(f.body, Frame::Hello(_)));
         hello.then(|| frame.to_vec())
     });
@@ -225,7 +226,7 @@ fn rewrite_first_offer(
     edit: impl Fn(&mut Offer) + Send + Sync + 'static,
 ) {
     let edited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    punch_hole::sim::connect_with(a, b, move |frame| {
+    punch_hole::signaling::connect_with(a, b, move |frame| {
         if edited.load(std::sync::atomic::Ordering::SeqCst) {
             return Some(frame.to_vec());
         }
@@ -328,7 +329,7 @@ async fn first_accept_lost_still_completes() {
     // without any configuration change.
     let cfg = config(&stun);
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         let accept = decode_sig(frame).is_ok_and(|f| f.body == Frame::Accept);
         // Only the very first Accept is lost; every re-send crosses.
         if accept && !dropped.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -444,7 +445,7 @@ async fn stale_attempt_injection_is_counted_and_ignored() {
     let mut addrs = Vec::new();
     addrs.extend(net.stun_server().addrs);
     addrs.extend(net.stun_server().addrs);
-    let stun = punch_hole::sim::StunServer { addrs };
+    let stun = nat_lab::sim::StunServer { addrs };
     // The initiator NAT drops inbound from unknown sources, so it never
     // sees the injected packets. The responder NAT passes any source.
     // A distinct port range keeps the two external endpoints apart.

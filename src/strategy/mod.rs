@@ -2059,7 +2059,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: vec![peer_v6],
         };
-        let mut engine: Engine<crate::sim::SimSocket> =
+        let mut engine: Engine<nat_lab::sim::SimSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
         // One PortUpdate now carries both families' fresh ports.
         engine
@@ -2196,7 +2196,7 @@ mod tests {
         use crate::socket::SocketPool;
 
         let cfg = PunchConfig::default();
-        let net = crate::sim::Net::seeded("malicious_targets");
+        let net = nat_lab::sim::Net::seeded("malicious_targets");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -2223,7 +2223,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             multicast,
             cfg.clone(),
             [0; 16],
@@ -2254,7 +2254,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             port_zero,
             cfg.clone(),
             [0; 16],
@@ -2584,13 +2584,13 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
             tokio::time::Instant::now() + cfg.punch_timeout,
         );
-        let net = crate::sim::Net::seeded("stall_grace");
+        let net = nat_lab::sim::Net::seeded("stall_grace");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -2634,13 +2634,13 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
             tokio::time::Instant::now() + cfg.punch_timeout,
         );
-        let net = crate::sim::Net::seeded("conntrack_reply_skip");
+        let net = nat_lab::sim::Net::seeded("conntrack_reply_skip");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -2725,14 +2725,14 @@ mod tests {
             nonce: [0; 16],
             socket: 3,
         });
-        let net = crate::sim::Net::seeded("held_spray");
+        let net = nat_lab::sim::Net::seeded("held_spray");
 
         // The ungated stage spends every tick from the shared start.
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
             .expect("pool binds");
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan(false),
             cfg.clone(),
             [0; 16],
@@ -2753,7 +2753,7 @@ mod tests {
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
             .expect("pool binds");
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan(true),
             cfg.clone(),
             [0; 16],
@@ -2790,7 +2790,7 @@ mod tests {
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
             .expect("pool binds");
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan(true),
             cfg.clone(),
             [0; 16],
@@ -2839,13 +2839,13 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
             tokio::time::Instant::now() + cfg.punch_timeout,
         );
-        let net = crate::sim::Net::seeded("conntrack_sweep_skip");
+        let net = nat_lab::sim::Net::seeded("conntrack_sweep_skip");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -2913,7 +2913,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
@@ -2927,7 +2927,7 @@ mod tests {
                 })
             })
             .collect();
-        let net = crate::sim::Net::seeded("low_rate_sweep");
+        let net = nat_lab::sim::Net::seeded("low_rate_sweep");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 4, 0)
             .await
@@ -2999,7 +2999,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
@@ -3015,7 +3015,7 @@ mod tests {
             next_retry: tokio::time::Instant::now(),
             attempts_left: REFRESH_ATTEMPTS,
         });
-        let net = crate::sim::Net::seeded("refresh_socket_guard");
+        let net = nat_lab::sim::Net::seeded("refresh_socket_guard");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 2, 0)
             .await
@@ -3069,7 +3069,7 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
@@ -3084,7 +3084,7 @@ mod tests {
             next_retry: tokio::time::Instant::now(),
             attempts_left: REFRESH_ATTEMPTS,
         });
-        let net = crate::sim::Net::seeded("refresh_via_pool");
+        let net = nat_lab::sim::Net::seeded("refresh_via_pool");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -3128,13 +3128,13 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
             tokio::time::Instant::now() + cfg.punch_timeout,
         );
-        let net = crate::sim::Net::seeded("syn_reply_gate");
+        let net = nat_lab::sim::Net::seeded("syn_reply_gate");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await
@@ -3219,13 +3219,13 @@ mod tests {
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
         };
-        let mut engine: Engine<crate::sim::SimSocket> = Engine::new(
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
             cfg.clone(),
             [0; 16],
             tokio::time::Instant::now() + cfg.punch_timeout,
         );
-        let net = crate::sim::Net::seeded("synack_source_gate");
+        let net = nat_lab::sim::Net::seeded("synack_source_gate");
         let host = net.public_host();
         let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
             .await

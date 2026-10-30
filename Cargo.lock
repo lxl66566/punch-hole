@@ -196,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nat-lab"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +260,7 @@ name = "punch-hole"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "nat-lab",
  "postcard",
  "rand",
  "serde",

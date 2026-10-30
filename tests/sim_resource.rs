@@ -5,10 +5,8 @@
 mod common;
 
 use common::config;
-use punch_hole::{
-    error::PunchError,
-    sim::{NatSpec, Net},
-};
+use nat_lab::sim::{NatSpec, Net};
+use punch_hole::error::PunchError;
 
 #[tokio::test(start_paused = true)]
 async fn budget_exhaustion_releases_sockets() {
@@ -109,7 +107,7 @@ async fn blackholed_signaling_times_out_and_releases() {
     // Without PortUpdate no sweep ever fires, so both sides end on their own
     // deadline. Whoever times out first closes its bridge, and the other
     // then sees SignalingClosed instead of its own timeout.
-    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
         matches!(
             r,
             Err(PunchError::Timeout { .. } | PunchError::SignalingClosed)
@@ -137,7 +135,7 @@ async fn overall_deadline_bounds_the_engine() {
     let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
     let b = tokio::spawn(common::run_responder(b, cfg, lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
         matches!(
             r,
             Err(PunchError::Timeout { .. }
@@ -215,7 +213,7 @@ async fn stuck_host_channel_bounds_the_engine() {
         .await
         .expect("responder session ends")
         .unwrap();
-    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
         matches!(
             r,
             Err(PunchError::Timeout { .. }
@@ -241,7 +239,7 @@ async fn engine_start_never_sleeps_past_overall() {
     let (hb, lb) = punch_hole::signaling::bridge(64);
     // Rewrite the Offer's start delay to the honored 10 second cap, far
     // past the session wall, so the shared start has to clamp.
-    punch_hole::sim::connect_with(ha, hb, |frame| {
+    punch_hole::signaling::connect_with(ha, hb, |frame| {
         let frame = punch_hole::msg::decode_sig(frame).ok()?;
         let body = match frame.body {
             punch_hole::msg::Frame::Offer(mut offer) => {
@@ -264,7 +262,7 @@ async fn engine_start_never_sleeps_past_overall() {
     let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
     let b = tokio::spawn(common::run_responder(b, cfg, lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-    let bounded = |r: &Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
         matches!(
             r,
             Err(PunchError::Timeout { .. } | PunchError::SignalingClosed)

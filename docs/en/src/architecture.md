@@ -28,18 +28,20 @@ src/
 ├── signaling.rs   the bridge, HostEnd and LibEnd, session frame IO
 ├── msg/           signaling frames and data packets, with their codecs
 ├── nat/           probe, classification, port prediction
-├── strategy/      selection, sizing, the four strategies, the engine
+├── strategy/      selection, sizing, the five strategies, the engine
 ├── socket/        UdpIo and UdpFactory, SocketPool, rate limiting, platform options
 ├── session.rs     Puncher, PunchSession, the phase state machine
 ├── keepalive.rs   optional post-handover heartbeat
-└── sim/           test-only NAT simulator, behind `test-util`
+└── compat.rs      seam impls for the nat-lab engines, behind `test-util`
 ```
 
-Dependencies stay small: `tokio` and `tokio-util` for async IO and cancellation, `socket2` for platform options, `serde` plus `postcard` for frames, `rand` for nonces and burst draws, `bytes` for the bridge, and `thiserror` for the error type. The STUN subset the prober needs is small enough to live in-tree.
+The workspace carries one member next to the root crate: `crates/nat-lab`, the standalone NAT test lab published as the `nat-lab` crate. Its virtual network and loopback engines serve the integration rings behind the `test-util` feature.
+
+Dependencies stay small: `tokio` and `tokio-util` for async IO and cancellation, `socket2` for platform options, `serde` plus `postcard` for frames, `rand` for nonces and burst draws, `bytes` for the bridge, and `thiserror` for the error type. The STUN subset the prober needs is small enough to live in-tree, and the only test dependency is the workspace's own `nat-lab` crate.
 
 ## The socket seam
 
-The driver binds sockets through two small traits instead of calling tokio directly. `UdpIo` is one UDP socket with `&self` methods and internal mutability, because a receive task and the sender share it. `UdpFactory` creates sockets. Tokio sockets provide the default, and `Puncher::with_factory` accepts any other, which is how the test simulator and the NAT lab attach hosts. The public API keeps the same `tokio::net::UdpSocket` deliverable.
+The driver binds sockets through two small traits instead of calling tokio directly. `UdpIo` is one UDP socket with `&self` methods and internal mutability, because a receive task and the sender share it. `UdpFactory` creates sockets. Tokio sockets provide the default, and `Puncher::with_factory` accepts any other, which is how the test simulator and the NAT lab attach hosts: the `nat-lab` crate defines the same-shaped traits for its engines, and `punch_hole::compat` bridges the two. The public API keeps the same `tokio::net::UdpSocket` deliverable.
 
 ## Session lifecycle
 

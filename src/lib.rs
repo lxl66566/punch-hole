@@ -84,10 +84,7 @@ pub mod signaling;
 pub mod socket;
 
 #[cfg(feature = "test-util")]
-pub mod natlab;
-
-#[cfg(feature = "test-util")]
-pub mod sim;
+pub mod compat;
 
 mod session;
 mod strategy;

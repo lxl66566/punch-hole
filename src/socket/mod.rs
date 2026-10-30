@@ -460,7 +460,7 @@ mod tests {
     async fn elect_returns_with_a_full_event_channel() {
         use std::time::Duration;
 
-        let net = crate::sim::Net::seeded("pool_full_channel");
+        let net = nat_lab::sim::Net::seeded("pool_full_channel");
         // The smallest max_sockets holds the scaled capacity at its floor.
         let cfg = PunchConfig {
             max_sockets: 64,
@@ -503,7 +503,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn exhausted_budget_stays_exhausted() {
-        let net = crate::sim::Net::seeded("pool_budget_stays_exhausted");
+        let net = nat_lab::sim::Net::seeded("pool_budget_stays_exhausted");
         let cfg = PunchConfig {
             packet_budget: 2,
             ..PunchConfig::default()
@@ -536,7 +536,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn failed_send_refunds_the_budget() {
-        let net = crate::sim::Net::seeded("pool_budget_refund");
+        let net = nat_lab::sim::Net::seeded("pool_budget_refund");
         let cfg = PunchConfig {
             packet_budget: 1,
             ..PunchConfig::default()
@@ -577,7 +577,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn an_empty_pool_admits_no_destination() {
-        let net = crate::sim::Net::seeded("pool_no_sockets");
+        let net = nat_lab::sim::Net::seeded("pool_no_sockets");
         let cfg = PunchConfig {
             max_mappings: 1,
             ..PunchConfig::default()
@@ -605,7 +605,7 @@ mod tests {
     async fn all_failed_binds_keep_their_cause() {
         struct Failing;
         impl UdpFactory for Failing {
-            type Socket = crate::sim::SimSocket;
+            type Socket = nat_lab::sim::SimSocket;
 
             async fn bind(&self, _addr: SocketAddr) -> io::Result<Self::Socket> {
                 Err(io::Error::other("simulated descriptor exhaustion"))
@@ -633,7 +633,7 @@ mod tests {
     async fn unusable_targets_are_rejected() {
         use std::net::Ipv6Addr;
 
-        let net = crate::sim::Net::seeded("pool_target_policy");
+        let net = nat_lab::sim::Net::seeded("pool_target_policy");
         let cfg = PunchConfig::default();
         let pool_host = net.public_host();
         let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
@@ -685,7 +685,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn refresh_sends_skip_the_conntrack_table() {
-        let net = crate::sim::Net::seeded("pool_refresh_conntrack");
+        let net = nat_lab::sim::Net::seeded("pool_refresh_conntrack");
         let cfg = PunchConfig {
             max_mappings: 1,
             ..PunchConfig::default()
@@ -725,7 +725,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn refresh_quota_runs_out() {
-        let net = crate::sim::Net::seeded("pool_refresh_quota");
+        let net = nat_lab::sim::Net::seeded("pool_refresh_quota");
         let cfg = PunchConfig::default();
         let pool_host = net.public_host();
         let (pool, _rx) = SocketPool::bind(&pool_host, &cfg, 1, 0)
@@ -761,7 +761,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_sends_never_overshoot_the_budget() {
         const BUDGET: u32 = 32;
-        let net = crate::sim::Net::seeded("pool_budget_concurrent");
+        let net = nat_lab::sim::Net::seeded("pool_budget_concurrent");
         let cfg = PunchConfig {
             packet_budget: BUDGET,
             packets_per_sec: 1_000_000,

@@ -15,21 +15,21 @@
 
 ## 套接字接缝
 
-真实的 NAT 翻译在回环上拦不住，裸 UDP 套接字直接发到目的地。接缝建在套接字创建的地方：`UdpIo` 和 `UdpFactory` 描述一个 UDP 套接字和它的工厂，tokio 工厂是默认值，模拟器插进自己的实现。`test-util` 特性暴露接缝、模拟器和 NAT 实验室。
+真实的 NAT 翻译在回环上拦不住，裸 UDP 套接字直接发到目的地。接缝建在套接字创建的地方：`UdpIo` 和 `UdpFactory` 描述一个 UDP 套接字和它的工厂，tokio 工厂是默认值，测试经 `Puncher::with_factory` 插入任意其他工厂。两个测试引擎在 `nat-lab` crate 里，它是 workspace 成员、藏在 `test-util` 特性之后：`nat_lab::socket` 保持着同样的四方法 trait 形状，`punch_hole::compat` 把两个引擎的主机与套接字桥接到本 crate 的接缝上。
 
 ## 模拟器
 
-`sim::Net` 持有一个路由任务和一张地址表。主机、NAT 和 STUN 服务器都挂在上面，每个虚拟套接字经路由收发，路由施加翻译、过滤、丢包和延迟。
+`nat_lab::sim::Net` 持有一个路由任务和一张地址表。主机、NAT 和 STUN 服务器都挂在上面，每个虚拟套接字经路由收发，路由施加翻译、过滤和丢包。
 
 ```rust,ignore
-let net = sim::Net::seeded("cone_cone_success");  // 用测试名做种子
+let net = nat_lab::Net::seeded("cone_cone_success");  // 用测试名做种子
 let stun = net.stun_server();
-let host = net.host(&sim::NatSpec::cone_apdf());  // 挂在 NAT 后面
+let host = net.host(nat_lab::NatSpec::cone_apdf());  // 挂在 NAT 后面
 ```
 
 `NatSpec` 组合一个映射策略和一个过滤类别。映射策略有 `Cone`、`Sequential { step }`、`AddressSequential { step }` 和 `Random`，预设 `cone_eif()`、`cone_apdf()`、`sequential(step)`、`address_sequential(step)`、`random(range)` 覆盖常见形态。对称预设默认地址相关过滤，即 CGNAT 的常见形态。
 
-路由暴露观测钩子供断言使用：转发与丢弃计数、活跃映射表、峰值映射数，以及一个有界的等映射清空函数。设置 `SIM_TRACE` 环境变量会打印每个转发包，定位故障很快。
+路由暴露观测钩子供断言使用：转发与丢弃计数、活跃映射表、峰值映射数，以及一个有界的等映射清空函数。设置 `NAT_LAB_TRACE` 环境变量会打印每个转发包，定位故障很快。
 
 主机附带故障注入，覆盖干净网络走不到的路径：`drop_first_send_to` 与 `fail_sends_to` 破坏上行，`external_allocations` 像同一运营商 NAT 背后的无关流量一样把序列往前推，`rebind_sequence_after` 在会话中途把端口行走跳到新基点。
 
@@ -37,7 +37,7 @@ let host = net.host(&sim::NatSpec::cone_apdf());  // 挂在 NAT 后面
 
 ## 回环 NAT 实验室
 
-`src/natlab.rs` 里的实验室是跑在真实 OS 套接字上的用户态 NAT 转发器。客户端套接字是普通回环套接字，每个出站数据报穿过一个施加 `NatSpec` 映射与过滤策略的网关任务，每个实验室独占 `127.0.0.0/8` 里的一个地址，同进程内的实验室互不干扰。
+`nat_lab::lab` 里的实验室是跑在真实 OS 套接字上的用户态 NAT 转发器。客户端套接字是普通回环套接字，每个出站数据报穿过一个施加 `NatSpec` 映射与过滤策略的网关任务，每个实验室独占 `127.0.0.0/8` 里的一个地址，同进程内的实验室互不干扰。
 
 实验室覆盖模拟器够不到的事：
 

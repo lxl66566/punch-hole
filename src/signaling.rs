@@ -1,5 +1,7 @@
 //! The signaling bridge between the host transport and the session.
 
+#[cfg(feature = "test-util")]
+use std::sync::Arc;
 use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
@@ -138,6 +140,45 @@ impl SigIo {
     pub(crate) fn rtt(&self) -> Duration {
         self.rtt.unwrap_or(Duration::from_millis(200))
     }
+}
+
+/// Wires two host ends together losslessly, acting as the host transport.
+#[cfg(feature = "test-util")]
+pub fn connect(a: HostEnd, b: HostEnd) {
+    connect_with(a, b, |frame| Some(frame.to_vec()));
+}
+
+/// Wires two host ends through a per-frame tap.
+///
+/// The tap sees each frame as bytes; returning `None` drops it, and the
+/// returned buffer replaces it. Loss, duplication, and version-mangling tests
+/// build their taps on this hook.
+#[cfg(feature = "test-util")]
+pub fn connect_with(
+    a: HostEnd,
+    b: HostEnd,
+    tap: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+) {
+    let tap = Arc::new(tap);
+    let mut a_to_b = a.to_peer;
+    let b_from_a = b.from_peer;
+    let forward_tap = Arc::clone(&tap);
+    tokio::spawn(async move {
+        while let Some(frame) = a_to_b.recv().await {
+            if let Some(bytes) = forward_tap(&frame) {
+                let _ = b_from_a.send(bytes.into()).await;
+            }
+        }
+    });
+    let mut b_to_a = b.to_peer;
+    let a_from_b = a.from_peer;
+    tokio::spawn(async move {
+        while let Some(frame) = b_to_a.recv().await {
+            if let Some(bytes) = tap(&frame) {
+                let _ = a_from_b.send(bytes.into()).await;
+            }
+        }
+    });
 }
 
 #[cfg(test)]

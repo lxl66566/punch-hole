@@ -15,21 +15,21 @@ Unit tests cover classification decisions, prediction fits, the collision model,
 
 ## The socket seam
 
-Real NAT translation cannot be intercepted at loopback, because plain UDP sockets send straight to their destination. The seam sits where sockets are created: `UdpIo` and `UdpFactory` describe a UDP socket and its factory, the tokio factory is the default, and the simulator plugs in its own. The `test-util` feature exposes the seam, the simulator, and the NAT lab.
+Real NAT translation cannot be intercepted at loopback, because plain UDP sockets send straight to their destination. The seam sits where sockets are created: `UdpIo` and `UdpFactory` describe a UDP socket and its factory, the tokio factory is the default, and a test plugs in any other factory through `Puncher::with_factory`. The two test engines live in the `nat-lab` crate, a workspace member behind the `test-util` feature: `nat_lab::socket` carries the same four-method trait shape, and `punch_hole::compat` bridges both engine hosts and sockets onto this crate's seam.
 
 ## The simulator
 
-`sim::Net` owns one router task and an address table. Hosts, NATs, and STUN servers attach to it, every virtual socket sends through the router, and the router applies translation, filtering, loss, and delay.
+`nat_lab::sim::Net` owns one router task and an address table. Hosts, NATs, and STUN servers attach to it, every virtual socket sends through the router, and the router applies translation, filtering, and loss.
 
 ```rust,ignore
-let net = sim::Net::seeded("cone_cone_success");  // seed from the test name
+let net = nat_lab::Net::seeded("cone_cone_success");  // seed from the test name
 let stun = net.stun_server();
-let host = net.host(&sim::NatSpec::cone_apdf());  // behind a NAT
+let host = net.host(nat_lab::NatSpec::cone_apdf());  // behind a NAT
 ```
 
 A `NatSpec` combines a mapping policy and a filtering class. The mapping policies are `Cone`, `Sequential { step }`, `AddressSequential { step }`, and `Random`, and the specs `cone_eif()`, `cone_apdf()`, `sequential(step)`, `address_sequential(step)`, and `random(range)` cover the common shapes. A symmetric spec defaults to address-dependent filtering, the common CGNAT shape.
 
-The router exposes observation hooks for assertions: forwarded and dropped counters, the live mapping table, the peak mapping count, and a bounded wait until every mapping drains. Setting the `SIM_TRACE` environment variable prints every forwarded packet, which narrows failures fast.
+The router exposes observation hooks for assertions: forwarded and dropped counters, the live mapping table, the peak mapping count, and a bounded wait until every mapping drains. Setting the `NAT_LAB_TRACE` environment variable prints every forwarded packet, which narrows failures fast.
 
 Hosts carry fault injection for the paths a clean net never walks: `drop_first_send_to` and `fail_sends_to` break the uplink, `external_allocations` walks a NAT's sequence forward like unrelated traffic behind the same carrier NAT, and `rebind_sequence_after` jumps the port walk to a fresh base mid-session.
 
@@ -37,7 +37,7 @@ Determinism comes from two pieces. All randomness flows through one `StdRng` see
 
 ## The loopback NAT lab
 
-The lab in `src/natlab.rs` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process.
+The lab in `nat_lab::lab` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process.
 
 What the lab covers and the simulator cannot:
 

@@ -10,12 +10,12 @@ use std::{
 };
 
 use common::config;
+use nat_lab::sim::{Mapping, NatSpec, Net};
 use punch_hole::{
     StrategyId,
     error::PunchError,
     msg::decode_sig,
     nat::{NatClass, NatInfo, V4Nat},
-    sim::{Mapping, NatSpec, Net},
 };
 
 #[tokio::test(start_paused = true)]
@@ -145,7 +145,7 @@ async fn cached_nat_info_skips_probe() {
     };
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
-    punch_hole::sim::connect(ha, hb);
+    punch_hole::signaling::connect(ha, hb);
     let session = punch_hole::Puncher::with_factory(config(&stun), a)
         .expect("config valid")
         .with_cached_nat(cached)
@@ -178,7 +178,7 @@ async fn pair_hellos(name: &str, spec: NatSpec, servers: usize) -> Vec<NatInfo> 
     let (hb, lb) = punch_hole::signaling::bridge(64);
     let hellos: Arc<Mutex<Vec<NatInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&hellos);
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         if let Ok(sig) = decode_sig(frame)
             && let punch_hole::msg::Frame::Hello(info) = sig.body
         {
@@ -248,7 +248,7 @@ async fn address_dependent_nat_reads_as_cone() {
     // the cone it cannot distinguish from address dependence.
     let spec = NatSpec {
         mapping: Mapping::AddressSequential { step: 2 },
-        filtering: punch_hole::FilterClass::EndpointIndependent,
+        filtering: nat_lab::FilterClass::EndpointIndependent,
         port_range: 30000..40000,
     };
     let hellos = pair_hellos("adm_reads_cone", spec, 1).await;
@@ -394,20 +394,20 @@ async fn probe_phase_ends_at_its_deadline() {
 /// allocation sequences forward once the Offer leaves, which lands the
 /// drift in the gap between Probe and the punch allocations.
 async fn drift_pair(
-    a: punch_hole::sim::Host,
+    a: nat_lab::sim::Host,
     cfg: punch_hole::PunchConfig,
-    b: punch_hole::sim::Host,
-    drift: Vec<punch_hole::sim::Host>,
+    b: nat_lab::sim::Host,
+    drift: Vec<nat_lab::sim::Host>,
     allocations: usize,
 ) -> (
-    Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>,
-    Result<punch_hole::Punched<punch_hole::sim::SimSocket>, PunchError>,
+    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>,
+    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>,
 ) {
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let armed = Arc::clone(&fired);
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         if !armed.load(std::sync::atomic::Ordering::Relaxed)
             && matches!(
                 decode_sig(frame).map(|f| f.body),
@@ -549,7 +549,7 @@ async fn mid_probe_rebind_degrades_to_hard_sym() {
     let (hb, lb) = punch_hole::signaling::bridge(64);
     let hellos: Arc<Mutex<Vec<NatInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&hellos);
-    punch_hole::sim::connect_with(ha, hb, move |frame| {
+    punch_hole::signaling::connect_with(ha, hb, move |frame| {
         if let Ok(sig) = decode_sig(frame)
             && let punch_hole::msg::Frame::Hello(info) = sig.body
         {
