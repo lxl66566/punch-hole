@@ -33,9 +33,9 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo test
-        run: cargo nextest run --all-features --locked --no-tests pass && cargo test --all-features --locked --doc
+        run: cargo nextest run --workspace --all-features --locked --no-tests pass && cargo test --workspace --all-features --locked --doc
 
   msrv:
     name: cargo check (msrv)
@@ -46,4 +46,4 @@ jobs:
       # Keep the pin in sync with rust-version in Cargo.toml.
       - uses: dtolnay/rust-toolchain@1.88
       - name: cargo check
-        run: cargo check --all-targets --all-features --locked
+        run: cargo check --workspace --all-targets --all-features --locked

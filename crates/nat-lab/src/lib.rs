@@ -72,7 +72,9 @@ pub mod socket;
 
 mod stun;
 
-pub use lab::{LabHost, LabSocket, NatLab, StunServer, stun_responder};
+pub use lab::{
+    Direction, LabHost, LabSocket, NatLab, StunServer, Tap, TapDecision, TapEvent, stun_responder,
+};
 pub use sim::{FilterClass, Host, Mapping, NatSpec, Net, SimSocket};
 pub use socket::{Family, UdpFactory, UdpIo};
 

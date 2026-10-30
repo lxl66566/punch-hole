@@ -8,9 +8,15 @@
 //! unmodified: real STUN probes, classification, strategy, and punch all
 //! observe a translated address, which the pure simulator covers only
 //! without the OS and plain loopback tests cover only without a NAT.
+//!
+//! [`NatLab`] carries the same fault surface as the virtual engine:
+//! data-plane loss, close and idle expiry, uplink faults,
+//! allocation-sequence control, and a per-packet tap.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    fmt,
     hash::{Hash, Hasher},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -19,7 +25,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rand::{prelude::*, rngs::StdRng};
@@ -29,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     MAX_DATAGRAM,
     sim::{FilterClass, Mapping, NatSpec},
-    socket::{UdpFactory, UdpIo},
+    socket::{Family, UdpFactory, UdpIo},
 };
 
 /// Lab addresses drawn in this process: 127.hi.lo.1.
@@ -80,6 +86,22 @@ fn draw_stun_ip() -> io::Result<Ipv4Addr> {
     })
 }
 
+/// Returns one drawn lab address to the registry.
+fn release_lab_ip(ip: Ipv4Addr) {
+    LAB_IPS
+        .lock()
+        .expect("address draw lock")
+        .retain(|v| *v != ip);
+}
+
+/// Returns drawn responder addresses to the registry.
+fn release_stun_ips(ips: &[Ipv4Addr]) {
+    STUN_IPS
+        .lock()
+        .expect("address draw lock")
+        .retain(|ip| !ips.contains(ip));
+}
+
 /// Frame tag of a client datagram on its way out.
 const TAG_OUT: u8 = 1;
 /// Frame tag of a translated datagram on its way back to a client.
@@ -88,6 +110,61 @@ const TAG_IN: u8 = 2;
 const TAG_BYE: u8 = 3;
 /// Frame bytes before the payload: one tag, four address, two port.
 const FRAME_HEADER: usize = 7;
+
+/// Which way one datagram crosses the tap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Client to network, seen after the frame parse and before
+    /// translation.
+    Out,
+    /// Network to client, seen before the inbound filter.
+    In,
+}
+
+/// One datagram at the tap, borrowed for the duration of the call.
+///
+/// `src` and `dst` are the addresses as the NAT sees them: on
+/// [`Direction::Out`] the private client and the intended destination, on
+/// [`Direction::In`] the external sender and the client the mapping
+/// delivers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapEvent<'a> {
+    /// Which way the datagram crosses.
+    pub direction: Direction,
+    /// Sender address as the NAT sees it.
+    pub src: SocketAddr,
+    /// Destination address as the NAT sees it.
+    pub dst: SocketAddr,
+    /// Datagram payload.
+    pub payload: &'a [u8],
+}
+
+/// What the tap decides for one datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TapDecision {
+    /// The datagram crosses unchanged.
+    Forward,
+    /// The datagram drops at the tap.
+    Drop,
+    /// The datagram crosses with this payload in place of the original.
+    Replace(Vec<u8>),
+}
+
+/// A per-packet tap: one callable over every crossing of the lab.
+pub type Tap = Arc<dyn Fn(&TapEvent<'_>) -> TapDecision + Send + Sync>;
+
+/// Uplink faults the lab's host arms.
+///
+/// One lab hosts one peer, so the rules are lab-wide: every socket the
+/// lab's hosts bound consults them before the gateway, and a datagram that
+/// never left the host holds no mapping.
+#[derive(Default)]
+struct UplinkFaults {
+    /// Destinations whose first datagram is dropped before the NAT.
+    drop_first: HashSet<SocketAddr>,
+    /// Destinations no datagram ever leaves the host for.
+    unreachable: HashSet<SocketAddr>,
+}
 
 /// One emulated NAT device. Create with [`NatLab::spawn`].
 pub struct NatLab {
@@ -104,10 +181,28 @@ struct LabInner {
     gateway: Arc<UdpSocket>,
     table: StdMutex<MappingTable>,
     rng: StdMutex<StdRng>,
+    /// Stops the gateway and reaper loops, and through the mapping tokens'
+    /// child relationship every mapping loop too.
+    cancel: CancellationToken,
+    /// Uplink faults every client socket consults before the gateway.
+    ///
+    /// Arc'd beside the lab, so client sockets share the rules without
+    /// holding the whole lab alive.
+    faults: Arc<StdMutex<UplinkFaults>>,
+    /// The per-packet tap, consulted on every crossing.
+    tap: StdMutex<Option<Tap>>,
+    /// Allocation count at which the stepped port walk jumps to a fresh
+    /// base, armed by a test and spent once.
+    rebind: StdMutex<Option<u32>>,
     forwarded: AtomicU32,
     dropped_by_filter: AtomicU32,
+    dropped_by_loss: AtomicU32,
+    idled: AtomicU32,
+    loss_permille: AtomicU32,
     /// Delay between a socket close and its mappings going away.
     mapping_expiry: StdMutex<Duration>,
+    /// Idle time after which an unused mapping is evicted.
+    idle_expiry: StdMutex<Duration>,
 }
 
 /// The mapping set of one lab, always behind one lock.
@@ -147,7 +242,12 @@ struct LabMapping {
     /// Destinations this mapping sent to, which inbound filtering checks.
     dests: Arc<StdMutex<HashSet<SocketAddr>>>,
     /// Fires when the mapping goes away; the task then drops the socket.
+    ///
+    /// A child of the lab token, so the lab's drop releases every mapping
+    /// at once.
     cancel: CancellationToken,
+    /// Last crossing in either direction, which the idle reaper reads.
+    last_seen: StdMutex<Instant>,
 }
 
 impl NatLab {
@@ -157,11 +257,18 @@ impl NatLab {
     /// returns, so a failed spawn leaves nothing behind.
     pub async fn spawn(seed: &str, spec: NatSpec) -> io::Result<Self> {
         let (public_ip, window) = settle_address(&spec)?;
-        let gateway = Arc::new(UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await?);
+        let gateway = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await {
+            Ok(gateway) => gateway,
+            Err(e) => {
+                release_lab_ip(public_ip);
+                return Err(e);
+            },
+        };
         let inner = Arc::new(LabInner {
             spec,
             public_ip,
             window,
+            gateway: Arc::new(gateway),
             table: StdMutex::new(MappingTable {
                 cone: HashMap::new(),
                 sym: HashMap::new(),
@@ -169,12 +276,22 @@ impl NatLab {
                 peak: 0,
             }),
             rng: StdMutex::new(seeded_rng(seed)),
-            gateway,
+            cancel: CancellationToken::new(),
+            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
+            tap: StdMutex::new(None),
+            rebind: StdMutex::new(None),
             forwarded: AtomicU32::new(0),
             dropped_by_filter: AtomicU32::new(0),
+            dropped_by_loss: AtomicU32::new(0),
+            idled: AtomicU32::new(0),
+            loss_permille: AtomicU32::new(0),
             mapping_expiry: StdMutex::new(Duration::ZERO),
+            idle_expiry: StdMutex::new(Duration::ZERO),
         });
         tokio::spawn(gateway_loop(Arc::clone(&inner)));
+        // One reaper per lab, alive from the spawn: enabling the idle
+        // timer needs no extra synchronization.
+        tokio::spawn(idle_reaper(Arc::clone(&inner)));
         Ok(Self { inner })
     }
 
@@ -194,8 +311,9 @@ impl NatLab {
 
     /// The port window the lab allocates from.
     ///
-    /// Discovery moves the window past ports the OS excludes, so tests
-    /// read port positions relative to this range.
+    /// Discovery moves the window past ports the OS excludes and verifies
+    /// at most [`MAX_WINDOW_PORTS`] of them, so tests read port positions
+    /// relative to this range.
     #[must_use]
     pub fn port_window(&self) -> Range<u16> {
         self.inner.window.clone()
@@ -205,9 +323,44 @@ impl NatLab {
     ///
     /// The default of zero releases mappings at close. A nonzero delay
     /// models the tens of seconds a real NAT keeps translating after the
-    /// loser socket of a punch went away.
+    /// loser socket of a punch went away. Mappings a rebound socket opens
+    /// on the same private port during the window outlive the release.
     pub fn set_mapping_expiry(&self, expiry: Duration) {
         *self.inner.mapping_expiry.lock().expect("expiry lock") = expiry;
+    }
+
+    /// Sets data-plane loss in permille, applied by the gateway.
+    ///
+    /// Each crossing drops with probability `permille`/1000, drawing from
+    /// the lab's seeded generator. Outbound loss follows translation, so a
+    /// dropped datagram still opened its mapping; inbound loss precedes
+    /// the filter, like the virtual engine's router.
+    pub fn set_loss(&self, permille: u32) {
+        self.inner.loss_permille.store(permille, Ordering::Relaxed);
+    }
+
+    /// Sets how long a mapping survives without traffic in either
+    /// direction, like a real NAT's UDP refresh timer per RFC 4787.
+    ///
+    /// The default of zero disables eviction. Every datagram the mapping
+    /// translates out and every datagram arriving on its public socket
+    /// restarts the timer; an expired mapping is evicted with its external
+    /// port released, counted by [`NatLab::idled_mappings`].
+    pub fn set_idle_expiry(&self, expiry: Duration) {
+        *self.inner.idle_expiry.lock().expect("idle expiry lock") = expiry;
+    }
+
+    /// Installs or removes the per-packet tap.
+    ///
+    /// The tap sees every crossing once: outbound after the frame parse
+    /// and before translation, inbound before the filter check. A `Drop`
+    /// decision loses the datagram, and a `Replace` forwards the given
+    /// payload instead; a replacement longer than [`MAX_DATAGRAM`] drops
+    /// the datagram like an oversize one. Installing or removing takes
+    /// effect between datagrams: each crossing consults the tap installed
+    /// at that moment and never observes a torn decision.
+    pub fn set_tap(&self, tap: Option<Tap>) {
+        *self.inner.tap.lock().expect("tap lock") = tap;
     }
 
     /// Live mappings.
@@ -242,6 +395,18 @@ impl NatLab {
         self.inner.dropped_by_filter.load(Ordering::Relaxed)
     }
 
+    /// Crossings the loss setting dropped, outbound plus inbound.
+    #[must_use]
+    pub fn dropped_by_loss(&self) -> u32 {
+        self.inner.dropped_by_loss.load(Ordering::Relaxed)
+    }
+
+    /// Mappings the idle reaper evicted.
+    #[must_use]
+    pub fn idled_mappings(&self) -> u32 {
+        self.inner.idled.load(Ordering::Relaxed)
+    }
+
     /// Waits until every mapping is gone, bounded by five real seconds.
     pub async fn wait_mappings_drained(&self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -251,17 +416,37 @@ impl NatLab {
     }
 }
 
+impl Drop for NatLab {
+    fn drop(&mut self) {
+        // Stops the gateway and reaper loops; the mapping tokens are
+        // children, so their receive loops wind down with them.
+        self.inner.cancel.cancel();
+        // Releasing the table drops the table-side references, so the
+        // public sockets close once the receive loops exit.
+        let mut table = self.inner.table.lock().expect("mapping table lock");
+        table.cone.clear();
+        table.sym.clear();
+        // The drawn address returns to the registry, so a long-lived
+        // process can spawn another lab on it.
+        release_lab_ip(self.inner.public_ip);
+    }
+}
+
 /// Draws one lab address together with its bindable port window.
 ///
 /// A twin process that squats the drawn address leaves no bindable port,
-/// so discovery repeats over fresh addresses.
+/// so discovery repeats over fresh addresses; a draw whose discovery
+/// failed returns to the registry.
 fn settle_address(spec: &NatSpec) -> io::Result<(Ipv4Addr, Range<u16>)> {
     let mut last = None;
     for _ in 0..8 {
         let ip = draw_lab_ip()?;
         match discover_window(ip, &spec.port_range) {
             Ok(window) => return Ok((ip, window)),
-            Err(e) => last = Some(e),
+            Err(e) => {
+                release_lab_ip(ip);
+                last = Some(e);
+            },
         }
     }
     Err(last.expect("eight draws all failed"))
@@ -290,10 +475,13 @@ fn snapshot(table: &MappingTable, public_ip: Ipv4Addr) -> Vec<(SocketAddr, Socke
 async fn gateway_loop(inner: Arc<LabInner>) {
     let mut buf = [0u8; FRAME_HEADER + MAX_DATAGRAM];
     loop {
-        let (len, from) = match inner.gateway.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) if is_link_reset(&e) => continue,
-            Err(_) => break,
+        let (len, from) = tokio::select! {
+            () = inner.cancel.cancelled() => break,
+            result = inner.gateway.recv_from(&mut buf) => match result {
+                Ok(v) => v,
+                Err(e) if is_link_reset(&e) => continue,
+                Err(_) => break,
+            },
         };
         let Some((tag, addr, payload)) = parse_frame(&buf[..len]) else {
             continue;
@@ -301,9 +489,15 @@ async fn gateway_loop(inner: Arc<LabInner>) {
         match tag {
             TAG_OUT => {
                 let Some(dst) = addr else { continue };
+                // The tap sees the datagram before translation, so a tap
+                // drop opens no mapping.
+                let Some(payload) = apply_tap(&inner.tap, Direction::Out, from, dst, payload)
+                else {
+                    continue;
+                };
                 // A bind failure means the window ran dry; the datagram is
                 // lost, as a full NAT would lose it.
-                let _ = outbound(&inner, from, dst, payload).await;
+                let _ = outbound(&inner, from, dst, &payload).await;
             },
             TAG_BYE => client_closed(&inner, from),
             // In frames travel to client sockets only.
@@ -313,6 +507,9 @@ async fn gateway_loop(inner: Arc<LabInner>) {
 }
 
 /// Translates one client datagram through its mapping and sends it out.
+///
+/// Loss follows translation, so a dropped datagram still opened its
+/// mapping, like the virtual engine's send path.
 async fn outbound(
     inner: &Arc<LabInner>,
     client: SocketAddr,
@@ -320,6 +517,12 @@ async fn outbound(
     payload: &[u8],
 ) -> io::Result<()> {
     let mapping = translate_outbound(inner, client, dst)?;
+    touch(&mapping);
+    if loses(inner) {
+        inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
+        trace(format_args!("LAB loss drop out {client} -> {dst}"));
+        return Ok(());
+    }
     mapping.ext.send_to(payload, dst).await?;
     inner.forwarded.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -380,7 +583,7 @@ fn allocate_mapping(
     // Candidates are tried until one binds, which covers a port stolen
     // after the window discovery.
     let mut budget = len as usize + 8;
-    let ext = loop {
+    loop {
         if budget == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -399,6 +602,7 @@ fn allocate_mapping(
             Mapping::Sequential { step } | Mapping::AddressSequential { step } => {
                 let n = table.next_alloc as i64;
                 table.next_alloc += 1;
+                let n = apply_rebind(inner, table, n);
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },
@@ -415,29 +619,62 @@ fn allocate_mapping(
                 }
             },
         };
-        if let Ok(sock) = bind_public(inner.public_ip, port) {
-            break Arc::new(sock);
-        }
-    };
-    let ext_port = ext
-        .local_addr()
-        .expect("bound socket reports its address")
-        .port();
-    let mapping = Arc::new(LabMapping {
-        client,
-        ext_port,
-        ext,
-        dests: Arc::new(StdMutex::new(HashSet::new())),
-        cancel: CancellationToken::new(),
-    });
-    tokio::spawn(mapping_loop(Arc::clone(inner), Arc::clone(&mapping)));
-    Ok(mapping)
+        let Ok(sock) = bind_public(inner.public_ip, port) else {
+            continue;
+        };
+        let ext_port = sock
+            .local_addr()
+            .expect("bound socket reports its address")
+            .port();
+        trace(format_args!(
+            "LAB alloc client={client} ext={}",
+            SocketAddr::V4(SocketAddrV4::new(inner.public_ip, ext_port))
+        ));
+        let mapping = Arc::new(LabMapping {
+            client,
+            ext_port,
+            ext: Arc::new(sock),
+            dests: Arc::new(StdMutex::new(HashSet::new())),
+            last_seen: StdMutex::new(Instant::now()),
+            // A child of the lab token, so the lab's drop releases every
+            // mapping at once.
+            cancel: inner.cancel.child_token(),
+        });
+        tokio::spawn(mapping_loop(Arc::clone(inner), Arc::clone(&mapping)));
+        return Ok(mapping);
+    }
+}
+
+/// Applies the armed rebind once the allocation count passes its arming
+/// point: the stepped walk jumps forward and the fault disarms, so the
+/// sequence continues from a fresh base like a router rebind.
+fn apply_rebind(inner: &LabInner, table: &mut MappingTable, n: i64) -> i64 {
+    let mut fault = inner.rebind.lock().expect("rebind fault lock");
+    match *fault {
+        Some(at) if n >= i64::from(at) => {
+            // The jump draws from the seeded generator and lands the walk
+            // well clear of the ports it just left for common widths.
+            let jump = i64::from(
+                inner
+                    .rng
+                    .lock()
+                    .expect("rng lock")
+                    .random_range(3_000..4_000u32),
+            );
+            table.next_alloc += jump as u64;
+            *fault = None;
+            trace(format_args!("LAB rebind alloc={n} jump={jump}"));
+            n + jump
+        },
+        _ => n,
+    }
 }
 
 /// Serves the public socket of one mapping.
 ///
-/// Inbound datagrams pass the filter check and reach the client as In
-/// frames through the gateway socket; filter failures count as drops.
+/// Inbound datagrams pass the loss draw, the tap, and the filter check in
+/// that order, then reach the client as In frames through the gateway
+/// socket; filter failures count as drops.
 async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut wire = [0u8; FRAME_HEADER + MAX_DATAGRAM];
@@ -447,8 +684,25 @@ async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
             () = mapping.cancel.cancelled() => break,
             result = recv => match result {
                 Ok((len, src)) => {
+                    // Any arrival on the public socket restarts the idle
+                    // timer.
+                    touch(&mapping);
+                    if loses(&inner) {
+                        inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
+                        trace(format_args!("LAB loss drop in {src} -> {}", mapping.client));
+                        continue;
+                    }
+                    let Some(payload) =
+                        apply_tap(&inner.tap, Direction::In, src, mapping.client, &buf[..len])
+                    else {
+                        continue;
+                    };
                     if !allows(inner.spec.filtering, &mapping.dests, src) {
                         inner.dropped_by_filter.fetch_add(1, Ordering::Relaxed);
+                        trace(format_args!(
+                            "LAB filter drop {src} ext={}",
+                            SocketAddr::V4(SocketAddrV4::new(inner.public_ip, mapping.ext_port))
+                        ));
                         continue;
                     }
                     // A v4 socket hears from v4 peers only.
@@ -456,12 +710,12 @@ async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
                         continue;
                     };
                     write_header(&mut wire, TAG_IN, src_v4);
-                    wire[FRAME_HEADER..FRAME_HEADER + len].copy_from_slice(&buf[..len]);
+                    wire[FRAME_HEADER..FRAME_HEADER + payload.len()].copy_from_slice(&payload);
                     // A failed delivery only loses this datagram, like a
                     // NAT whose client went away.
                     if inner
                         .gateway
-                        .send_to(&wire[..FRAME_HEADER + len], mapping.client)
+                        .send_to(&wire[..FRAME_HEADER + payload.len()], mapping.client)
                         .await
                         .is_ok()
                     {
@@ -485,20 +739,125 @@ fn allows(filtering: FilterClass, dests: &StdMutex<HashSet<SocketAddr>>, src: So
     }
 }
 
+/// Evicts mappings idle past the inactivity expiry.
+///
+/// The reaper runs from the spawn and idles while the expiry is zero, so
+/// enabling the timer needs no extra synchronization.
+async fn idle_reaper(inner: Arc<LabInner>) {
+    loop {
+        let expiry = *inner.idle_expiry.lock().expect("idle expiry lock");
+        // The tick tracks the expiry, bounded so a huge setting still
+        // polls and a tiny one still yields.
+        let tick = if expiry.is_zero() {
+            Duration::from_millis(200)
+        } else {
+            (expiry / 4).clamp(Duration::from_millis(10), Duration::from_secs(1))
+        };
+        tokio::select! {
+            () = inner.cancel.cancelled() => break,
+            () = tokio::time::sleep(tick) => {},
+        }
+        if expiry.is_zero() {
+            continue;
+        }
+        let now = Instant::now();
+        let expired: Vec<Arc<LabMapping>> = {
+            let table = inner.table.lock().expect("mapping table lock");
+            table
+                .cone
+                .values()
+                .chain(table.sym.values())
+                .filter(|mapping| {
+                    let last = *mapping.last_seen.lock().expect("last seen lock");
+                    now.saturating_duration_since(last) >= expiry
+                })
+                .cloned()
+                .collect()
+        };
+        if expired.is_empty() {
+            continue;
+        }
+        for mapping in &expired {
+            trace(format_args!(
+                "LAB idle evict client={} ext={}",
+                mapping.client,
+                SocketAddr::V4(SocketAddrV4::new(inner.public_ip, mapping.ext_port))
+            ));
+        }
+        let removed = release_captured(&inner, &expired);
+        inner.idled.fetch_add(removed as u32, Ordering::Relaxed);
+    }
+}
+
 /// Releases a closed client's mappings, honoring the expiry setting.
 fn client_closed(inner: &Arc<LabInner>, client: SocketAddr) {
     let expiry = *inner.mapping_expiry.lock().expect("expiry lock");
     if expiry.is_zero() {
         forget_client(inner, client);
-    } else {
-        // The mappings keep translating for the expiry window, like a
-        // router honoring its timer after the socket closed.
-        let inner = Arc::clone(inner);
-        tokio::spawn(async move {
-            tokio::time::sleep(expiry).await;
-            forget_client(&inner, client);
-        });
+        return;
     }
+    // The mappings keep translating for the expiry window, like a router
+    // honoring its timer after the socket closed. The capture holds the
+    // mappings alive at Bye: the OS may reassign the private port during
+    // the window, and a rebound socket's fresh mappings must outlive this
+    // release.
+    let captured = capture_client(inner, client);
+    if captured.is_empty() {
+        return;
+    }
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        tokio::select! {
+            () = inner.cancel.cancelled() => {},
+            () = tokio::time::sleep(expiry) => {
+                release_captured(&inner, &captured);
+            },
+        }
+    });
+}
+
+/// The mappings of one client alive right now, left in the table.
+fn capture_client(inner: &LabInner, client: SocketAddr) -> Vec<Arc<LabMapping>> {
+    let table = inner.table.lock().expect("mapping table lock");
+    let mut captured = Vec::new();
+    if let Some(mapping) = table.cone.get(&client) {
+        captured.push(Arc::clone(mapping));
+    }
+    captured.extend(
+        table
+            .sym
+            .values()
+            .filter(|mapping| mapping.client == client)
+            .cloned(),
+    );
+    captured
+}
+
+/// Removes exactly `captured` mappings from the table and cancels their
+/// tokens, closing the public sockets.
+///
+/// The removal matches by identity, so a mapping a rebound socket opened
+/// on the same private port during the wait survives. Returns how many
+/// mappings left the table.
+fn release_captured(inner: &LabInner, captured: &[Arc<LabMapping>]) -> usize {
+    if captured.is_empty() {
+        return 0;
+    }
+    let mut table = inner.table.lock().expect("mapping table lock");
+    let before = table.cone.len() + table.sym.len();
+    table
+        .cone
+        .retain(|_, mapping| !captured.iter().any(|c| Arc::ptr_eq(c, mapping)));
+    table
+        .sym
+        .retain(|_, mapping| !captured.iter().any(|c| Arc::ptr_eq(c, mapping)));
+    let removed = before - (table.cone.len() + table.sym.len());
+    drop(table);
+    // Each receive task owns one socket reference; the token releases it.
+    for mapping in captured {
+        mapping.cancel.cancel();
+    }
+    removed
 }
 
 /// Removes every mapping of one client and closes its public sockets.
@@ -522,10 +881,128 @@ fn forget_client(inner: &LabInner, client: SocketAddr) {
     }
 }
 
+/// Marks one crossing on the mapping's idle timer.
+fn touch(mapping: &LabMapping) {
+    *mapping.last_seen.lock().expect("last seen lock") = Instant::now();
+}
+
+/// Whether the lab drops one crossing, drawing from the seeded generator.
+fn loses(inner: &LabInner) -> bool {
+    let permille = inner.loss_permille.load(Ordering::Relaxed);
+    permille > 0 && inner.rng.lock().expect("rng lock").random_range(0..1000) < permille
+}
+
+/// Consults the installed tap for one crossing and returns the payload to
+/// forward, or `None` when the tap drops the datagram.
+///
+/// A `Replace` payload over [`MAX_DATAGRAM`] drops the datagram like an
+/// oversize one. The tap clones out of its slot, so a tap that re-enters
+/// the lab cannot deadlock the crossing, and an install or removal takes
+/// effect between datagrams.
+fn apply_tap<'a>(
+    tap: &StdMutex<Option<Tap>>,
+    direction: Direction,
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: &'a [u8],
+) -> Option<Cow<'a, [u8]>> {
+    let tap = tap.lock().expect("tap lock").clone();
+    let event = TapEvent {
+        direction,
+        src,
+        dst,
+        payload,
+    };
+    match tap.as_ref().map(|tap| tap(&event)) {
+        Some(TapDecision::Forward) | None => Some(Cow::Borrowed(payload)),
+        Some(TapDecision::Drop) => {
+            trace(format_args!("LAB tap drop {direction:?} {src} -> {dst}"));
+            None
+        },
+        Some(TapDecision::Replace(replacement)) if replacement.len() > MAX_DATAGRAM => {
+            trace(format_args!(
+                "LAB tap drop {direction:?} {src} -> {dst} oversize"
+            ));
+            None
+        },
+        Some(TapDecision::Replace(replacement)) => Some(Cow::Owned(replacement)),
+    }
+}
+
+/// Prints one trace line when `NAT_LAB_TRACE` is set, like the simulator.
+fn trace(args: fmt::Arguments<'_>) {
+    if std::env::var_os("NAT_LAB_TRACE").is_some() {
+        eprintln!("[lab] {args}");
+    }
+}
+
 /// Factory that binds client sockets behind one lab NAT.
 #[derive(Clone)]
 pub struct LabHost {
     inner: Arc<LabInner>,
+}
+
+impl LabHost {
+    /// Drops the first datagram this lab sends to `target` before it
+    /// reaches the NAT, so the destination holds no mapping until the
+    /// sender retransmits.
+    ///
+    /// One lab hosts one peer, so the rule covers every socket the lab's
+    /// hosts bound, and it is one-shot: the next datagram to `target`
+    /// crosses.
+    pub fn drop_first_send_to(&self, target: SocketAddr) {
+        self.inner
+            .faults
+            .lock()
+            .expect("uplink fault lock")
+            .drop_first
+            .insert(target);
+    }
+
+    /// Fails every send to `target` locally, like a route that never
+    /// leaves the host.
+    ///
+    /// One lab hosts one peer, so the rule covers every socket the lab's
+    /// hosts bound.
+    pub fn fail_sends_to(&self, target: SocketAddr) {
+        self.inner
+            .faults
+            .lock()
+            .expect("uplink fault lock")
+            .unreachable
+            .insert(target);
+    }
+
+    /// Walks the lab allocation sequence forward by `count` mappings, like
+    /// other users of the same carrier NAT allocating between the phases
+    /// of a session.
+    ///
+    /// One scratch socket sends a datagram to `count` distinct
+    /// documentation-range destinations and closes at once, so only the
+    /// sequence position moves; no mapping survives.
+    pub async fn external_allocations(&self, count: usize) {
+        let Ok(sock) = self.bind(Family::V4.any_addr()).await else {
+            return;
+        };
+        for i in 0..count {
+            // Documentation-range addresses that route to nobody, varying
+            // the IP so an address-dependent NAT allocates per destination
+            // too.
+            let dst = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(198, 51, 100, (i % 254 + 1) as u8),
+                9000 + (i / 254) as u16,
+            ));
+            let _ = sock.send_to(b"x", dst).await;
+        }
+        drop(sock);
+    }
+
+    /// Jumps the lab allocation sequence to a fresh base once
+    /// `allocations` mappings exist, like a router rebind that restarts
+    /// the port walk. Applies to the stepped symmetric walks only.
+    pub fn rebind_sequence_after(&self, allocations: u32) {
+        *self.inner.rebind.lock().expect("rebind fault lock") = Some(allocations);
+    }
 }
 
 impl UdpFactory for LabHost {
@@ -546,6 +1023,7 @@ impl UdpFactory for LabHost {
         Ok(LabSocket {
             sock,
             gateway,
+            faults: Arc::clone(&self.inner.faults),
             send_wire: tokio::sync::Mutex::new(frame()),
             recv_wire: tokio::sync::Mutex::new(frame()),
         })
@@ -560,12 +1038,28 @@ impl UdpFactory for LabHost {
 pub struct LabSocket {
     sock: UdpSocket,
     gateway: SocketAddr,
+    /// Uplink faults the socket consults before the gateway.
+    faults: Arc<StdMutex<UplinkFaults>>,
     send_wire: tokio::sync::Mutex<Vec<u8>>,
     recv_wire: tokio::sync::Mutex<Vec<u8>>,
 }
 
 impl UdpIo for LabSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        {
+            let mut faults = self.faults.lock().expect("uplink fault lock");
+            if faults.unreachable.contains(&target) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NetworkUnreachable,
+                    "lab uplink fault: destination unreachable",
+                ));
+            }
+            if faults.drop_first.remove(&target) {
+                // The datagram reports success and never reaches the NAT,
+                // so the destination holds no mapping yet.
+                return Ok(buf.len());
+            }
+        }
         // The gateway's receive buffer fits one framed data packet, so a
         // longer payload has no path through the lab.
         if buf.len() > MAX_DATAGRAM {
@@ -611,7 +1105,8 @@ impl UdpIo for LabSocket {
 impl Drop for LabSocket {
     fn drop(&mut self) {
         // Best effort from a sync context; a lost Bye only keeps the
-        // mapping alive until the lab goes away.
+        // mapping alive until the lab goes away, and a Bye after the lab
+        // died fails to send and is ignored.
         let _ = self.sock.try_send_to(&[TAG_BYE], self.gateway);
     }
 }
@@ -665,14 +1160,28 @@ fn bind_public(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
     UdpSocket::from_std(sock)
 }
 
+/// Widest port window discovery verifies, whatever the spec asks for.
+///
+/// A wide spec spans some 64k ports, and probing each costs one bind and
+/// one close per spawn, so the scan verifies at most this many ports and
+/// the window covers the first such run.
+const MAX_WINDOW_PORTS: u32 = 1024;
+
+/// Bind attempts one window discovery spends before falling back to the
+/// longest run found, so a long OS-reserved stretch cannot stall a spawn.
+const MAX_WINDOW_BINDS: u32 = 4096;
+
 /// Finds the mapping port window on one public address.
 ///
 /// Explicit binds fail on ports the OS excludes, Windows reserves chunks
 /// machine-wide, and on ports another process holds. The scan takes the
 /// first run of bindable ports at or after the requested start that fits
-/// the whole window, so the window keeps its width and only its position
-/// moves. When no full-width run exists the longest run wins, which
-/// narrows the window instead of failing the spawn.
+/// the window, so the window keeps its width and only its position moves.
+/// Two caps keep the scan cheap: at most [`MAX_WINDOW_PORTS`] ports are
+/// verified, and at most [`MAX_WINDOW_BINDS`] binds are attempted before
+/// the scan falls back to the longest run found, which narrows the window
+/// instead of failing the spawn. Every port of the returned window bound
+/// during the scan.
 fn discover_window(ip: Ipv4Addr, requested: &Range<u16>) -> io::Result<Range<u16>> {
     if requested.start >= requested.end {
         return Err(io::Error::new(
@@ -687,12 +1196,22 @@ fn discover_window(ip: Ipv4Addr, requested: &Range<u16>) -> io::Result<Range<u16
 }
 
 /// Scans upward from `first` for the first run of `width` bindable ports.
+///
+/// `width` caps at [`MAX_WINDOW_PORTS`], and the scan spends at most
+/// [`MAX_WINDOW_BINDS`] bind attempts before returning the longest run
+/// found.
 fn scan_window(first: u16, width: u32, bindable: impl Fn(u16) -> bool) -> io::Result<Range<u16>> {
+    let width = width.min(MAX_WINDOW_PORTS);
     // Longest bindable run so far, as (start, length).
     let mut best = (first, 0u32);
     let mut run_start = first;
     let mut run_len = 0u32;
+    let mut budget = MAX_WINDOW_BINDS;
     for port in first..=u16::MAX {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
         if bindable(port) {
             run_len += 1;
             if run_len >= width {
@@ -709,6 +1228,8 @@ fn scan_window(first: u16, width: u32, bindable: impl Fn(u16) -> bool) -> io::Re
             run_start = port.saturating_add(1);
         }
     }
+    // The scan stopped on the budget or the last port; the trailing run
+    // holds verified ports and competes with the best run.
     if run_len > best.1 {
         best = (run_start, run_len);
     }
@@ -740,6 +1261,17 @@ fn seeded_rng(seed: &str) -> StdRng {
 pub struct StunServer {
     /// `host:port` strings for `PunchConfig::stun_servers`.
     pub addrs: Vec<String>,
+    /// Stops the responder loops.
+    cancel: CancellationToken,
+    /// Drawn addresses, returned to the registry on drop.
+    ips: Vec<Ipv4Addr>,
+}
+
+impl Drop for StunServer {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        release_stun_ips(&self.ips);
+    }
 }
 
 /// Starts a STUN responder over two dedicated loopback addresses.
@@ -767,15 +1299,24 @@ pub fn stun_responder() -> io::Result<StunServer> {
             .iter()
             .all(|&(ip, port)| bind_public(ip, port).map(|s| sockets.push(s)).is_ok());
         if bound {
+            let cancel = CancellationToken::new();
             for sock in sockets {
-                tokio::spawn(stun_loop(sock));
+                tokio::spawn(stun_loop(sock, cancel.clone()));
             }
             let addrs = layout
                 .iter()
                 .map(|&(ip, port)| format!("{ip}:{port}"))
                 .collect();
-            return Ok(StunServer { addrs });
+            return Ok(StunServer {
+                addrs,
+                cancel,
+                ips: vec![first, second],
+            });
         }
+        // The failed draw never became a responder, so both addresses go
+        // back for the next attempt.
+        drop(sockets);
+        release_stun_ips(&[first, second]);
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
@@ -783,18 +1324,22 @@ pub fn stun_responder() -> io::Result<StunServer> {
     ))
 }
 
-/// Answers binding requests on one STUN socket.
-async fn stun_loop(sock: UdpSocket) {
+/// Answers binding requests on one STUN socket until the server drops.
+async fn stun_loop(sock: UdpSocket, cancel: CancellationToken) {
     let mut buf = [0u8; 128];
     loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((len, from)) => {
-                if let Some(reply) = crate::stun::binding_reply(&buf[..len], from) {
-                    let _ = sock.send_to(&reply, from).await;
-                }
+        let recv = sock.recv_from(&mut buf);
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            result = recv => match result {
+                Ok((len, from)) => {
+                    if let Some(reply) = crate::stun::binding_reply(&buf[..len], from) {
+                        let _ = sock.send_to(&reply, from).await;
+                    }
+                },
+                Err(e) if is_link_reset(&e) => {},
+                Err(_) => break,
             },
-            Err(e) if is_link_reset(&e) => {},
-            Err(_) => break,
         }
     }
 }
@@ -887,10 +1432,27 @@ mod tests {
     }
 
     #[test]
+    fn window_scan_caps_the_verified_width() {
+        // A wide request verifies at most MAX_WINDOW_PORTS ports: the run
+        // past the conflict at 3 closes at the capped width.
+        let window = scan_window(1, u32::from(u16::MAX), |port| port != 3).expect("a run fits");
+        assert_eq!(window, 4..4 + MAX_WINDOW_PORTS as u16);
+    }
+
+    #[test]
+    fn window_scan_budget_falls_back_to_the_longest_run() {
+        // The only bindable run holds 100 ports, and the budget runs out
+        // long before any full-width run could exist, so the scan returns
+        // the run it verified.
+        let window = scan_window(1, MAX_WINDOW_PORTS, |port| port <= 100).expect("a run exists");
+        assert_eq!(window, 1..101);
+    }
+
+    #[test]
     fn window_scan_clamps_a_run_touching_the_last_port() {
         // The longest run ends at 65535, which no u16 range end can
         // express, so the window ends at 65534.
-        let window = scan_window(1, 10, |port| port >= 65_530).expect("a run exists");
+        let window = scan_window(65_520, 10, |port| port >= 65_530).expect("a run exists");
         assert_eq!(window, 65_530..u16::MAX);
         assert!(scan_window(1, 2, |_| false).is_err());
     }
@@ -1039,5 +1601,396 @@ mod tests {
         lab.wait_mappings_drained().await;
         assert_eq!(lab.mapping_count(), 0);
         assert_eq!(lab.peak_mappings(), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_release_spares_a_rebound_socket() {
+        let lab = NatLab::spawn(
+            "rebound",
+            spec(
+                Mapping::Sequential { step: 1 },
+                FilterClass::AddressDependent,
+            ),
+        )
+        .await
+        .expect("lab spawns");
+        lab.set_mapping_expiry(Duration::from_millis(800));
+        let d_old = dest().await;
+        let d_new = dest().await;
+        let private = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 31_111);
+        {
+            let client = lab.host().bind(private).await.expect("client binds");
+            client
+                .send_to(b"old", d_old.local_addr().expect("dest addr"))
+                .await
+                .expect("first send");
+            wait_mappings(&lab, 1).await;
+        }
+        // The Bye reaches the gateway before the rebind, so the capture at
+        // Bye time holds the first mapping only.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = {
+            // The closed socket frees its port; a lingering hold clears
+            // within moments.
+            let host = lab.host();
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                match host.bind(private).await {
+                    Ok(sock) => break sock,
+                    Err(e) if tries < 10 => {
+                        assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "rebind: {e}");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    },
+                    Err(e) => panic!("rebind: {e}"),
+                }
+            }
+        };
+        client
+            .send_to(b"new", d_new.local_addr().expect("dest addr"))
+            .await
+            .expect("second send");
+        wait_mappings(&lab, 2).await;
+
+        // The window passes: the mapping captured at Bye goes away and the
+        // rebound socket's fresh mapping survives.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(lab.mapping_count(), 1);
+        let window = lab.port_window();
+        assert_eq!(
+            lab.mappings_snapshot()[0].1.port(),
+            window.start + 1,
+            "the rebound socket's mapping survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_evicts_and_traffic_refreshes() {
+        let lab = NatLab::spawn(
+            "idle",
+            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        )
+        .await
+        .expect("lab spawns");
+        lab.set_idle_expiry(Duration::from_millis(300));
+        let d = dest().await;
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        let target = d.local_addr().expect("dest addr");
+
+        // Periodic traffic keeps one mapping alive past several expiries.
+        for _ in 0..8 {
+            client.send_to(b"tick", target).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(lab.mapping_count(), 1, "traffic refreshes the timer");
+            assert_eq!(lab.idled_mappings(), 0);
+        }
+
+        // With traffic stopped, the reaper evicts and counts.
+        lab.wait_mappings_drained().await;
+        assert_eq!(lab.mapping_count(), 0);
+        assert_eq!(lab.idled_mappings(), 1);
+    }
+
+    #[tokio::test]
+    async fn loss_drops_both_directions_and_counts_them() {
+        let lab = NatLab::spawn(
+            "loss",
+            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        )
+        .await
+        .expect("lab spawns");
+        lab.set_loss(1000);
+        let d = dest().await;
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+
+        // Outbound: every datagram drops, and the mapping still opens.
+        client
+            .send_to(b"out", d.local_addr().expect("dest addr"))
+            .await
+            .expect("send");
+        wait_counter(|| lab.dropped_by_loss(), 1).await;
+        assert_eq!(lab.mapping_count(), 1);
+        assert_eq!(lab.forwarded(), 0);
+
+        // Inbound: the reply drops before the filter and never arrives.
+        let ext = lab.mappings_snapshot()[0].1;
+        d.send_to(b"in", ext).await.expect("reply send");
+        wait_counter(|| lab.dropped_by_loss(), 2).await;
+        assert_eq!(lab.forwarded(), 0);
+        assert_eq!(lab.dropped_by_filter(), 0);
+
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "no datagram survives a total loss uplink"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_first_send_holds_the_mapping_back() {
+        let lab = NatLab::spawn(
+            "drop_first",
+            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        )
+        .await
+        .expect("lab spawns");
+        let host = lab.host();
+        let d = dest().await;
+        let target = d.local_addr().expect("dest addr");
+        host.drop_first_send_to(target);
+        let client = host
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+
+        // The first datagram reports success and never reaches the NAT.
+        client.send_to(b"one", target).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(lab.mapping_count(), 0);
+
+        // The retransmission crosses and opens the mapping.
+        client.send_to(b"two", target).await.expect("send");
+        let (payload, _) = recv(&d).await;
+        assert_eq!(payload, b"two");
+        wait_mappings(&lab, 1).await;
+    }
+
+    #[tokio::test]
+    async fn fail_sends_to_reports_unreachable() {
+        let lab = NatLab::spawn(
+            "fail_sends",
+            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        )
+        .await
+        .expect("lab spawns");
+        let host = lab.host();
+        let d = dest().await;
+        let target = d.local_addr().expect("dest addr");
+        host.fail_sends_to(target);
+        let client = host
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+
+        let err = client
+            .send_to(b"x", target)
+            .await
+            .expect_err("the send fails locally");
+        assert_eq!(err.kind(), io::ErrorKind::NetworkUnreachable);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(lab.mapping_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_allocations_advance_the_walk() {
+        let lab = NatLab::spawn(
+            "ext_alloc",
+            spec(
+                Mapping::Sequential { step: 1 },
+                FilterClass::AddressDependent,
+            ),
+        )
+        .await
+        .expect("lab spawns");
+        lab.host().external_allocations(3).await;
+        let d = dest().await;
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        client
+            .send_to(b"hi", d.local_addr().expect("dest addr"))
+            .await
+            .expect("send");
+
+        // The scratch datagrams consumed the first three slots of the walk.
+        let (_, from) = recv(&d).await;
+        assert_eq!(from.port(), lab.port_window().start + 3);
+    }
+
+    #[tokio::test]
+    async fn rebind_sequence_jumps_after_the_arming_count() {
+        let lab = NatLab::spawn(
+            "rebind_seq",
+            spec(
+                Mapping::Sequential { step: 2 },
+                FilterClass::AddressDependent,
+            ),
+        )
+        .await
+        .expect("lab spawns");
+        lab.host().rebind_sequence_after(2);
+        let window = lab.port_window();
+        let len = i64::from(window.end - window.start);
+        // The jump draws from the lab's seeded generator, and this rebind
+        // is its first draw.
+        let jump = i64::from(seeded_rng("rebind_seq").random_range(3_000..4_000u32));
+        let offset = |n: i64| (n * 2).rem_euclid(len) as u16;
+
+        let mut dests = Vec::new();
+        for _ in 0..4 {
+            dests.push(dest().await);
+        }
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        for d in &dests {
+            client
+                .send_to(b"x", d.local_addr().expect("dest addr"))
+                .await
+                .expect("send");
+        }
+
+        // The first two allocations walk as usual; the third crosses the
+        // arming point and lands past the jump.
+        let mut ports = Vec::new();
+        for d in &dests {
+            let (_, from) = recv(d).await;
+            ports.push(from.port());
+        }
+        assert_eq!(ports[0], window.start);
+        assert_eq!(ports[1], window.start + 2);
+        assert_eq!(ports[2], window.start + offset(2 + jump));
+        assert_eq!(ports[3], window.start + offset(3 + jump));
+        assert_eq!(lab.mapping_count(), 4);
+    }
+
+    /// Crossings the test's tap recorded, as (direction, src, dst, payload).
+    type Seen = Vec<(Direction, SocketAddr, SocketAddr, Vec<u8>)>;
+
+    #[tokio::test]
+    async fn tap_sees_and_shapes_both_directions() {
+        let lab = NatLab::spawn("tap", spec(Mapping::Cone, FilterClass::EndpointIndependent))
+            .await
+            .expect("lab spawns");
+        let seen: Arc<StdMutex<Seen>> = Arc::new(StdMutex::new(Vec::new()));
+        let tap_seen = Arc::clone(&seen);
+        lab.set_tap(Some(Arc::new(move |event: &TapEvent| {
+            tap_seen.lock().expect("seen lock").push((
+                event.direction,
+                event.src,
+                event.dst,
+                event.payload.to_vec(),
+            ));
+            match event.direction {
+                Direction::Out if event.payload == b"swap-me" => {
+                    TapDecision::Replace(b"swapped".to_vec())
+                },
+                Direction::In if event.payload == b"blocked" => TapDecision::Drop,
+                _ => TapDecision::Forward,
+            }
+        })));
+
+        let d = dest().await;
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        let target = d.local_addr().expect("dest addr");
+        let client_addr = client.local_addr().expect("client addr");
+
+        // Outbound Replace: the destination reads the rewritten payload.
+        client.send_to(b"swap-me", target).await.expect("send");
+        let (payload, _) = recv(&d).await;
+        assert_eq!(payload, b"swapped");
+        wait_mappings(&lab, 1).await;
+        let ext = lab.mappings_snapshot()[0].1;
+
+        // Inbound Drop: the datagram never reaches the client.
+        d.send_to(b"blocked", ext).await.expect("reply");
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the tap dropped the reply"
+        );
+
+        // Inbound Forward passes unchanged.
+        d.send_to(b"pass", ext).await.expect("reply");
+        let (len, from) = client.recv_from(&mut buf).await.expect("delivered");
+        assert_eq!(&buf[..len], b"pass");
+        assert_eq!(from, target);
+
+        // Removing the tap restores the plain path, and the crossing goes
+        // unrecorded.
+        lab.set_tap(None);
+        client.send_to(b"plain", target).await.expect("send");
+        let (payload, _) = recv(&d).await;
+        assert_eq!(payload, b"plain");
+
+        assert_eq!(*seen.lock().expect("seen lock"), vec![
+            (Direction::Out, client_addr, target, b"swap-me".to_vec()),
+            (Direction::In, target, client_addr, b"blocked".to_vec()),
+            (Direction::In, target, client_addr, b"pass".to_vec()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_lab_and_responder_frees_their_addresses() {
+        let lab = NatLab::spawn(
+            "lifecycle",
+            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        )
+        .await
+        .expect("lab spawns");
+        let ip = lab.public_ip();
+        assert!(LAB_IPS.lock().expect("address draw lock").contains(&ip));
+
+        let stun = stun_responder().expect("responder spawns");
+        assert_eq!(stun.addrs.len(), 4);
+        let stun_ips: HashSet<Ipv4Addr> = stun
+            .addrs
+            .iter()
+            .filter_map(|addr| addr.split(':').next()?.parse().ok())
+            .collect();
+        assert_eq!(stun_ips.len(), 2);
+        {
+            let taken = STUN_IPS.lock().expect("address draw lock");
+            for drawn in &stun_ips {
+                assert!(taken.contains(drawn), "{drawn} never registered");
+            }
+        }
+
+        // A mapping loop is live when the lab drops.
+        let d = dest().await;
+        let client = lab
+            .host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+        client
+            .send_to(b"x", d.local_addr().expect("dest addr"))
+            .await
+            .expect("mapping opens");
+        wait_mappings(&lab, 1).await;
+
+        drop(lab);
+        assert!(
+            !LAB_IPS.lock().expect("address draw lock").contains(&ip),
+            "the lab address returns to the draw"
+        );
+        drop(stun);
+        let taken = STUN_IPS.lock().expect("address draw lock");
+        for drawn in &stun_ips {
+            assert!(!taken.contains(drawn), "{drawn} never freed");
+        }
+
+        // A socket outliving the lab drops without a panic.
+        drop(client);
     }
 }

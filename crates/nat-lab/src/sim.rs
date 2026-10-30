@@ -135,6 +135,8 @@ struct NatShared {
     sym: StdMutex<HashMap<(u16, SocketAddr), MappingEntry>>,
     next_alloc: AtomicU32,
     peak: AtomicU32,
+    /// Datagrams the filter rejected.
+    filter_drops: AtomicU32,
     /// Allocation count at which the port walk jumps to a fresh base,
     /// armed by a test and spent once.
     rebind: StdMutex<Option<u32>>,
@@ -150,6 +152,7 @@ impl NatShared {
             sym: StdMutex::new(HashMap::new()),
             next_alloc: AtomicU32::new(0),
             peak: AtomicU32::new(0),
+            filter_drops: AtomicU32::new(0),
             rebind: StdMutex::new(None),
         }
     }
@@ -270,17 +273,32 @@ impl NatShared {
             return None;
         }
         let cone = self.cone.lock().expect("cone lock");
+        let mut matched = false;
         for entry in cone.values() {
-            if entry.ext_port == dst.port() && self.allows(entry, src) {
+            if entry.ext_port != dst.port() {
+                continue;
+            }
+            matched = true;
+            if self.allows(entry, src) {
                 return Some(entry.local);
             }
         }
         drop(cone);
         let sym = self.sym.lock().expect("sym lock");
         for entry in sym.values() {
-            if entry.ext_port == dst.port() && self.allows(entry, src) {
+            if entry.ext_port != dst.port() {
+                continue;
+            }
+            matched = true;
+            if self.allows(entry, src) {
                 return Some(entry.local);
             }
+        }
+        drop(sym);
+        if matched {
+            // A live mapping saw the datagram and its filter rejected the
+            // source, like the loopback engine's counter.
+            self.filter_drops.fetch_add(1, Ordering::Relaxed);
         }
         None
     }
@@ -537,6 +555,18 @@ impl Net {
     #[must_use]
     pub fn dropped(&self) -> u32 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Inbound datagrams a NAT filter rejected.
+    #[must_use]
+    pub fn dropped_by_filter(&self) -> u32 {
+        self.inner
+            .nats
+            .lock()
+            .expect("nat list lock")
+            .iter()
+            .map(|nat| nat.filter_drops.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Current mappings across every NAT.
