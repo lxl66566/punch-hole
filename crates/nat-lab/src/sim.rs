@@ -70,13 +70,22 @@ pub enum Allocation {
 }
 
 /// Configuration of one simulated NAT: the two orthogonal RFC 4787 axes
-/// over a port range, plus the inbound filtering class.
+/// over a port range, plus the inbound filtering class and the hairpinning
+/// switch.
 #[derive(Debug, Clone)]
 pub struct NatSpec {
     pub mapping: MappingBehavior,
     pub allocation: Allocation,
     pub filtering: FilterClass,
     pub port_range: Range<u16>,
+    /// Whether datagrams aimed at one of this NAT's own external addresses
+    /// loop back to the internal host behind the live mapping (RFC 4787 §6
+    /// hairpinning). A hairpinned datagram arrives as if from outside: the
+    /// source is the sender's translated address and the target mapping's
+    /// filter applies to it. With `false`, the NAT still opens the sender's
+    /// mapping, then drops the datagram like the broken no-loopback NATs a
+    /// puncher must survive; [`Net::dropped_by_hairpin`] counts the drops.
+    pub hairpin: bool,
 }
 
 impl NatSpec {
@@ -88,6 +97,7 @@ impl NatSpec {
             allocation: Allocation::Increment { step: 1 },
             filtering: FilterClass::EndpointIndependent,
             port_range: 1024..65535,
+            hairpin: true,
         }
     }
 
@@ -99,6 +109,7 @@ impl NatSpec {
             allocation: Allocation::Increment { step: 1 },
             filtering: FilterClass::AddressPortDependent,
             port_range: 1024..65535,
+            hairpin: true,
         }
     }
 
@@ -114,6 +125,7 @@ impl NatSpec {
             allocation: Allocation::Increment { step },
             filtering: FilterClass::AddressDependent,
             port_range: 30000..40000,
+            hairpin: true,
         }
     }
 
@@ -128,6 +140,7 @@ impl NatSpec {
             allocation: Allocation::Increment { step },
             filtering: FilterClass::AddressDependent,
             port_range: 30000..40000,
+            hairpin: true,
         }
     }
 
@@ -139,6 +152,7 @@ impl NatSpec {
             allocation: Allocation::Random,
             filtering: FilterClass::AddressDependent,
             port_range: range,
+            hairpin: true,
         }
     }
 
@@ -152,6 +166,7 @@ impl NatSpec {
             allocation: Allocation::Random,
             filtering: FilterClass::EndpointIndependent,
             port_range: range,
+            hairpin: true,
         }
     }
 
@@ -167,6 +182,7 @@ impl NatSpec {
             allocation: Allocation::Preserve,
             filtering,
             port_range: 30000..40000,
+            hairpin: true,
         }
     }
 
@@ -195,6 +211,13 @@ impl NatSpec {
     #[must_use]
     pub fn with_range(mut self, port_range: Range<u16>) -> Self {
         self.port_range = port_range;
+        self
+    }
+
+    /// Replaces the hairpinning switch.
+    #[must_use]
+    pub fn with_hairpin(mut self, hairpin: bool) -> Self {
+        self.hairpin = hairpin;
         self
     }
 }
@@ -238,9 +261,27 @@ struct NatShared {
     peak: AtomicU32,
     /// Datagrams the filter rejected.
     filter_drops: AtomicU32,
+    /// Datagrams dropped because hairpinning is disabled.
+    hairpin_drops: AtomicU32,
     /// Allocation count at which the stepped port walk jumps to a fresh
     /// base, armed by a test and spent once.
     rebind: StdMutex<Option<u32>>,
+}
+
+/// What becomes of one translated datagram aimed at this NAT's own
+/// external address (RFC 4787 §6 hairpinning).
+enum HairpinFate {
+    /// No live mapping holds the destination port: not a hairpin, so the
+    /// datagram keeps its ordinary outward emission.
+    None,
+    /// Hairpinning is disabled: dropped after the translation, counted by
+    /// [`Net::dropped_by_hairpin`].
+    Disabled,
+    /// Every matching mapping's filter rejected the source: dropped and
+    /// counted as a filter drop, like the router's inbound scan.
+    Filtered,
+    /// Deliver to this client address as if from outside.
+    Deliver(SocketAddr),
 }
 
 impl NatShared {
@@ -253,6 +294,7 @@ impl NatShared {
             next_alloc: AtomicU32::new(0),
             peak: AtomicU32::new(0),
             filter_drops: AtomicU32::new(0),
+            hairpin_drops: AtomicU32::new(0),
             rebind: StdMutex::new(None),
         }
     }
@@ -374,6 +416,43 @@ impl NatShared {
             self.filter_drops.fetch_add(1, Ordering::Relaxed);
         }
         None
+    }
+
+    /// Resolves the hairpin fate of one translated datagram, counting the
+    /// drop on this NAT when the fate is [`HairpinFate::Disabled`] or
+    /// [`HairpinFate::Filtered`].
+    ///
+    /// One rule serves every shape of NAT: the destination is this NAT's
+    /// own external address and a live mapping holds the port. The caller
+    /// translated the sender first, so the sender's mapping exists either
+    /// way, like a real NAT that emits toward its WAN before the loopback
+    /// decision.
+    fn hairpin_fate(&self, src: SocketAddr, dst: SocketAddr) -> HairpinFate {
+        let SocketAddr::V4(dst) = dst else {
+            return HairpinFate::None;
+        };
+        if *dst.ip() != self.public_ip {
+            return HairpinFate::None;
+        }
+        let mappings = self.mappings.lock().expect("mapping lock");
+        if !mappings.values().any(|entry| entry.ext_port == dst.port()) {
+            // Nobody translates at this port: the datagram goes out and is
+            // lost, not turned into a hairpin drop.
+            return HairpinFate::None;
+        }
+        if !self.spec.hairpin {
+            self.hairpin_drops.fetch_add(1, Ordering::Relaxed);
+            return HairpinFate::Disabled;
+        }
+        if let Some(entry) = mappings
+            .values()
+            .filter(|entry| entry.ext_port == dst.port())
+            .find(|entry| self.allows(entry, src))
+        {
+            return HairpinFate::Deliver(entry.local);
+        }
+        self.filter_drops.fetch_add(1, Ordering::Relaxed);
+        HairpinFate::Filtered
     }
 
     fn allows(&self, entry: &MappingEntry, src: SocketAddr) -> bool {
@@ -672,6 +751,18 @@ impl Net {
             .sum()
     }
 
+    /// Datagrams a NAT dropped because hairpinning is disabled.
+    #[must_use]
+    pub fn dropped_by_hairpin(&self) -> u32 {
+        self.inner
+            .nats
+            .lock()
+            .expect("nat list lock")
+            .iter()
+            .map(|nat| nat.hairpin_drops.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Current mappings across every NAT.
     #[must_use]
     pub fn mapping_count(&self) -> usize {
@@ -850,18 +941,23 @@ impl UdpIo for SimSocket {
                 return Ok(buf.len());
             }
         }
-        let src = match &self.nat {
-            Some(nat) => nat.translate_outbound(&self.inner.rng, self.local, target),
-            None => self.local,
+        let Some(nat) = &self.nat else {
+            self.emit(buf, self.local, target)?;
+            return Ok(buf.len());
         };
-        self.inner
-            .tx
-            .send(Msg::Packet {
-                src,
-                dst: target,
-                payload: buf.to_vec(),
-            })
-            .map_err(|_| io::Error::other("router stopped"))?;
+        // The mapping opens and refreshes before its fate, like the loss
+        // hook's order.
+        let src = nat.translate_outbound(&self.inner.rng, self.local, target);
+        match nat.hairpin_fate(src, target) {
+            // Delivered as if from outside: the private destination
+            // matches no NAT, so the router applies its loss roll and
+            // hands the datagram to the target unchanged.
+            HairpinFate::Deliver(local) => self.emit(buf, src, local)?,
+            // The NAT dropped the datagram after the translation; the
+            // fate call already counted it.
+            HairpinFate::Disabled | HairpinFate::Filtered => return Ok(buf.len()),
+            HairpinFate::None => self.emit(buf, src, target)?,
+        }
         Ok(buf.len())
     }
 
@@ -878,6 +974,20 @@ impl UdpIo for SimSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
+    }
+}
+
+impl SimSocket {
+    /// Hands one datagram to the router.
+    fn emit(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<()> {
+        self.inner
+            .tx
+            .send(Msg::Packet {
+                src,
+                dst,
+                payload: buf.to_vec(),
+            })
+            .map_err(|_| io::Error::other("router stopped"))
     }
 }
 

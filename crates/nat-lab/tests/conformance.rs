@@ -31,6 +31,7 @@ fn spec(mapping: MappingBehavior, filtering: FilterClass) -> NatSpec {
         allocation: Allocation::Increment { step: 1 },
         filtering,
         port_range: 30_000..30_040,
+        hairpin: true,
     }
 }
 
@@ -435,6 +436,7 @@ conformance!(
         allocation: Allocation::Increment { step: 2 },
         filtering: FilterClass::AddressDependent,
         port_range: 30_000..30_040,
+        hairpin: true,
     },
     sequential_mapping_walks_one_step_per_destination
 );
@@ -447,6 +449,7 @@ conformance!(
         allocation: Allocation::Increment { step: 2 },
         filtering: FilterClass::AddressDependent,
         port_range: 30_000..30_040,
+        hairpin: true,
     },
     address_sequential_shares_one_mapping_per_destination_address
 );
@@ -459,6 +462,7 @@ conformance!(
         allocation: Allocation::Random,
         filtering: FilterClass::AddressDependent,
         port_range: 30_000..30_010,
+        hairpin: true,
     },
     random_mappings_hold_distinct_ports
 );
@@ -576,6 +580,27 @@ conformance!(
         FilterClass::AddressPortDependent
     ),
     change_request_reply_from_an_unsent_port_is_filtered
+);
+
+conformance!(
+    sim_hairpin_loops_a_client_back_to_its_sibling,
+    lab_hairpin_loops_a_client_back_to_its_sibling,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::AddressPortDependent
+    ),
+    hairpin_loops_a_client_back_to_its_sibling
+);
+
+conformance!(
+    sim_hairpin_disabled_drops_the_loop,
+    lab_hairpin_disabled_drops_the_loop,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    )
+    .with_hairpin(false),
+    hairpin_disabled_drops_the_loop
 );
 
 /// Endpoint-independent mapping with random allocation: one unpredictable
@@ -842,6 +867,88 @@ async fn change_request_reply_from_an_unsent_port_is_filtered(e: impl Engine) {
         .expect("request sends");
     let (_, from) = recv_from(&client).await;
     assert_eq!(from, alt_port, "the directly queried alternate answers");
+}
+
+/// Two clients behind one NAT: a datagram one sends to the other's
+/// external address loops back through the target mapping (RFC 4787 §6),
+/// arriving as if from outside with the sender's external address as the
+/// source. The target mapping's filter applies to the looped source: B's
+/// early answer toward A is dropped because A has not yet sent to B's
+/// external, and the drop counts as filtered; once A has, the loop passes.
+async fn hairpin_loops_a_client_back_to_its_sibling(e: impl Engine) {
+    let dest = e.public_socket().await.expect("dest binds");
+    let scratch = dest.local_addr().expect("dest addr");
+    let a = e.client().await.expect("a binds");
+    let b = e.client().await.expect("b binds");
+
+    // Both mappings open against a scratch destination.
+    b.send_to(b"b", scratch).await.expect("b sends");
+    a.send_to(b"a", scratch).await.expect("a sends");
+    e.wait_mappings(2).await;
+    let snapshot = e.snapshot();
+    let ext_of = |local: SocketAddr| {
+        snapshot
+            .iter()
+            .find(|(candidate, _)| *candidate == local)
+            .map(|(_, ext)| *ext)
+            .expect("mapping in snapshot")
+    };
+    let ext_a = ext_of(a.local_addr().expect("a addr"));
+    let ext_b = ext_of(b.local_addr().expect("b addr"));
+    assert_ne!(ext_a, ext_b, "two clients hold distinct mappings");
+
+    // B answers toward A's external before A ever sent there: the loop is
+    // filtered at A's mapping and counted.
+    b.send_to(b"early", ext_a).await.expect("b sends");
+    assert_silent(&a, NON_DELIVERY).await;
+    e.wait_filter_drops(1).await;
+    if let Some(drops) = e.filter_drops() {
+        assert_eq!(drops, 1, "the filtered loop is counted");
+    }
+
+    // A sends to B's learned external. B's mapping already sent to A's
+    // external through the filtered attempt, so the loop passes and B
+    // reads A's external address as the source.
+    a.send_to(b"hello", ext_b).await.expect("a sends");
+    let (payload, from) = recv_from(&b).await;
+    assert_eq!(payload, b"hello");
+    assert_eq!(
+        from, ext_a,
+        "the looped datagram carries A's external address"
+    );
+}
+
+/// With hairpinning disabled, a datagram sent to the sibling's external
+/// address is dropped after the translation: silence at the sibling, the
+/// drop counted, and the sender's mapping still open like a real
+/// no-loopback NAT that emitted toward its WAN.
+async fn hairpin_disabled_drops_the_loop(e: impl Engine) {
+    let dest = e.public_socket().await.expect("dest binds");
+    let scratch = dest.local_addr().expect("dest addr");
+    let a = e.client().await.expect("a binds");
+    let b = e.client().await.expect("b binds");
+    b.send_to(b"b", scratch).await.expect("b sends");
+    a.send_to(b"a", scratch).await.expect("a sends");
+    e.wait_mappings(2).await;
+    let snapshot = e.snapshot();
+    let ext_b = snapshot
+        .iter()
+        .find(|(local, _)| *local == b.local_addr().expect("b addr"))
+        .map(|(_, ext)| *ext)
+        .expect("b's mapping in snapshot");
+
+    a.send_to(b"loop", ext_b).await.expect("a sends");
+    assert_silent(&b, NON_DELIVERY).await;
+    e.wait_hairpin_drops(1).await;
+    if let Some(drops) = e.hairpin_drops() {
+        assert_eq!(drops, 1, "the disabled loop is counted");
+    }
+    assert!(
+        e.snapshot()
+            .iter()
+            .any(|(local, _)| *local == a.local_addr().expect("a addr")),
+        "the sender's mapping survives the disabled loop"
+    );
 }
 
 /// The simulator keeps a closed socket's mapping in the table for the

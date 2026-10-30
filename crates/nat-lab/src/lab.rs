@@ -197,6 +197,7 @@ struct LabInner {
     rebind: StdMutex<Option<u32>>,
     forwarded: AtomicU32,
     dropped_by_filter: AtomicU32,
+    dropped_by_hairpin: AtomicU32,
     dropped_by_loss: AtomicU32,
     idled: AtomicU32,
     loss_permille: AtomicU32,
@@ -276,6 +277,7 @@ impl NatLab {
             rebind: StdMutex::new(None),
             forwarded: AtomicU32::new(0),
             dropped_by_filter: AtomicU32::new(0),
+            dropped_by_hairpin: AtomicU32::new(0),
             dropped_by_loss: AtomicU32::new(0),
             idled: AtomicU32::new(0),
             loss_permille: AtomicU32::new(0),
@@ -393,6 +395,12 @@ impl NatLab {
         self.inner.dropped_by_filter.load(Ordering::Relaxed)
     }
 
+    /// Datagrams dropped because hairpinning is disabled.
+    #[must_use]
+    pub fn dropped_by_hairpin(&self) -> u32 {
+        self.inner.dropped_by_hairpin.load(Ordering::Relaxed)
+    }
+
     /// Crossings the loss setting dropped, outbound plus inbound.
     #[must_use]
     pub fn dropped_by_loss(&self) -> u32 {
@@ -467,6 +475,28 @@ fn snapshot(table: &MappingTable, public_ip: Ipv4Addr) -> Vec<(SocketAddr, Socke
         .collect()
 }
 
+/// The live mapping whose external port `dst` aims at, when `dst` is one
+/// of this NAT's own external addresses.
+///
+/// One rule serves flat and stacked NATs alike: the destination is this
+/// NAT's public address and a live mapping holds the port. A port nobody
+/// translates at keeps the ordinary outward emission — the datagram goes
+/// out and is lost, not turned into a hairpin drop.
+fn hairpin_target(inner: &LabInner, dst: SocketAddr) -> Option<Arc<LabMapping>> {
+    let SocketAddr::V4(dst) = dst else {
+        return None;
+    };
+    if *dst.ip() != inner.public_ip {
+        return None;
+    }
+    let table = inner.table.lock().expect("mapping table lock");
+    table
+        .map
+        .values()
+        .find(|mapping| mapping.ext_port == dst.port())
+        .cloned()
+}
+
 /// The lab's forwarding core: one sequential receive loop.
 ///
 /// Allocation order follows arrival order, and loopback preserves send
@@ -509,7 +539,11 @@ async fn gateway_loop(inner: Arc<LabInner>) {
 /// Translates one client datagram through its mapping and sends it out.
 ///
 /// Loss follows translation, so a dropped datagram still opened its
-/// mapping, like the virtual engine's send path.
+/// mapping, like the virtual engine's send path. A datagram aimed at this
+/// NAT's own external address loops back through the target mapping's
+/// inbound path instead (RFC 4787 §6 hairpinning), or — with hairpinning
+/// disabled — drops right after the translation and counts as
+/// [`NatLab::dropped_by_hairpin`].
 async fn outbound(
     inner: &Arc<LabInner>,
     client: SocketAddr,
@@ -517,6 +551,26 @@ async fn outbound(
     payload: &[u8],
 ) -> io::Result<()> {
     let mapping = translate_outbound(inner, client, dst)?;
+    if let Some(target) = hairpin_target(inner, dst) {
+        if !inner.spec.hairpin {
+            inner.dropped_by_hairpin.fetch_add(1, Ordering::Relaxed);
+            trace(format_args!("LAB hairpin drop {client} -> {dst}"));
+            return Ok(());
+        }
+        // The out crossing translated, refreshes the sender's idle timer,
+        // and can drop, like any emission; the looped datagram then reads
+        // as if it arrived on the target's public socket.
+        touch(&mapping);
+        if loses(inner) {
+            inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
+            trace(format_args!("LAB loss drop out {client} -> {dst}"));
+            return Ok(());
+        }
+        inner.forwarded.fetch_add(1, Ordering::Relaxed);
+        let src = SocketAddr::V4(SocketAddrV4::new(inner.public_ip, mapping.ext_port));
+        inbound(inner, &target, src, payload).await;
+        return Ok(());
+    }
     touch(&mapping);
     if loses(inner) {
         inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
@@ -678,60 +732,62 @@ fn apply_rebind(inner: &LabInner, table: &mut MappingTable, n: i64) -> i64 {
 
 /// Serves the public socket of one mapping.
 ///
-/// Inbound datagrams pass the loss draw, the tap, and the filter check in
-/// that order, then reach the client as In frames through the gateway
-/// socket; filter failures count as drops.
+/// Inbound datagrams pass through the mapping's inbound pipeline: the
+/// loss draw, the tap, and the filter check in that order, then reach the
+/// client as In frames through the gateway socket.
 async fn mapping_loop(inner: Arc<LabInner>, mapping: Arc<LabMapping>) {
     let mut buf = [0u8; MAX_DATAGRAM];
-    let mut wire = [0u8; FRAME_HEADER + MAX_DATAGRAM];
     loop {
         let recv = mapping.ext.recv_from(&mut buf);
         tokio::select! {
             () = mapping.cancel.cancelled() => break,
             result = recv => match result {
-                Ok((len, src)) => {
-                    // Any arrival on the public socket restarts the idle
-                    // timer.
-                    touch(&mapping);
-                    if loses(&inner) {
-                        inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
-                        trace(format_args!("LAB loss drop in {src} -> {}", mapping.client));
-                        continue;
-                    }
-                    let Some(payload) =
-                        apply_tap(&inner.tap, Direction::In, src, mapping.client, &buf[..len])
-                    else {
-                        continue;
-                    };
-                    if !allows(inner.spec.filtering, &mapping.dests, src) {
-                        inner.dropped_by_filter.fetch_add(1, Ordering::Relaxed);
-                        trace(format_args!(
-                            "LAB filter drop {src} ext={}",
-                            SocketAddr::V4(SocketAddrV4::new(inner.public_ip, mapping.ext_port))
-                        ));
-                        continue;
-                    }
-                    // A v4 socket hears from v4 peers only.
-                    let SocketAddr::V4(src_v4) = src else {
-                        continue;
-                    };
-                    write_header(&mut wire, TAG_IN, src_v4);
-                    wire[FRAME_HEADER..FRAME_HEADER + payload.len()].copy_from_slice(&payload);
-                    // A failed delivery only loses this datagram, like a
-                    // NAT whose client went away.
-                    if inner
-                        .gateway
-                        .send_to(&wire[..FRAME_HEADER + payload.len()], mapping.client)
-                        .await
-                        .is_ok()
-                    {
-                        inner.forwarded.fetch_add(1, Ordering::Relaxed);
-                    }
-                },
+                Ok((len, src)) => inbound(&inner, &mapping, src, &buf[..len]).await,
                 Err(e) if is_link_reset(&e) => {},
                 Err(_) => break,
             },
         }
+    }
+}
+
+/// The inbound pipeline of one mapping: idle refresh, loss draw, tap, and
+/// filter check in that order, then delivery to the client as an In frame
+/// through the gateway socket.
+///
+/// A hairpinned datagram crosses this pipeline on the target mapping, so
+/// it reads exactly like an arrival on the target's public socket: the
+/// source is the sender's external address and the target's filter
+/// applies to it.
+async fn inbound(inner: &Arc<LabInner>, mapping: &LabMapping, src: SocketAddr, payload: &[u8]) {
+    // Any arrival on the public socket restarts the idle timer.
+    touch(mapping);
+    if loses(inner) {
+        inner.dropped_by_loss.fetch_add(1, Ordering::Relaxed);
+        trace(format_args!("LAB loss drop in {src} -> {}", mapping.client));
+        return;
+    }
+    let Some(payload) = apply_tap(&inner.tap, Direction::In, src, mapping.client, payload) else {
+        return;
+    };
+    if !allows(inner.spec.filtering, &mapping.dests, src) {
+        inner.dropped_by_filter.fetch_add(1, Ordering::Relaxed);
+        trace(format_args!(
+            "LAB filter drop {src} ext={}",
+            SocketAddr::V4(SocketAddrV4::new(inner.public_ip, mapping.ext_port))
+        ));
+        return;
+    }
+    // A v4 socket hears from v4 peers only.
+    let SocketAddr::V4(src_v4) = src else {
+        return;
+    };
+    let mut wire = vec![0u8; FRAME_HEADER + payload.len()];
+    write_header(&mut wire, TAG_IN, src_v4);
+    wire[FRAME_HEADER..].copy_from_slice(&payload);
+    // A failed delivery only loses this datagram, like a NAT whose client
+    // went away.
+    if inner.gateway.send_to(&wire, mapping.client).await.is_ok() {
+        inner.forwarded.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1380,6 +1436,7 @@ mod tests {
             allocation: Allocation::Increment { step: 1 },
             filtering,
             port_range: 30_000..30_040,
+            hairpin: true,
         }
     }
 

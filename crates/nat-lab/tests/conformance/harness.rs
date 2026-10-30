@@ -57,11 +57,18 @@ pub trait Engine {
     /// The rejected-datagram counter, when the engine exposes one.
     fn filter_drops(&self) -> Option<u32>;
 
+    /// The disabled-hairpin-drop counter, when the engine exposes one.
+    fn hairpin_drops(&self) -> Option<u32>;
+
     /// Waits until the engine holds at least `want` mappings, bounded.
     async fn wait_mappings(&self, want: usize);
 
     /// Waits until at least `want` datagrams were rejected, bounded.
     async fn wait_filter_drops(&self, want: u32);
+
+    /// Waits until at least `want` datagrams were dropped as disabled
+    /// loops, bounded.
+    async fn wait_hairpin_drops(&self, want: u32);
 
     /// Waits until every mapping is gone, bounded.
     async fn wait_drained(&self);
@@ -230,6 +237,10 @@ impl Engine for SimEng {
         Some(self.net.dropped_by_filter())
     }
 
+    fn hairpin_drops(&self) -> Option<u32> {
+        Some(self.net.dropped_by_hairpin())
+    }
+
     async fn wait_mappings(&self, want: usize) {
         wait_until(Duration::from_secs(2), || self.mapping_count() >= want).await;
     }
@@ -237,6 +248,13 @@ impl Engine for SimEng {
     async fn wait_filter_drops(&self, want: u32) {
         wait_until(Duration::from_secs(2), || {
             self.filter_drops().unwrap_or(0) >= want
+        })
+        .await;
+    }
+
+    async fn wait_hairpin_drops(&self, want: u32) {
+        wait_until(Duration::from_secs(2), || {
+            self.hairpin_drops().unwrap_or(0) >= want
         })
         .await;
     }
@@ -334,6 +352,10 @@ impl Engine for LabEng {
         Some(self.lab.dropped_by_filter())
     }
 
+    fn hairpin_drops(&self) -> Option<u32> {
+        Some(self.lab.dropped_by_hairpin())
+    }
+
     async fn wait_mappings(&self, want: usize) {
         wait_until(Duration::from_secs(2), || self.mapping_count() >= want).await;
     }
@@ -341,6 +363,13 @@ impl Engine for LabEng {
     async fn wait_filter_drops(&self, want: u32) {
         wait_until(Duration::from_secs(2), || {
             self.filter_drops().unwrap_or(0) >= want
+        })
+        .await;
+    }
+
+    async fn wait_hairpin_drops(&self, want: u32) {
+        wait_until(Duration::from_secs(2), || {
+            self.hairpin_drops().unwrap_or(0) >= want
         })
         .await;
     }

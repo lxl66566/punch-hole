@@ -14,8 +14,12 @@
 //! a mapping behavior ([`MappingBehavior`], which destinations reuse a
 //! mapping) and an allocation policy ([`Allocation`], how a fresh external
 //! port is chosen) crossed with an inbound filtering class
-//! ([`FilterClass`]) over a port range. A suite that asserts mapping,
-//! allocation, and filtering behavior can parameterize over the engine and
+//! ([`FilterClass`]) over a port range, plus a hairpinning switch: a
+//! datagram a client sends to its own NAT's external address loops back to
+//! the sibling behind the same NAT as if from outside (RFC 4787 §6), or —
+//! with hairpinning off — drops with a counter, like the broken no-loopback
+//! NATs a puncher must survive. A suite that asserts mapping, allocation,
+//! filtering, and hairpinning behavior can parameterize over the engine and
 //! keep one set of expectations.
 //!
 //! # Example

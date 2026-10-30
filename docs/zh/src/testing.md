@@ -29,6 +29,8 @@ let host = net.host(nat_lab::NatSpec::cone_apdf());  // 挂在 NAT 后面
 
 `NatSpec` 把两条正交的 RFC 4787 轴与一个过滤类别组合在一起：映射行为（`MappingBehavior::EndpointIndependent`、`AddressDependent` 或 `AddressPortDependent`）决定哪些目的地复用同一映射，分配策略（`Allocation::Increment { step }`、`Random` 或 `Preserve`）决定如何挑选新的外部端口。预设 `cone_eif()`、`cone_apdf()`、`sequential(step)`、`address_sequential(step)`、`random(range)`、`random_eif(range)` 和 `preserved(filtering)` 覆盖常见形态，`with_*` 构建器可单独调整字段。对称预设默认地址相关过滤，即 CGNAT 的常见形态。两个引擎内建的 STUN 应答器都支持 RFC 5780 行为发现：各自在双 IP、多端口的地址网格上应答，处理 CHANGE-REQUEST，并在 XOR-MAPPED-ADDRESS 之外报告 RESPONSE-ORIGIN 与 OTHER-ADDRESS，测试套件因此可以直接在线上验证声明的映射行为与过滤类别。
 
+`NatSpec` 还有一个字段决定发夹（hairpinning，RFC 4787 §6）：客户端发往自己 NAT 外部地址的数据报会经目标映射环回，像从外部到达一样——源地址是发送方翻译后的地址，并接受目标映射的过滤，因此未经请求的环回会像普通入站流量一样被过滤并计数。`hairpin: false` 则建模损坏的无环回 NAT：发送方的映射照常打开，数据报被丢弃，引擎的 `dropped_by_hairpin` 计数器加一。
+
 路由暴露观测钩子供断言使用：转发与丢弃计数、活跃映射表、峰值映射数，以及一个有界的等映射清空函数。设置 `NAT_LAB_TRACE` 环境变量会打印每个转发包，定位故障很快。
 
 主机附带故障注入，覆盖干净网络走不到的路径：`drop_first_send_to` 与 `fail_sends_to` 破坏上行，`external_allocations` 像同一运营商 NAT 背后的无关流量一样把序列往前推，`rebind_sequence_after` 在会话中途把端口行走跳到新基点。
