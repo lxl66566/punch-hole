@@ -41,6 +41,10 @@ pub trait Engine {
     /// The addresses of the engine's STUN responders.
     async fn stun_addrs(&self) -> Vec<SocketAddr>;
 
+    /// The addresses of the engine's discovery alternates: the responder's
+    /// other IP, where RFC 5780 OTHER-ADDRESS points.
+    async fn stun_other_addrs(&self) -> Vec<SocketAddr>;
+
     /// Live mappings right now.
     fn mapping_count(&self) -> usize;
 
@@ -158,6 +162,9 @@ pub struct SimEng {
     nat_host: Host,
     public_host: Host,
     spec: NatSpec,
+    /// The one STUN server, created on first use so every accessor reads
+    /// the same grid.
+    stun: OnceLock<nat_lab::sim::StunServer>,
 }
 
 impl SimEng {
@@ -172,7 +179,13 @@ impl SimEng {
             nat_host,
             public_host,
             spec,
+            stun: OnceLock::new(),
         }
+    }
+
+    /// The engine's STUN server, created on first use.
+    fn stun(&self) -> &nat_lab::sim::StunServer {
+        self.stun.get_or_init(|| self.net.stun_server())
     }
 }
 
@@ -194,7 +207,11 @@ impl Engine for SimEng {
     }
 
     async fn stun_addrs(&self) -> Vec<SocketAddr> {
-        parse_addrs(&self.net.stun_server().addrs)
+        parse_addrs(&self.stun().addrs)
+    }
+
+    async fn stun_other_addrs(&self) -> Vec<SocketAddr> {
+        parse_addrs(&self.stun().other_addrs)
     }
 
     fn mapping_count(&self) -> usize {
@@ -259,6 +276,12 @@ impl LabEng {
         self.lab.public_ip()
     }
 
+    /// The engine's STUN responder, spawned on first use.
+    fn responder(&self) -> &StunServer {
+        self.stun
+            .get_or_init(|| stun_responder().expect("stun responder binds"))
+    }
+
     /// Binds one client socket at an explicit local port, so a mapping can
     /// be observed past the close of its original socket.
     pub async fn client_at(&self, port: u16) -> LabSocket {
@@ -288,10 +311,11 @@ impl Engine for LabEng {
     }
 
     async fn stun_addrs(&self) -> Vec<SocketAddr> {
-        let responder = self
-            .stun
-            .get_or_init(|| stun_responder().expect("stun responder binds"));
-        parse_addrs(&responder.addrs)
+        parse_addrs(&self.responder().addrs)
+    }
+
+    async fn stun_other_addrs(&self) -> Vec<SocketAddr> {
+        parse_addrs(&self.responder().other_addrs)
     }
 
     fn mapping_count(&self) -> usize {

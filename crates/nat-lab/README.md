@@ -9,6 +9,8 @@ Testing NAT traversal needs a NAT on the other side of the wire. `nat-lab` provi
 
 Both engines translate and filter datagrams according to one `NatSpec`: a mapping behavior per RFC 4787 (`MappingBehavior::EndpointIndependent`, `AddressDependent`, `AddressPortDependent`) crossed with an allocation policy (`Allocation::Increment { step }`, `Random`, `Preserve`) and an inbound filtering class (endpoint-independent, address-dependent, address-and-port-dependent) over a port range.
 
+The built-in STUN responders of both engines support RFC 5780 behavior discovery: each answers on a two-IP, multi-port grid, honors CHANGE-REQUEST (the reply leaves the flag-selected alternate socket), and reports RESPONSE-ORIGIN and OTHER-ADDRESS beside XOR-MAPPED-ADDRESS. The handles expose the alternate addresses as `other_addrs`.
+
 ## Usage
 
 ```rust,ignore

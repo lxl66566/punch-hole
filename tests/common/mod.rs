@@ -129,7 +129,15 @@ pub fn cone_net(name: &str) -> (Net, StunServer, Host, Host) {
     let a = net.host(NatSpec::cone_apdf());
     let b = net.host(NatSpec::cone_apdf());
     addrs.extend(net.stun_server().addrs);
-    (net, StunServer { addrs }, a, b)
+    (
+        net,
+        StunServer {
+            addrs,
+            other_addrs: Vec::new(),
+        },
+        a,
+        b,
+    )
 }
 
 /// Runs the pair on a fresh net per try until both sides punch, and returns

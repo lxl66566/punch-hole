@@ -444,7 +444,10 @@ async fn stale_attempt_injection_is_counted_and_ignored() {
     let mut addrs = Vec::new();
     addrs.extend(net.stun_server().addrs);
     addrs.extend(net.stun_server().addrs);
-    let stun = nat_lab::sim::StunServer { addrs };
+    let stun = nat_lab::sim::StunServer {
+        addrs,
+        other_addrs: Vec::new(),
+    };
     // The initiator NAT drops inbound from unknown sources, so it never
     // sees the injected packets. The responder NAT passes any source.
     // A distinct port range keeps the two external endpoints apart.

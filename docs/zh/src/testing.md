@@ -27,7 +27,7 @@ let stun = net.stun_server();
 let host = net.host(nat_lab::NatSpec::cone_apdf());  // 挂在 NAT 后面
 ```
 
-`NatSpec` 把两条正交的 RFC 4787 轴与一个过滤类别组合在一起：映射行为（`MappingBehavior::EndpointIndependent`、`AddressDependent` 或 `AddressPortDependent`）决定哪些目的地复用同一映射，分配策略（`Allocation::Increment { step }`、`Random` 或 `Preserve`）决定如何挑选新的外部端口。预设 `cone_eif()`、`cone_apdf()`、`sequential(step)`、`address_sequential(step)`、`random(range)`、`random_eif(range)` 和 `preserved(filtering)` 覆盖常见形态，`with_*` 构建器可单独调整字段。对称预设默认地址相关过滤，即 CGNAT 的常见形态。
+`NatSpec` 把两条正交的 RFC 4787 轴与一个过滤类别组合在一起：映射行为（`MappingBehavior::EndpointIndependent`、`AddressDependent` 或 `AddressPortDependent`）决定哪些目的地复用同一映射，分配策略（`Allocation::Increment { step }`、`Random` 或 `Preserve`）决定如何挑选新的外部端口。预设 `cone_eif()`、`cone_apdf()`、`sequential(step)`、`address_sequential(step)`、`random(range)`、`random_eif(range)` 和 `preserved(filtering)` 覆盖常见形态，`with_*` 构建器可单独调整字段。对称预设默认地址相关过滤，即 CGNAT 的常见形态。两个引擎内建的 STUN 应答器都支持 RFC 5780 行为发现：各自在双 IP、多端口的地址网格上应答，处理 CHANGE-REQUEST，并在 XOR-MAPPED-ADDRESS 之外报告 RESPONSE-ORIGIN 与 OTHER-ADDRESS，测试套件因此可以直接在线上验证声明的映射行为与过滤类别。
 
 路由暴露观测钩子供断言使用：转发与丢弃计数、活跃映射表、峰值映射数，以及一个有界的等映射清空函数。设置 `NAT_LAB_TRACE` 环境变量会打印每个转发包，定位故障很快。
 

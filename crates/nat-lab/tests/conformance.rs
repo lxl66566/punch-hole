@@ -65,6 +65,76 @@ fn xor_mapped(reply: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
     Some(SocketAddr::from((ip, port)))
 }
 
+/// Builds a binding request carrying CHANGE-REQUEST with the given flags.
+fn change_request(tid: [u8; 12], change_ip: bool, change_port: bool) -> Vec<u8> {
+    let mut request = binding_request(tid).to_vec();
+    // One attribute: four bytes of header, four of flags.
+    request[2..4].copy_from_slice(&8u16.to_be_bytes());
+    request.extend_from_slice(&0x0003_u16.to_be_bytes());
+    request.extend_from_slice(&4u16.to_be_bytes());
+    let mut flags = 0u32;
+    if change_ip {
+        flags |= 0x0004;
+    }
+    if change_port {
+        flags |= 0x0002;
+    }
+    request.extend_from_slice(&flags.to_be_bytes());
+    request
+}
+
+/// Decodes one MAPPED-ADDRESS-shaped attribute (RESPONSE-ORIGIN 0x802b or
+/// OTHER-ADDRESS 0x802c), which stays in the clear.
+fn plain_address(reply: &[u8], attr: u16) -> Option<SocketAddr> {
+    if reply.len() < 20 {
+        return None;
+    }
+    let msg_len = u16::from_be_bytes([reply[2], reply[3]]) as usize;
+    let mut at = 20;
+    while at + 12 <= 20 + msg_len && at + 12 <= reply.len() {
+        let ty = u16::from_be_bytes([reply[at], reply[at + 1]]);
+        let len = u16::from_be_bytes([reply[at + 2], reply[at + 3]]) as usize;
+        if ty == attr && len == 8 && reply[at + 5] == 0x01 {
+            let port = u16::from_be_bytes([reply[at + 6], reply[at + 7]]);
+            let ip = [reply[at + 8], reply[at + 9], reply[at + 10], reply[at + 11]];
+            return Some(SocketAddr::from((ip, port)));
+        }
+        at += 4 + len;
+    }
+    None
+}
+
+/// The three discovery destinations of one responder grid plus the
+/// OTHER-ADDRESS the primary socket advertises: the queried primary, its
+/// port partner on the same IP, the same port on the other IP, and the
+/// both-flags corner.
+async fn discovery_targets(e: &impl Engine) -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
+    let primaries = e.stun_addrs().await;
+    let others = e.stun_other_addrs().await;
+    assert!(!primaries.is_empty(), "the engine exposes STUN addresses");
+    assert!(
+        !others.is_empty(),
+        "the engine exposes discovery alternates"
+    );
+    let primary = primaries[0];
+    let alt_port = primaries
+        .iter()
+        .copied()
+        .find(|a| a.ip() == primary.ip() && a.port() != primary.port())
+        .expect("the primary IP holds a second port");
+    let alt_ip = others
+        .iter()
+        .copied()
+        .find(|a| a.port() == primary.port())
+        .expect("the other IP answers on the primary port");
+    let both = others
+        .iter()
+        .copied()
+        .find(|a| a.port() == alt_port.port())
+        .expect("the other IP answers on the alternate port");
+    (primary, alt_port, alt_ip, both)
+}
+
 /// One client socket sends to two destinations, and both destinations
 /// observe the same source address off one mapping.
 async fn cone_mapping_reuses_one_port_across_destinations(e: impl Engine) {
@@ -458,6 +528,56 @@ conformance!(
     preserve_allocation_mirrors_the_internal_port_then_walks
 );
 
+conformance!(
+    sim_discovery_ei_mapping_reports_one_address_for_every_destination,
+    lab_discovery_ei_mapping_reports_one_address_for_every_destination,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
+    discovery_ei_mapping_reports_one_address_for_every_destination
+);
+
+conformance!(
+    sim_discovery_ad_mapping_splits_by_destination_address,
+    lab_discovery_ad_mapping_splits_by_destination_address,
+    spec(
+        MappingBehavior::AddressDependent,
+        FilterClass::AddressDependent
+    ),
+    discovery_ad_mapping_splits_by_destination_address
+);
+
+conformance!(
+    sim_discovery_apd_mapping_allocates_per_destination,
+    lab_discovery_apd_mapping_allocates_per_destination,
+    spec(
+        MappingBehavior::AddressPortDependent,
+        FilterClass::AddressDependent
+    ),
+    discovery_apd_mapping_allocates_per_destination
+);
+
+conformance!(
+    sim_change_request_reply_follows_the_flags,
+    lab_change_request_reply_follows_the_flags,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
+    change_request_reply_follows_the_flags
+);
+
+conformance!(
+    sim_change_request_reply_from_an_unsent_port_is_filtered,
+    lab_change_request_reply_from_an_unsent_port_is_filtered,
+    spec(
+        MappingBehavior::AddressPortDependent,
+        FilterClass::AddressPortDependent
+    ),
+    change_request_reply_from_an_unsent_port_is_filtered
+);
+
 /// Endpoint-independent mapping with random allocation: one unpredictable
 /// port per socket, shared by every destination. The old single-axis API
 /// could not express the pair — its random shape forced a fresh mapping
@@ -550,6 +670,178 @@ async fn preserve_allocation_mirrors_the_internal_port_then_walks(e: impl Engine
         ports, expected,
         "the lost mirrors walk the window base upward"
     );
+}
+
+/// RFC 5780-style discovery: one client socket probes the primary, its
+/// port partner, and the other IP. An endpoint-independent mapping
+/// reports one mapped address everywhere.
+async fn discovery_ei_mapping_reports_one_address_for_every_destination(e: impl Engine) {
+    let (primary, alt_port, alt_ip, _) = discovery_targets(&e).await;
+    let client = e.client().await.expect("client binds");
+    let mut mapped = Vec::new();
+    for (i, target) in [primary, alt_port, alt_ip].into_iter().enumerate() {
+        let tid = [0x40 + u8::try_from(i).expect("three targets"); 12];
+        client
+            .send_to(&binding_request(tid), target)
+            .await
+            .expect("request sends");
+        let (reply, from) = recv_from(&client).await;
+        assert_eq!(from, target, "the reply leaves the queried socket");
+        assert_eq!(
+            plain_address(&reply, 0x802b),
+            Some(from),
+            "RESPONSE-ORIGIN names the actual source"
+        );
+        mapped.push(xor_mapped(&reply, &tid).expect("reply decodes"));
+    }
+    assert!(
+        mapped.windows(2).all(|w| w[0] == w[1]),
+        "EI mapping reuses one port for every destination: {mapped:?}"
+    );
+}
+
+/// Discovery over an address-dependent mapping: the same-IP destinations
+/// share one mapped address and the other IP opens its own.
+async fn discovery_ad_mapping_splits_by_destination_address(e: impl Engine) {
+    let (primary, alt_port, alt_ip, _) = discovery_targets(&e).await;
+    let client = e.client().await.expect("client binds");
+    let mut mapped = Vec::new();
+    for (i, target) in [primary, alt_port, alt_ip].into_iter().enumerate() {
+        let tid = [0x50 + u8::try_from(i).expect("three targets"); 12];
+        client
+            .send_to(&binding_request(tid), target)
+            .await
+            .expect("request sends");
+        let (reply, from) = recv_from(&client).await;
+        assert_eq!(from, target, "the reply leaves the queried socket");
+        mapped.push(xor_mapped(&reply, &tid).expect("reply decodes"));
+    }
+    assert_eq!(
+        mapped[0], mapped[1],
+        "the same-IP destination reuses the mapping"
+    );
+    assert_ne!(mapped[1], mapped[2], "the other IP opens its own mapping");
+}
+
+/// Discovery over an address-and-port-dependent mapping: every
+/// destination reads its own mapped address.
+async fn discovery_apd_mapping_allocates_per_destination(e: impl Engine) {
+    let (primary, alt_port, alt_ip, _) = discovery_targets(&e).await;
+    let client = e.client().await.expect("client binds");
+    let mut mapped = Vec::new();
+    for (i, target) in [primary, alt_port, alt_ip].into_iter().enumerate() {
+        let tid = [0x60 + u8::try_from(i).expect("three targets"); 12];
+        client
+            .send_to(&binding_request(tid), target)
+            .await
+            .expect("request sends");
+        let (reply, from) = recv_from(&client).await;
+        assert_eq!(from, target, "the reply leaves the queried socket");
+        mapped.push(xor_mapped(&reply, &tid).expect("reply decodes"));
+    }
+    assert_ne!(
+        mapped[0], mapped[1],
+        "the port partner gets its own mapping"
+    );
+    assert_ne!(mapped[1], mapped[2], "the other IP gets its own mapping");
+    assert_ne!(mapped[0], mapped[2], "every destination stands alone");
+}
+
+/// CHANGE-REQUEST reroutes the reply across the grid, and the reply names
+/// its actual source plus the OTHER-ADDRESS.
+async fn change_request_reply_follows_the_flags(e: impl Engine) {
+    let (primary, alt_port, alt_ip, both) = discovery_targets(&e).await;
+    let client = e.client().await.expect("client binds");
+
+    // CHANGE-PORT: the reply leaves the port partner on the same IP.
+    let tid = [0x71; 12];
+    client
+        .send_to(&change_request(tid, false, true), primary)
+        .await
+        .expect("request sends");
+    let (reply, from) = recv_from(&client).await;
+    assert_eq!(
+        from, alt_port,
+        "CHANGE-PORT moves the reply to the port partner"
+    );
+    assert_eq!(
+        plain_address(&reply, 0x802b),
+        Some(alt_port),
+        "RESPONSE-ORIGIN names the actual source"
+    );
+    assert_eq!(
+        plain_address(&reply, 0x802c),
+        Some(both),
+        "OTHER-ADDRESS names the both-flags corner"
+    );
+
+    // CHANGE-IP: the reply leaves the same port on the other IP.
+    let tid = [0x72; 12];
+    client
+        .send_to(&change_request(tid, true, false), primary)
+        .await
+        .expect("request sends");
+    let (reply, from) = recv_from(&client).await;
+    assert_eq!(from, alt_ip, "CHANGE-IP moves the reply to the other IP");
+    assert_eq!(
+        plain_address(&reply, 0x802b),
+        Some(alt_ip),
+        "RESPONSE-ORIGIN names the actual source"
+    );
+
+    // Both flags: the reply leaves the diagonal corner.
+    let tid = [0x73; 12];
+    client
+        .send_to(&change_request(tid, true, true), primary)
+        .await
+        .expect("request sends");
+    let (reply, from) = recv_from(&client).await;
+    assert_eq!(from, both, "both flags move the reply to the other address");
+    assert_eq!(
+        plain_address(&reply, 0x802b),
+        Some(both),
+        "RESPONSE-ORIGIN names the actual source"
+    );
+}
+
+/// Under address-and-port-dependent filtering, the CHANGE-PORT reply
+/// leaves a source the mapping never sent to and dies at the filter,
+/// while the directly addressed alternate still answers.
+async fn change_request_reply_from_an_unsent_port_is_filtered(e: impl Engine) {
+    let (primary, alt_port, ..) = discovery_targets(&e).await;
+    let client = e.client().await.expect("client binds");
+
+    // The queried socket answers and opens the mapping.
+    let tid = [0x81; 12];
+    client
+        .send_to(&binding_request(tid), primary)
+        .await
+        .expect("request sends");
+    let (_, from) = recv_from(&client).await;
+    assert_eq!(from, primary);
+
+    // The CHANGE-PORT reply would leave the port partner, a source the
+    // mapping never sent to: the filter drops it.
+    let tid = [0x82; 12];
+    client
+        .send_to(&change_request(tid, false, true), primary)
+        .await
+        .expect("request sends");
+    assert_silent(&client, NON_DELIVERY).await;
+    e.wait_filter_drops(1).await;
+    if let Some(drops) = e.filter_drops() {
+        assert_eq!(drops, 1, "the cross-socket reply is counted as filtered");
+    }
+
+    // The responder's other socket answers when addressed directly: that
+    // destination holds its own mapping.
+    let tid = [0x83; 12];
+    client
+        .send_to(&binding_request(tid), alt_port)
+        .await
+        .expect("request sends");
+    let (_, from) = recv_from(&client).await;
+    assert_eq!(from, alt_port, "the directly queried alternate answers");
 }
 
 /// The simulator keeps a closed socket's mapping in the table for the

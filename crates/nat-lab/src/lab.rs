@@ -36,6 +36,7 @@ use crate::{
     MAX_DATAGRAM,
     sim::{Allocation, FilterClass, NatSpec, ReuseKey},
     socket::{Family, UdpFactory, UdpIo},
+    stun::Grid,
 };
 
 /// Lab addresses drawn in this process: 127.hi.lo.1.
@@ -1253,6 +1254,9 @@ fn seeded_rng(seed: &str) -> StdRng {
 pub struct StunServer {
     /// `host:port` strings for `PunchConfig::stun_servers`.
     pub addrs: Vec<String>,
+    /// Alternate-IP `host:port` strings the responder answers RFC 5780
+    /// discovery requests from: the OTHER-ADDRESS targets.
+    pub other_addrs: Vec<String>,
     /// Stops the responder loops.
     cancel: CancellationToken,
     /// Drawn addresses, returned to the registry on drop.
@@ -1268,11 +1272,14 @@ impl Drop for StunServer {
 
 /// Starts a STUN responder over two dedicated loopback addresses.
 ///
-/// Four sockets, two ports on each of two addresses, answer binding
-/// requests with the v4 XOR-MAPPED address of the datagram's source. Four
-/// destinations is what classification needs for a confident EasySym fit,
-/// and spanning two IPs is what a cone reading needs before it counts as
-/// mapping-dimension evidence.
+/// Four sockets, two ports on each of two addresses, form the RFC 5780
+/// discovery grid: every socket answers binding requests with the v4
+/// XOR-MAPPED address of the datagram's source plus RESPONSE-ORIGIN and
+/// OTHER-ADDRESS, and a CHANGE-REQUEST reroutes the reply to the
+/// flag-selected alternate socket. Four destinations is what
+/// classification needs for a confident EasySym fit, and spanning two IPs
+/// is what a cone reading needs before it counts as mapping-dimension
+/// evidence.
 pub fn stun_responder() -> io::Result<StunServer> {
     const PORTS: [u16; 2] = [3478, 3479];
     // Every port must bind on both addresses; a twin process that holds
@@ -1280,27 +1287,33 @@ pub fn stun_responder() -> io::Result<StunServer> {
     for _ in 0..16 {
         let first = draw_stun_ip()?;
         let second = draw_stun_ip()?;
-        let layout = [
-            (first, PORTS[0]),
-            (first, PORTS[1]),
-            (second, PORTS[0]),
-            (second, PORTS[1]),
-        ];
+        let grid = Grid::new([first, second], &PORTS);
+        let layout = grid.addrs();
         let mut sockets = Vec::with_capacity(layout.len());
-        let bound = layout
-            .iter()
-            .all(|&(ip, port)| bind_public(ip, port).map(|s| sockets.push(s)).is_ok());
+        let bound = layout.iter().all(|&addr| {
+            let SocketAddr::V4(v4) = addr else {
+                return false;
+            };
+            bind_public(*v4.ip(), v4.port())
+                .map(|s| sockets.push(s))
+                .is_ok()
+        });
         if bound {
             let cancel = CancellationToken::new();
-            for sock in sockets {
-                tokio::spawn(stun_loop(sock, cancel.clone()));
+            let sockets: Arc<[Arc<UdpSocket>]> =
+                sockets.into_iter().map(Arc::new).collect::<Vec<_>>().into();
+            for sock in sockets.iter() {
+                tokio::spawn(stun_loop(
+                    Arc::clone(sock),
+                    grid.clone(),
+                    Arc::clone(&sockets),
+                    cancel.clone(),
+                ));
             }
-            let addrs = layout
-                .iter()
-                .map(|&(ip, port)| format!("{ip}:{port}"))
-                .collect();
+            let split = layout.len() / 2;
             return Ok(StunServer {
-                addrs,
+                addrs: layout.iter().map(ToString::to_string).collect(),
+                other_addrs: layout[split..].iter().map(ToString::to_string).collect(),
                 cancel,
                 ips: vec![first, second],
             });
@@ -1317,7 +1330,16 @@ pub fn stun_responder() -> io::Result<StunServer> {
 }
 
 /// Answers binding requests on one STUN socket until the server drops.
-async fn stun_loop(sock: UdpSocket, cancel: CancellationToken) {
+///
+/// A CHANGE-REQUEST reply leaves the grid's flag-selected socket, so every
+/// loop holds a handle on every socket of the grid.
+async fn stun_loop(
+    sock: Arc<UdpSocket>,
+    grid: Grid,
+    sockets: Arc<[Arc<UdpSocket>]>,
+    cancel: CancellationToken,
+) {
+    let received = sock.local_addr().expect("bound socket reports its address");
     let mut buf = [0u8; 128];
     loop {
         let recv = sock.recv_from(&mut buf);
@@ -1325,8 +1347,16 @@ async fn stun_loop(sock: UdpSocket, cancel: CancellationToken) {
             () = cancel.cancelled() => break,
             result = recv => match result {
                 Ok((len, from)) => {
-                    if let Some(reply) = crate::stun::binding_reply(&buf[..len], from) {
-                        let _ = sock.send_to(&reply, from).await;
+                    let Some(flags) = crate::stun::binding_request_flags(&buf[..len]) else {
+                        continue;
+                    };
+                    let reply_src = grid.reply_source(received, flags);
+                    let other = grid.other_address(received);
+                    if let Some(reply) =
+                        crate::stun::discovery_reply(&buf[..len], from, reply_src, other)
+                    {
+                        let at = grid.index_of(reply_src).expect("grid address");
+                        let _ = sockets[at].send_to(&reply, from).await;
                     }
                 },
                 Err(e) if is_link_reset(&e) => {},
@@ -1970,6 +2000,7 @@ mod tests {
 
         let stun = stun_responder().expect("responder spawns");
         assert_eq!(stun.addrs.len(), 4);
+        assert_eq!(stun.other_addrs.len(), 2, "the other IP holds both ports");
         let stun_ips: HashSet<Ipv4Addr> = stun
             .addrs
             .iter()

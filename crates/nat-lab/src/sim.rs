@@ -23,7 +23,10 @@ use std::{
 use rand::{prelude::*, rngs::StdRng};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::socket::{UdpFactory, UdpIo};
+use crate::{
+    socket::{UdpFactory, UdpIo},
+    stun::Grid,
+};
 
 /// Inbound filtering behavior of a simulated NAT, per RFC 4787.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,32 +575,63 @@ impl Net {
         }
     }
 
-    /// Starts a STUN server that answers binding requests on four ports,
-    /// which gives the prober four distinct destinations.
+    /// Starts a STUN server that answers binding requests on four primary
+    /// ports, which gives the prober four distinct destinations, and
+    /// mirrors them on a second address for RFC 5780 discovery: a
+    /// CHANGE-REQUEST reroutes the reply to the flag-selected socket of
+    /// the grid, and every reply names its source and the OTHER-ADDRESS.
     #[must_use]
     pub fn stun_server(&self) -> StunServer {
         let index = self.inner.subnet_counter.fetch_add(1, Ordering::Relaxed);
-        let ip = Ipv4Addr::new(1, 1, 1, index as u8 + 1);
-        let mut addrs = Vec::new();
-        for port in [3478, 3479, 3480, 3481] {
-            let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+        let grid = Grid::new(
+            [
+                Ipv4Addr::new(1, 1, 1, index as u8 + 1),
+                Ipv4Addr::new(1, 1, 2, index as u8 + 1),
+            ],
+            &[3478, 3479, 3480, 3481],
+        );
+        let addrs = grid.addrs();
+        let split = addrs.len() / 2;
+        for addr in &addrs {
             let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(16);
-            let _ = self.inner.tx.send(Msg::Register { addr, inbox: tx });
+            let _ = self.inner.tx.send(Msg::Register {
+                addr: *addr,
+                inbox: tx,
+            });
             let router_tx = self.inner.tx.clone();
+            let grid = grid.clone();
+            let received = *addr;
             tokio::spawn(async move {
                 while let Some((from, payload)) = rx.recv().await {
-                    if let Some(reply) = crate::stun::binding_reply(&payload, from) {
+                    let Some(flags) = crate::stun::binding_request_flags(&payload) else {
+                        continue;
+                    };
+                    let reply_src = grid.reply_source(received, flags);
+                    let other = grid.other_address(received);
+                    if let Some(reply) =
+                        crate::stun::discovery_reply(&payload, from, reply_src, other)
+                    {
+                        // The router routes by address, so the reply
+                        // surfaces from the flag-selected grid socket.
                         let _ = router_tx.send(Msg::Packet {
-                            src: addr,
+                            src: reply_src,
                             dst: from,
                             payload: reply,
                         });
                     }
                 }
             });
-            addrs.push(format!("{ip}:{port}"));
         }
-        StunServer { addrs }
+        let to_strings = |addrs: &[SocketAddr]| {
+            addrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        };
+        StunServer {
+            addrs: to_strings(&addrs[..split]),
+            other_addrs: to_strings(&addrs[split..]),
+        }
     }
 
     /// Sets data-plane loss in permille, applied by the router.
@@ -683,8 +717,11 @@ impl Net {
 
 /// Handle of a simulated STUN server.
 pub struct StunServer {
-    /// `host:port` strings for `PunchConfig::stun_servers`.
+    /// Primary `host:port` strings for `PunchConfig::stun_servers`.
     pub addrs: Vec<String>,
+    /// Alternate-IP `host:port` strings the server answers RFC 5780
+    /// discovery requests from: the OTHER-ADDRESS targets.
+    pub other_addrs: Vec<String>,
 }
 
 /// A host on the network, usable as a socket factory.
