@@ -11,10 +11,12 @@
 //!   the code under test runs unmodified.
 //!
 //! Both engines translate and filter datagrams according to a [`NatSpec`]:
-//! a mapping policy ([`Mapping`]) crossed with an inbound filtering class
-//! ([`FilterClass`]) over a port range. A suite that asserts mapping and
-//! filtering behavior can parameterize over the engine and keep one set of
-//! expectations.
+//! a mapping behavior ([`MappingBehavior`], which destinations reuse a
+//! mapping) and an allocation policy ([`Allocation`], how a fresh external
+//! port is chosen) crossed with an inbound filtering class
+//! ([`FilterClass`]) over a port range. A suite that asserts mapping,
+//! allocation, and filtering behavior can parameterize over the engine and
+//! keep one set of expectations.
 //!
 //! # Example
 //!
@@ -75,7 +77,7 @@ mod stun;
 pub use lab::{
     Direction, LabHost, LabSocket, NatLab, StunServer, Tap, TapDecision, TapEvent, stun_responder,
 };
-pub use sim::{FilterClass, Host, Mapping, NatSpec, Net, SimSocket};
+pub use sim::{Allocation, FilterClass, Host, MappingBehavior, NatSpec, Net, SimSocket};
 pub use socket::{Family, UdpFactory, UdpIo};
 
 /// The largest UDP payload the loopback lab forwards: the IPv4 datagram

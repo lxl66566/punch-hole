@@ -18,15 +18,17 @@ use std::{
 };
 
 use harness::{Engine, LabEng, SimEng, assert_silent, claim_released, recv_from};
-use nat_lab::{FilterClass, Mapping, NatSpec, UdpIo};
+use nat_lab::{Allocation, FilterClass, MappingBehavior, NatSpec, UdpIo};
 
 /// How long a non-delivery assertion waits before it declares silence.
 const NON_DELIVERY: Duration = Duration::from_millis(300);
 
 /// One narrow-range spec, so the lab's port window discovery stays instant.
-fn spec(mapping: Mapping, filtering: FilterClass) -> NatSpec {
+/// The step-one increment is the walk the cone presets use.
+fn spec(mapping: MappingBehavior, filtering: FilterClass) -> NatSpec {
     NatSpec {
         mapping,
+        allocation: Allocation::Increment { step: 1 },
         filtering,
         port_range: 30_000..30_040,
     }
@@ -348,27 +350,34 @@ macro_rules! conformance {
 conformance!(
     sim_cone_mapping_reuses_one_port_across_destinations,
     lab_cone_mapping_reuses_one_port_across_destinations,
-    spec(Mapping::Cone, FilterClass::EndpointIndependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
     cone_mapping_reuses_one_port_across_destinations
 );
 
 conformance!(
     sim_sequential_mapping_walks_one_step_per_destination,
     lab_sequential_mapping_walks_one_step_per_destination,
-    spec(
-        Mapping::Sequential { step: 2 },
-        FilterClass::AddressDependent
-    ),
+    NatSpec {
+        mapping: MappingBehavior::AddressPortDependent,
+        allocation: Allocation::Increment { step: 2 },
+        filtering: FilterClass::AddressDependent,
+        port_range: 30_000..30_040,
+    },
     sequential_mapping_walks_one_step_per_destination
 );
 
 conformance!(
     sim_address_sequential_shares_one_mapping_per_destination_address,
     lab_address_sequential_shares_one_mapping_per_destination_address,
-    spec(
-        Mapping::AddressSequential { step: 2 },
-        FilterClass::AddressDependent
-    ),
+    NatSpec {
+        mapping: MappingBehavior::AddressDependent,
+        allocation: Allocation::Increment { step: 2 },
+        filtering: FilterClass::AddressDependent,
+        port_range: 30_000..30_040,
+    },
     address_sequential_shares_one_mapping_per_destination_address
 );
 
@@ -376,7 +385,8 @@ conformance!(
     sim_random_mappings_hold_distinct_ports,
     lab_random_mappings_hold_distinct_ports,
     NatSpec {
-        mapping: Mapping::Random,
+        mapping: MappingBehavior::AddressPortDependent,
+        allocation: Allocation::Random,
         filtering: FilterClass::AddressDependent,
         port_range: 30_000..30_010,
     },
@@ -386,37 +396,161 @@ conformance!(
 conformance!(
     sim_endpoint_independent_filter_admits_an_unsolicited_stranger,
     lab_endpoint_independent_filter_admits_an_unsolicited_stranger,
-    spec(Mapping::Cone, FilterClass::EndpointIndependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
     endpoint_independent_filter_admits_an_unsolicited_stranger
 );
 
 conformance!(
     sim_address_dependent_filter_splits_by_source_ip,
     lab_address_dependent_filter_splits_by_source_ip,
-    spec(Mapping::Cone, FilterClass::AddressDependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::AddressDependent
+    ),
     address_dependent_filter_splits_by_source_ip
 );
 
 conformance!(
     sim_address_port_dependent_filter_admits_only_sent_destinations,
     lab_address_port_dependent_filter_admits_only_sent_destinations,
-    spec(Mapping::Cone, FilterClass::AddressPortDependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::AddressPortDependent
+    ),
     address_port_dependent_filter_admits_only_sent_destinations
 );
 
 conformance!(
     sim_stun_responder_reports_the_mapped_external_address,
     lab_stun_responder_reports_the_mapped_external_address,
-    spec(Mapping::Cone, FilterClass::EndpointIndependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
     stun_responder_reports_the_mapped_external_address
 );
 
 conformance!(
     sim_socket_drop_releases_mappings_and_keeps_the_peak,
     lab_socket_drop_releases_mappings_and_keeps_the_peak,
-    spec(Mapping::Cone, FilterClass::EndpointIndependent),
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
     socket_drop_releases_mappings_and_keeps_the_peak
 );
+
+conformance!(
+    sim_ei_mapping_with_random_allocation_holds_one_port_per_socket,
+    lab_ei_mapping_with_random_allocation_holds_one_port_per_socket,
+    NatSpec::random_eif(30_000..30_010),
+    ei_mapping_with_random_allocation_holds_one_port_per_socket
+);
+
+conformance!(
+    sim_preserve_allocation_mirrors_the_internal_port_then_walks,
+    lab_preserve_allocation_mirrors_the_internal_port_then_walks,
+    NatSpec::preserved(FilterClass::AddressDependent)
+        .with_mapping(MappingBehavior::AddressPortDependent),
+    preserve_allocation_mirrors_the_internal_port_then_walks
+);
+
+/// Endpoint-independent mapping with random allocation: one unpredictable
+/// port per socket, shared by every destination. The old single-axis API
+/// could not express the pair — its random shape forced a fresh mapping
+/// per destination.
+async fn ei_mapping_with_random_allocation_holds_one_port_per_socket(e: impl Engine) {
+    let d1 = e.public_socket().await.expect("d1 binds");
+    let d2 = e.public_socket().await.expect("d2 binds");
+    let d3 = e.public_socket().await.expect("d3 binds");
+    let c1 = e.client().await.expect("c1 binds");
+    let c2 = e.client().await.expect("c2 binds");
+
+    for dest in [&d1, &d2, &d3] {
+        c1.send_to(b"a", dest.local_addr().expect("dest addr"))
+            .await
+            .expect("c1 sends");
+    }
+    let (_, a1) = recv_from(&d1).await;
+    let (_, a2) = recv_from(&d2).await;
+    let (_, a3) = recv_from(&d3).await;
+    assert_eq!(a1, a2, "the second destination reuses c1's mapping");
+    assert_eq!(a2, a3, "the third destination reuses c1's mapping");
+
+    for dest in [&d1, &d2, &d3] {
+        c2.send_to(b"b", dest.local_addr().expect("dest addr"))
+            .await
+            .expect("c2 sends");
+    }
+    let (_, b1) = recv_from(&d1).await;
+    let (_, b2) = recv_from(&d2).await;
+    let (_, b3) = recv_from(&d3).await;
+    assert_eq!(b1, b2, "the second destination reuses c2's mapping");
+    assert_eq!(b2, b3, "the third destination reuses c2's mapping");
+
+    assert_ne!(
+        a1, b1,
+        "the random draws hand the two sockets distinct ports"
+    );
+    e.wait_mappings(2).await;
+    assert_eq!(e.mapping_count(), 2, "one mapping per socket in total");
+    let window = e.port_window();
+    assert!(
+        window.contains(&a1.port()) && window.contains(&b1.port()),
+        "both draws stay inside the allocation window"
+    );
+}
+
+/// Preserve allocation mirrors the client's internal port while it is
+/// free; the socket's next mapping loses that race and falls into the
+/// sequential walk through the window.
+async fn preserve_allocation_mirrors_the_internal_port_then_walks(e: impl Engine) {
+    let d1 = e.public_socket().await.expect("d1 binds");
+    let d2 = e.public_socket().await.expect("d2 binds");
+    let d3 = e.public_socket().await.expect("d3 binds");
+    let client = e.client().await.expect("client binds");
+    let internal = client.local_addr().expect("client addr").port();
+
+    client
+        .send_to(b"one", d1.local_addr().expect("d1 addr"))
+        .await
+        .expect("send one");
+    e.wait_mappings(1).await;
+    let (_, ext1) = e.snapshot()[0];
+    assert_eq!(
+        ext1.port(),
+        internal,
+        "the free internal port is mirrored as the external port"
+    );
+
+    // The next two mappings want the same mirror and lose the race: the
+    // first mapping holds the port, so the walk takes over.
+    client
+        .send_to(b"two", d2.local_addr().expect("d2 addr"))
+        .await
+        .expect("send two");
+    client
+        .send_to(b"three", d3.local_addr().expect("d3 addr"))
+        .await
+        .expect("send three");
+    e.wait_mappings(3).await;
+    let base = e.port_window().start;
+    let mut ports: Vec<u16> = e
+        .snapshot()
+        .into_iter()
+        .map(|(_, ext)| ext.port())
+        .collect();
+    ports.sort_unstable();
+    let mut expected = vec![base, base + 1, internal];
+    expected.sort_unstable();
+    assert_eq!(
+        ports, expected,
+        "the lost mirrors walk the window base upward"
+    );
+}
 
 /// The simulator keeps a closed socket's mapping in the table for the
 /// expiry window and releases it after.
@@ -424,7 +558,10 @@ conformance!(
 async fn sim_mapping_expiry_keeps_translation_for_the_window_then_releases() {
     let e = SimEng::new(
         "sim_mapping_expiry_keeps_translation_for_the_window_then_releases",
-        spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        spec(
+            MappingBehavior::EndpointIndependent,
+            FilterClass::EndpointIndependent,
+        ),
     );
     e.set_expiry(Duration::from_secs(30));
     let dest = e.public_socket().await.expect("dest binds");
@@ -458,7 +595,10 @@ async fn sim_mapping_expiry_keeps_translation_for_the_window_then_releases() {
 async fn lab_mapping_expiry_keeps_translation_for_the_window_then_releases() {
     let e = LabEng::new(
         "lab_mapping_expiry_keeps_translation_for_the_window_then_releases",
-        spec(Mapping::Cone, FilterClass::EndpointIndependent),
+        spec(
+            MappingBehavior::EndpointIndependent,
+            FilterClass::EndpointIndependent,
+        ),
     )
     .await;
     e.set_expiry(Duration::from_millis(1500));

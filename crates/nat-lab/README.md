@@ -7,7 +7,7 @@ Testing NAT traversal needs a NAT on the other side of the wire. `nat-lab` provi
 - **Virtual engine** (`nat_lab::sim`): a deterministic virtual IPv4 network. Hosts attach directly or behind a NAT, STUN servers answer binding requests, and every packet crosses a router task that applies translation, filtering, and loss. All randomness flows through one seeded generator, and tests run under paused tokio time, so a full session reproduces from its seed in milliseconds of wall time.
 - **Loopback engine** (`nat_lab::lab`): a userspace NAT forwarder over real OS sockets on the 127.0.0.0/8 space. Client sockets are real sockets; every outbound datagram crosses a gateway task that applies the mapping and filtering policy and leaves through a per-mapping public socket. The code under test runs unmodified, so OS bind rules, ICMP quirks (Windows surfaces loopback port-unreachable as `ConnectionReset`), and real timing all apply.
 
-Both engines translate and filter datagrams according to one `NatSpec`: a mapping policy (`Cone`, `Sequential { step }`, `AddressSequential { step }`, `Random`) crossed with an inbound filtering class per RFC 4787 (endpoint-independent, address-dependent, address-and-port-dependent) over a port range.
+Both engines translate and filter datagrams according to one `NatSpec`: a mapping behavior per RFC 4787 (`MappingBehavior::EndpointIndependent`, `AddressDependent`, `AddressPortDependent`) crossed with an allocation policy (`Allocation::Increment { step }`, `Random`, `Preserve`) and an inbound filtering class (endpoint-independent, address-dependent, address-and-port-dependent) over a port range.
 
 ## Usage
 

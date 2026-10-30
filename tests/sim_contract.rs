@@ -11,7 +11,7 @@ use std::{
 };
 
 use common::config;
-use nat_lab::sim::{FilterClass, Mapping, NatSpec, Net};
+use nat_lab::sim::{NatSpec, Net};
 use punch_hole::{
     AbortReason, PunchConfig, Puncher,
     error::{Phase, PunchError},
@@ -411,7 +411,7 @@ async fn bad_config_is_rejected() {
 
 #[tokio::test(start_paused = true)]
 async fn sequential_nat_produces_stepped_allocations() {
-    // Sanity for the Mapping::Sequential engine of the simulator itself.
+    // Sanity for the simulator's stepped sequential engine.
     let net = Net::seeded("sequential_alloc");
     let stun = net.stun_server();
     let host = net.host(NatSpec::sequential(2));
@@ -424,7 +424,6 @@ async fn sequential_nat_produces_stepped_allocations() {
         report.local_class,
         Some(punch_hole::NatClass::EasySym { step: 2 })
     );
-    let _ = Mapping::Cone;
 }
 
 /// Foreign-attempt packets that reach a live punch socket are counted as
@@ -450,11 +449,7 @@ async fn stale_attempt_injection_is_counted_and_ignored() {
     // sees the injected packets. The responder NAT passes any source.
     // A distinct port range keeps the two external endpoints apart.
     let a = net.host(NatSpec::cone_apdf());
-    let b = net.host(NatSpec {
-        mapping: Mapping::Cone,
-        filtering: FilterClass::EndpointIndependent,
-        port_range: 2048..65535,
-    });
+    let b = net.host(NatSpec::cone_eif().with_range(2048..65535));
 
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);

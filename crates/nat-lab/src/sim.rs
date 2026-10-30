@@ -12,7 +12,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::Range,
     sync::{
         Arc, Mutex as StdMutex,
@@ -36,26 +36,42 @@ pub enum FilterClass {
     AddressPortDependent,
 }
 
-/// Outbound mapping behavior of a simulated NAT.
+/// RFC 4787 mapping behavior: which destinations reuse an existing mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mapping {
-    /// One external port per internal socket.
-    Cone,
-    /// A new port per destination address and port, walking a constant step.
-    Sequential { step: i16 },
-    /// A new port per destination address, walking a constant step.
-    ///
-    /// Common CGNAT shape: the ports of one server share a mapping, and a
-    /// second server address opens its own.
-    AddressSequential { step: i16 },
-    /// A new port per destination, drawn at random.
-    Random,
+pub enum MappingBehavior {
+    /// One mapping per internal socket; every destination reuses it.
+    EndpointIndependent,
+    /// One mapping per destination address: the ports of one server share
+    /// it, and a second server address opens its own. Common CGNAT shape.
+    AddressDependent,
+    /// A fresh mapping per destination address and port.
+    AddressPortDependent,
 }
 
-/// Configuration of one simulated NAT.
+/// RFC 4787 §4.1 allocation policy: how a fresh external port is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allocation {
+    /// Sequential walk through `port_range`, advancing `step` per
+    /// allocation.
+    Increment { step: i16 },
+    /// Uniform random draw from `port_range` per allocation, from the ports
+    /// no live mapping holds.
+    Random,
+    /// Mirror the client's internal port; on collision fall back to the
+    /// sequential walk through `port_range`.
+    ///
+    /// The walk starts at `port_range` and not at the internal port,
+    /// because an OS-assigned client port usually sits outside the range
+    /// the NAT allocates from.
+    Preserve,
+}
+
+/// Configuration of one simulated NAT: the two orthogonal RFC 4787 axes
+/// over a port range, plus the inbound filtering class.
 #[derive(Debug, Clone)]
 pub struct NatSpec {
-    pub mapping: Mapping,
+    pub mapping: MappingBehavior,
+    pub allocation: Allocation,
     pub filtering: FilterClass,
     pub port_range: Range<u16>,
 }
@@ -65,7 +81,8 @@ impl NatSpec {
     #[must_use]
     pub fn cone_eif() -> Self {
         Self {
-            mapping: Mapping::Cone,
+            mapping: MappingBehavior::EndpointIndependent,
+            allocation: Allocation::Increment { step: 1 },
             filtering: FilterClass::EndpointIndependent,
             port_range: 1024..65535,
         }
@@ -75,7 +92,8 @@ impl NatSpec {
     #[must_use]
     pub fn cone_apdf() -> Self {
         Self {
-            mapping: Mapping::Cone,
+            mapping: MappingBehavior::EndpointIndependent,
+            allocation: Allocation::Increment { step: 1 },
             filtering: FilterClass::AddressPortDependent,
             port_range: 1024..65535,
         }
@@ -89,7 +107,8 @@ impl NatSpec {
     #[must_use]
     pub fn sequential(step: i16) -> Self {
         Self {
-            mapping: Mapping::Sequential { step },
+            mapping: MappingBehavior::AddressPortDependent,
+            allocation: Allocation::Increment { step },
             filtering: FilterClass::AddressDependent,
             port_range: 30000..40000,
         }
@@ -102,7 +121,8 @@ impl NatSpec {
     #[must_use]
     pub fn address_sequential(step: i16) -> Self {
         Self {
-            mapping: Mapping::AddressSequential { step },
+            mapping: MappingBehavior::AddressDependent,
+            allocation: Allocation::Increment { step },
             filtering: FilterClass::AddressDependent,
             port_range: 30000..40000,
         }
@@ -112,9 +132,88 @@ impl NatSpec {
     #[must_use]
     pub fn random(range: Range<u16>) -> Self {
         Self {
-            mapping: Mapping::Random,
+            mapping: MappingBehavior::AddressPortDependent,
+            allocation: Allocation::Random,
             filtering: FilterClass::AddressDependent,
             port_range: range,
+        }
+    }
+
+    /// An endpoint-independent NAT drawing each socket's port at random
+    /// from the given range: the common home-router shape, one
+    /// unpredictable port per socket shared by every destination.
+    #[must_use]
+    pub fn random_eif(range: Range<u16>) -> Self {
+        Self {
+            mapping: MappingBehavior::EndpointIndependent,
+            allocation: Allocation::Random,
+            filtering: FilterClass::EndpointIndependent,
+            port_range: range,
+        }
+    }
+
+    /// A port-preserving NAT with the given filtering.
+    ///
+    /// Each socket's first mapping mirrors its internal port while that
+    /// port is free, which keeps port predictions exact; collisions fall
+    /// back to the sequential walk.
+    #[must_use]
+    pub fn preserved(filtering: FilterClass) -> Self {
+        Self {
+            mapping: MappingBehavior::EndpointIndependent,
+            allocation: Allocation::Preserve,
+            filtering,
+            port_range: 30000..40000,
+        }
+    }
+
+    /// Replaces the mapping behavior.
+    #[must_use]
+    pub fn with_mapping(mut self, mapping: MappingBehavior) -> Self {
+        self.mapping = mapping;
+        self
+    }
+
+    /// Replaces the allocation policy.
+    #[must_use]
+    pub fn with_allocation(mut self, allocation: Allocation) -> Self {
+        self.allocation = allocation;
+        self
+    }
+
+    /// Replaces the filtering class.
+    #[must_use]
+    pub fn with_filtering(mut self, filtering: FilterClass) -> Self {
+        self.filtering = filtering;
+        self
+    }
+
+    /// Replaces the port range.
+    #[must_use]
+    pub fn with_range(mut self, port_range: Range<u16>) -> Self {
+        self.port_range = port_range;
+        self
+    }
+}
+
+/// The reuse key one mapping lives under, chosen by the mapping behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ReuseKey {
+    /// One mapping per client socket.
+    Socket(SocketAddr),
+    /// One mapping per client socket and destination address.
+    Address(SocketAddr, IpAddr),
+    /// One mapping per client socket and destination.
+    Dest(SocketAddr, SocketAddr),
+}
+
+impl ReuseKey {
+    /// The key one outbound datagram translates under.
+    pub(crate) fn new(behavior: MappingBehavior, local: SocketAddr, dst: SocketAddr) -> Self {
+        match behavior {
+            MappingBehavior::EndpointIndependent => Self::Socket(local),
+            MappingBehavior::AddressDependent => Self::Address(local, dst.ip()),
+            MappingBehavior::AddressPortDependent => Self::Dest(local, dst),
         }
     }
 }
@@ -129,16 +228,15 @@ struct MappingEntry {
 struct NatShared {
     spec: NatSpec,
     public_ip: Ipv4Addr,
-    /// Cone mappings, keyed by local port.
-    cone: StdMutex<HashMap<u16, MappingEntry>>,
-    /// Symmetric mappings, keyed by local port and destination.
-    sym: StdMutex<HashMap<(u16, SocketAddr), MappingEntry>>,
+    /// Live mappings under their reuse key, chosen by the mapping
+    /// behavior.
+    mappings: StdMutex<HashMap<ReuseKey, MappingEntry>>,
     next_alloc: AtomicU32,
     peak: AtomicU32,
     /// Datagrams the filter rejected.
     filter_drops: AtomicU32,
-    /// Allocation count at which the port walk jumps to a fresh base,
-    /// armed by a test and spent once.
+    /// Allocation count at which the stepped port walk jumps to a fresh
+    /// base, armed by a test and spent once.
     rebind: StdMutex<Option<u32>>,
 }
 
@@ -148,8 +246,7 @@ impl NatShared {
         Self {
             spec,
             public_ip,
-            cone: StdMutex::new(HashMap::new()),
-            sym: StdMutex::new(HashMap::new()),
+            mappings: StdMutex::new(HashMap::new()),
             next_alloc: AtomicU32::new(0),
             peak: AtomicU32::new(0),
             filter_drops: AtomicU32::new(0),
@@ -163,51 +260,23 @@ impl NatShared {
         local: SocketAddr,
         dst: SocketAddr,
     ) -> SocketAddr {
-        let symmetric = !matches!(self.spec.mapping, Mapping::Cone);
-        let mut cone = self.cone.lock().expect("cone lock");
-        let mut sym = self.sym.lock().expect("sym lock");
+        let key = ReuseKey::new(self.spec.mapping, local, dst);
+        let mut mappings = self.mappings.lock().expect("mapping lock");
         // External ports of the live mappings, which a fresh allocation
         // avoids.
-        let used: Vec<u16> = cone
-            .values()
-            .chain(sym.values())
-            .map(|e| e.ext_port)
-            .collect();
-        if symmetric {
-            // Symmetric mappings key on the destination. An address
-            // dependent NAT keys on the destination address alone, so the
-            // ports of one server share one mapping.
-            let key = match self.spec.mapping {
-                Mapping::AddressSequential { .. } => (local.port(), SocketAddr::new(dst.ip(), 0)),
-                _ => (local.port(), dst),
+        let used: Vec<u16> = mappings.values().map(|e| e.ext_port).collect();
+        if let std::collections::hash_map::Entry::Vacant(e) = mappings.entry(key) {
+            let entry = MappingEntry {
+                local,
+                ext_port: self.alloc_port(rng, &used, local),
+                dests: HashSet::new(),
             };
-            if let std::collections::hash_map::Entry::Vacant(e) = sym.entry(key) {
-                let entry = MappingEntry {
-                    local,
-                    ext_port: self.alloc_port(rng, &used),
-                    dests: HashSet::new(),
-                };
-                e.insert(entry);
-                self.note_mapping_count(cone.len() + sym.len());
-            }
-            let entry = sym.get_mut(&key).expect("entry just inserted");
-            entry.dests.insert(dst);
-            SocketAddr::V4(SocketAddrV4::new(self.public_ip, entry.ext_port))
-        } else {
-            let key = local.port();
-            if let std::collections::hash_map::Entry::Vacant(e) = cone.entry(key) {
-                let entry = MappingEntry {
-                    local,
-                    ext_port: self.alloc_port(rng, &used),
-                    dests: HashSet::new(),
-                };
-                e.insert(entry);
-                self.note_mapping_count(cone.len() + sym.len());
-            }
-            let entry = cone.get_mut(&key).expect("entry just inserted");
-            entry.dests.insert(dst);
-            SocketAddr::V4(SocketAddrV4::new(self.public_ip, entry.ext_port))
+            e.insert(entry);
+            self.note_mapping_count(mappings.len());
         }
+        let entry = mappings.get_mut(&key).expect("entry just inserted");
+        entry.dests.insert(dst);
+        SocketAddr::V4(SocketAddrV4::new(self.public_ip, entry.ext_port))
     }
 
     fn note_mapping_count(&self, current: usize) {
@@ -233,24 +302,25 @@ impl NatShared {
         }
     }
 
-    fn alloc_port(&self, rng: &StdMutex<StdRng>, used: &[u16]) -> u16 {
+    fn alloc_port(&self, rng: &StdMutex<StdRng>, used: &[u16], client: SocketAddr) -> u16 {
         let start = self.spec.port_range.start;
         let end = self.spec.port_range.end;
         let len = u64::from(end - start);
-        match self.spec.mapping {
-            Mapping::Cone
-            | Mapping::Sequential { step: 1 }
-            | Mapping::AddressSequential { step: 1 } => {
-                let n = u64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
-                start + (n % len) as u16
-            },
-            Mapping::Sequential { step } | Mapping::AddressSequential { step } => {
+        match self.spec.allocation {
+            Allocation::Increment { step } => {
                 let n = i64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
-                let n = self.apply_rebind(n, rng);
+                // The rebind fault models a router restart of the port
+                // walk and stays armed for stepped walks only; the plain
+                // step-one walk of the cone presets ignores it.
+                let n = if step == 1 {
+                    n
+                } else {
+                    self.apply_rebind(n, rng)
+                };
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },
-            Mapping::Random => {
+            Allocation::Random => {
                 let mut rng = rng.lock().expect("rng lock");
                 // A real NAT never hands two live mappings the same port,
                 // so the draw comes from the ports no live mapping holds.
@@ -260,6 +330,18 @@ impl NatShared {
                     return rng.random_range(start..end);
                 }
                 free[rng.random_range(0..free.len())]
+            },
+            Allocation::Preserve => {
+                // Mirror the client's internal port while no live mapping
+                // holds it; the fallback walks the range like a step-one
+                // increment. The rebind fault stays a no-op here: a
+                // mirrored port does not follow the walk.
+                let internal = client.port();
+                if !used.contains(&internal) {
+                    return internal;
+                }
+                let n = u64::from(self.next_alloc.fetch_add(1, Ordering::Relaxed));
+                start + (n % len) as u16
             },
         }
     }
@@ -272,9 +354,9 @@ impl NatShared {
         if *dst_v4.ip() != self.public_ip {
             return None;
         }
-        let cone = self.cone.lock().expect("cone lock");
+        let mappings = self.mappings.lock().expect("mapping lock");
         let mut matched = false;
-        for entry in cone.values() {
+        for entry in mappings.values() {
             if entry.ext_port != dst.port() {
                 continue;
             }
@@ -283,18 +365,6 @@ impl NatShared {
                 return Some(entry.local);
             }
         }
-        drop(cone);
-        let sym = self.sym.lock().expect("sym lock");
-        for entry in sym.values() {
-            if entry.ext_port != dst.port() {
-                continue;
-            }
-            matched = true;
-            if self.allows(entry, src) {
-                return Some(entry.local);
-            }
-        }
-        drop(sym);
         if matched {
             // A live mapping saw the datagram and its filter rejected the
             // source, like the loopback engine's counter.
@@ -312,18 +382,17 @@ impl NatShared {
     }
 
     fn forget_local(&self, local: SocketAddr) {
-        self.cone.lock().expect("cone lock").remove(&local.port());
-        self.sym
+        self.mappings
             .lock()
-            .expect("sym lock")
+            .expect("mapping lock")
             .retain(|_, entry| entry.local != local);
     }
 
     fn snapshot(&self) -> Vec<(SocketAddr, SocketAddr)> {
-        let cone = self.cone.lock().expect("cone lock");
-        let sym = self.sym.lock().expect("sym lock");
-        cone.values()
-            .chain(sym.values())
+        self.mappings
+            .lock()
+            .expect("mapping lock")
+            .values()
             .map(|e| {
                 (
                     e.local,
@@ -679,7 +748,9 @@ impl Host {
 
     /// Jumps this host's NAT allocation sequence to a fresh base once
     /// `allocations` mappings exist, like a router rebind that restarts
-    /// the port walk. Applies to the stepped symmetric walks only.
+    /// the port walk. Applies to stepped [`Allocation::Increment`] walks
+    /// (a step other than one); [`Allocation::Random`] and
+    /// [`Allocation::Preserve`] ignore it.
     pub fn rebind_sequence_after(&self, allocations: u32) {
         if let Some(nat) = &self.nat {
             *nat.rebind.lock().expect("rebind fault lock") = Some(allocations);

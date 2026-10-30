@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     MAX_DATAGRAM,
-    sim::{FilterClass, Mapping, NatSpec},
+    sim::{Allocation, FilterClass, NatSpec, ReuseKey},
     socket::{Family, UdpFactory, UdpIo},
 };
 
@@ -207,10 +207,9 @@ struct LabInner {
 
 /// The mapping set of one lab, always behind one lock.
 struct MappingTable {
-    /// Cone mappings, keyed by client address.
-    cone: HashMap<SocketAddr, Arc<LabMapping>>,
-    /// Symmetric mappings, keyed by client and destination.
-    sym: HashMap<(SocketAddr, SocketAddr), Arc<LabMapping>>,
+    /// Live mappings under their reuse key, chosen by the mapping
+    /// behavior.
+    map: HashMap<ReuseKey, Arc<LabMapping>>,
     /// Allocation counter the sequential policies walk.
     next_alloc: u64,
     peak: usize,
@@ -219,17 +218,12 @@ struct MappingTable {
 impl MappingTable {
     /// Ports the live mappings hold.
     fn used_ports(&self) -> Vec<u16> {
-        self.cone
-            .values()
-            .chain(self.sym.values())
-            .map(|m| m.ext_port)
-            .collect()
+        self.map.values().map(|m| m.ext_port).collect()
     }
 
     /// Records the concurrent mapping peak after one insert.
     fn note_count(&mut self) {
-        let live = self.cone.len() + self.sym.len();
-        self.peak = self.peak.max(live);
+        self.peak = self.peak.max(self.map.len());
     }
 }
 
@@ -270,8 +264,7 @@ impl NatLab {
             window,
             gateway: Arc::new(gateway),
             table: StdMutex::new(MappingTable {
-                cone: HashMap::new(),
-                sym: HashMap::new(),
+                map: HashMap::new(),
                 next_alloc: 0,
                 peak: 0,
             }),
@@ -366,8 +359,12 @@ impl NatLab {
     /// Live mappings.
     #[must_use]
     pub fn mapping_count(&self) -> usize {
-        let table = self.inner.table.lock().expect("mapping table lock");
-        table.cone.len() + table.sym.len()
+        self.inner
+            .table
+            .lock()
+            .expect("mapping table lock")
+            .map
+            .len()
     }
 
     /// Peak concurrent mappings since the spawn.
@@ -423,9 +420,12 @@ impl Drop for NatLab {
         self.inner.cancel.cancel();
         // Releasing the table drops the table-side references, so the
         // public sockets close once the receive loops exit.
-        let mut table = self.inner.table.lock().expect("mapping table lock");
-        table.cone.clear();
-        table.sym.clear();
+        self.inner
+            .table
+            .lock()
+            .expect("mapping table lock")
+            .map
+            .clear();
         // The drawn address returns to the registry, so a long-lived
         // process can spawn another lab on it.
         release_lab_ip(self.inner.public_ip);
@@ -455,9 +455,8 @@ fn settle_address(spec: &NatSpec) -> io::Result<(Ipv4Addr, Range<u16>)> {
 /// Collects (private, external) pairs of every live mapping.
 fn snapshot(table: &MappingTable, public_ip: Ipv4Addr) -> Vec<(SocketAddr, SocketAddr)> {
     table
-        .cone
+        .map
         .values()
-        .chain(table.sym.values())
         .map(|m| {
             (
                 m.client,
@@ -530,40 +529,25 @@ async fn outbound(
 
 /// Finds or creates the mapping one outbound datagram uses.
 ///
-/// The policy fixes the key: cone mappings follow the client, symmetric
-/// mappings follow the destination, and an address-dependent NAT keys on
-/// the destination address alone.
+/// The mapping behavior fixes the reuse key: endpoint-independent mappings
+/// follow the client, address-dependent ones the destination address, and
+/// address-and-port-dependent ones the full destination.
 fn translate_outbound(
     inner: &Arc<LabInner>,
     client: SocketAddr,
     dst: SocketAddr,
 ) -> io::Result<Arc<LabMapping>> {
+    let key = ReuseKey::new(inner.spec.mapping, client, dst);
     let mut table = inner.table.lock().expect("mapping table lock");
-    if matches!(inner.spec.mapping, Mapping::Cone) {
-        if let Some(mapping) = table.cone.get(&client) {
-            add_dest(mapping, dst);
-            return Ok(Arc::clone(mapping));
-        }
-        let mapping = allocate_mapping(inner, &mut table, client)?;
-        add_dest(&mapping, dst);
-        table.cone.insert(client, Arc::clone(&mapping));
-        table.note_count();
-        Ok(mapping)
-    } else {
-        let key = match inner.spec.mapping {
-            Mapping::AddressSequential { .. } => (client, SocketAddr::new(dst.ip(), 0)),
-            _ => (client, dst),
-        };
-        if let Some(mapping) = table.sym.get(&key) {
-            add_dest(mapping, dst);
-            return Ok(Arc::clone(mapping));
-        }
-        let mapping = allocate_mapping(inner, &mut table, client)?;
-        add_dest(&mapping, dst);
-        table.sym.insert(key, Arc::clone(&mapping));
-        table.note_count();
-        Ok(mapping)
+    if let Some(mapping) = table.map.get(&key) {
+        add_dest(mapping, dst);
+        return Ok(Arc::clone(mapping));
     }
+    let mapping = allocate_mapping(inner, &mut table, client)?;
+    add_dest(&mapping, dst);
+    table.map.insert(key, Arc::clone(&mapping));
+    table.note_count();
+    Ok(mapping)
 }
 
 /// Records one destination on its mapping for the inbound filter.
@@ -577,6 +561,13 @@ fn allocate_mapping(
     table: &mut MappingTable,
     client: SocketAddr,
 ) -> io::Result<Arc<LabMapping>> {
+    // Preserve claims the client's internal port exactly when it is free;
+    // the walk below takes over only on collision.
+    if let Allocation::Preserve = inner.spec.allocation
+        && let Ok(sock) = bind_public(inner.public_ip, client.port())
+    {
+        return Ok(build_mapping(inner, client, sock));
+    }
     let start = inner.window.start;
     let end = inner.window.end;
     let len = u64::from(end - start);
@@ -591,24 +582,24 @@ fn allocate_mapping(
             ));
         }
         budget -= 1;
-        let port = match inner.spec.mapping {
-            Mapping::Cone
-            | Mapping::Sequential { step: 1 }
-            | Mapping::AddressSequential { step: 1 } => {
-                let n = table.next_alloc;
-                table.next_alloc += 1;
-                start + (n % len) as u16
-            },
-            Mapping::Sequential { step } | Mapping::AddressSequential { step } => {
+        let port = match inner.spec.allocation {
+            Allocation::Increment { step } => {
                 let n = table.next_alloc as i64;
                 table.next_alloc += 1;
-                let n = apply_rebind(inner, table, n);
+                // The rebind fault models a router restart of the port
+                // walk and stays armed for stepped walks only; the plain
+                // step-one walk of the cone presets ignores it.
+                let n = if step == 1 {
+                    n
+                } else {
+                    apply_rebind(inner, table, n)
+                };
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },
             // A live mapping holds its port alone, so the draw comes from
             // the ports no live mapping holds, like the simulator's.
-            Mapping::Random => {
+            Allocation::Random => {
                 let used = table.used_ports();
                 let mut rng = inner.rng.lock().expect("rng lock");
                 if used.len() >= len as usize {
@@ -618,31 +609,45 @@ fn allocate_mapping(
                     free[rng.random_range(0..free.len())]
                 }
             },
+            // The mirror lost the race; walk the window like a step-one
+            // increment. The rebind fault stays a no-op here: a port the
+            // walk handed out does not follow the stepped jump.
+            Allocation::Preserve => {
+                let n = table.next_alloc;
+                table.next_alloc += 1;
+                start + (n % len) as u16
+            },
         };
         let Ok(sock) = bind_public(inner.public_ip, port) else {
             continue;
         };
-        let ext_port = sock
-            .local_addr()
-            .expect("bound socket reports its address")
-            .port();
-        trace(format_args!(
-            "LAB alloc client={client} ext={}",
-            SocketAddr::V4(SocketAddrV4::new(inner.public_ip, ext_port))
-        ));
-        let mapping = Arc::new(LabMapping {
-            client,
-            ext_port,
-            ext: Arc::new(sock),
-            dests: Arc::new(StdMutex::new(HashSet::new())),
-            last_seen: StdMutex::new(Instant::now()),
-            // A child of the lab token, so the lab's drop releases every
-            // mapping at once.
-            cancel: inner.cancel.child_token(),
-        });
-        tokio::spawn(mapping_loop(Arc::clone(inner), Arc::clone(&mapping)));
-        return Ok(mapping);
+        return Ok(build_mapping(inner, client, sock));
     }
+}
+
+/// Wraps one bound public socket into a live mapping and starts its
+/// receive loop.
+fn build_mapping(inner: &Arc<LabInner>, client: SocketAddr, sock: UdpSocket) -> Arc<LabMapping> {
+    let ext_port = sock
+        .local_addr()
+        .expect("bound socket reports its address")
+        .port();
+    trace(format_args!(
+        "LAB alloc client={client} ext={}",
+        SocketAddr::V4(SocketAddrV4::new(inner.public_ip, ext_port))
+    ));
+    let mapping = Arc::new(LabMapping {
+        client,
+        ext_port,
+        ext: Arc::new(sock),
+        dests: Arc::new(StdMutex::new(HashSet::new())),
+        last_seen: StdMutex::new(Instant::now()),
+        // A child of the lab token, so the lab's drop releases every
+        // mapping at once.
+        cancel: inner.cancel.child_token(),
+    });
+    tokio::spawn(mapping_loop(Arc::clone(inner), Arc::clone(&mapping)));
+    mapping
 }
 
 /// Applies the armed rebind once the allocation count passes its arming
@@ -764,9 +769,8 @@ async fn idle_reaper(inner: Arc<LabInner>) {
         let expired: Vec<Arc<LabMapping>> = {
             let table = inner.table.lock().expect("mapping table lock");
             table
-                .cone
+                .map
                 .values()
-                .chain(table.sym.values())
                 .filter(|mapping| {
                     let last = *mapping.last_seen.lock().expect("last seen lock");
                     now.saturating_duration_since(last) >= expiry
@@ -819,18 +823,12 @@ fn client_closed(inner: &Arc<LabInner>, client: SocketAddr) {
 /// The mappings of one client alive right now, left in the table.
 fn capture_client(inner: &LabInner, client: SocketAddr) -> Vec<Arc<LabMapping>> {
     let table = inner.table.lock().expect("mapping table lock");
-    let mut captured = Vec::new();
-    if let Some(mapping) = table.cone.get(&client) {
-        captured.push(Arc::clone(mapping));
-    }
-    captured.extend(
-        table
-            .sym
-            .values()
-            .filter(|mapping| mapping.client == client)
-            .cloned(),
-    );
-    captured
+    table
+        .map
+        .values()
+        .filter(|mapping| mapping.client == client)
+        .cloned()
+        .collect()
 }
 
 /// Removes exactly `captured` mappings from the table and cancels their
@@ -844,14 +842,11 @@ fn release_captured(inner: &LabInner, captured: &[Arc<LabMapping>]) -> usize {
         return 0;
     }
     let mut table = inner.table.lock().expect("mapping table lock");
-    let before = table.cone.len() + table.sym.len();
+    let before = table.map.len();
     table
-        .cone
+        .map
         .retain(|_, mapping| !captured.iter().any(|c| Arc::ptr_eq(c, mapping)));
-    table
-        .sym
-        .retain(|_, mapping| !captured.iter().any(|c| Arc::ptr_eq(c, mapping)));
-    let removed = before - (table.cone.len() + table.sym.len());
+    let removed = before - table.map.len();
     drop(table);
     // Each receive task owns one socket reference; the token releases it.
     for mapping in captured {
@@ -863,18 +858,13 @@ fn release_captured(inner: &LabInner, captured: &[Arc<LabMapping>]) -> usize {
 /// Removes every mapping of one client and closes its public sockets.
 fn forget_client(inner: &LabInner, client: SocketAddr) {
     let mut table = inner.table.lock().expect("mapping table lock");
-    let mut removed: Vec<Arc<LabMapping>> = Vec::new();
-    if let Some(mapping) = table.cone.remove(&client) {
-        removed.push(mapping);
-    }
-    table.sym.retain(|_, mapping| {
-        if mapping.client == client {
-            removed.push(Arc::clone(mapping));
-            false
-        } else {
-            true
-        }
-    });
+    let removed: Vec<Arc<LabMapping>> = table
+        .map
+        .values()
+        .filter(|mapping| mapping.client == client)
+        .cloned()
+        .collect();
+    table.map.retain(|_, mapping| mapping.client != client);
     // Each receive task owns one socket reference; the token releases it.
     for mapping in removed {
         mapping.cancel.cancel();
@@ -999,7 +989,9 @@ impl LabHost {
 
     /// Jumps the lab allocation sequence to a fresh base once
     /// `allocations` mappings exist, like a router rebind that restarts
-    /// the port walk. Applies to the stepped symmetric walks only.
+    /// the port walk. Applies to stepped [`Allocation::Increment`] walks
+    /// (a step other than one); [`Allocation::Random`] and
+    /// [`Allocation::Preserve`] ignore it.
     pub fn rebind_sequence_after(&self, allocations: u32) {
         *self.inner.rebind.lock().expect("rebind fault lock") = Some(allocations);
     }
@@ -1349,12 +1341,13 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::socket::Family;
+    use crate::{sim::MappingBehavior, socket::Family};
 
     /// A narrow-range spec, so window discovery stays instant.
-    fn spec(mapping: Mapping, filtering: FilterClass) -> NatSpec {
+    fn spec(mapping: MappingBehavior, filtering: FilterClass) -> NatSpec {
         NatSpec {
             mapping,
+            allocation: Allocation::Increment { step: 1 },
             filtering,
             port_range: 30_000..30_040,
         }
@@ -1461,7 +1454,10 @@ mod tests {
     async fn cone_mapping_reuses_one_port_across_destinations() {
         let lab = NatLab::spawn(
             "cone_reuse",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1496,10 +1492,7 @@ mod tests {
     async fn sequential_mapping_walks_the_step_across_destinations() {
         let lab = NatLab::spawn(
             "seq_step",
-            spec(
-                Mapping::Sequential { step: 2 },
-                FilterClass::AddressDependent,
-            ),
+            NatSpec::sequential(2).with_range(30_000..30_040),
         )
         .await
         .expect("lab spawns");
@@ -1534,7 +1527,10 @@ mod tests {
     async fn apdf_filter_drops_an_unsolicited_source() {
         let lab = NatLab::spawn(
             "apdf_drop",
-            spec(Mapping::Cone, FilterClass::AddressPortDependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::AddressPortDependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1579,7 +1575,10 @@ mod tests {
     async fn bye_drains_the_mappings_of_a_closed_socket() {
         let lab = NatLab::spawn(
             "bye_drain",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1608,7 +1607,7 @@ mod tests {
         let lab = NatLab::spawn(
             "rebound",
             spec(
-                Mapping::Sequential { step: 1 },
+                MappingBehavior::AddressPortDependent,
                 FilterClass::AddressDependent,
             ),
         )
@@ -1668,7 +1667,10 @@ mod tests {
     async fn idle_expiry_evicts_and_traffic_refreshes() {
         let lab = NatLab::spawn(
             "idle",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1699,7 +1701,10 @@ mod tests {
     async fn loss_drops_both_directions_and_counts_them() {
         let lab = NatLab::spawn(
             "loss",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1740,7 +1745,10 @@ mod tests {
     async fn drop_first_send_holds_the_mapping_back() {
         let lab = NatLab::spawn(
             "drop_first",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1769,7 +1777,10 @@ mod tests {
     async fn fail_sends_to_reports_unreachable() {
         let lab = NatLab::spawn(
             "fail_sends",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");
@@ -1796,7 +1807,7 @@ mod tests {
         let lab = NatLab::spawn(
             "ext_alloc",
             spec(
-                Mapping::Sequential { step: 1 },
+                MappingBehavior::AddressPortDependent,
                 FilterClass::AddressDependent,
             ),
         )
@@ -1823,10 +1834,7 @@ mod tests {
     async fn rebind_sequence_jumps_after_the_arming_count() {
         let lab = NatLab::spawn(
             "rebind_seq",
-            spec(
-                Mapping::Sequential { step: 2 },
-                FilterClass::AddressDependent,
-            ),
+            NatSpec::sequential(2).with_range(30_000..30_040),
         )
         .await
         .expect("lab spawns");
@@ -1873,9 +1881,15 @@ mod tests {
 
     #[tokio::test]
     async fn tap_sees_and_shapes_both_directions() {
-        let lab = NatLab::spawn("tap", spec(Mapping::Cone, FilterClass::EndpointIndependent))
-            .await
-            .expect("lab spawns");
+        let lab = NatLab::spawn(
+            "tap",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("lab spawns");
         let seen: Arc<StdMutex<Seen>> = Arc::new(StdMutex::new(Vec::new()));
         let tap_seen = Arc::clone(&seen);
         lab.set_tap(Some(Arc::new(move |event: &TapEvent| {
@@ -1944,7 +1958,10 @@ mod tests {
     async fn dropping_the_lab_and_responder_frees_their_addresses() {
         let lab = NatLab::spawn(
             "lifecycle",
-            spec(Mapping::Cone, FilterClass::EndpointIndependent),
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
         )
         .await
         .expect("lab spawns");

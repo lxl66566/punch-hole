@@ -7,7 +7,7 @@
 mod common;
 
 use common::config;
-use nat_lab::sim::{Mapping, NatSpec, Net};
+use nat_lab::sim::{NatSpec, Net};
 use punch_hole::{NatClass, PunchConfig, StrategyId, error::PunchError};
 
 #[tokio::test(start_paused = true)]
@@ -455,11 +455,8 @@ async fn address_dependent_pair_routes_sym_probe() {
     // filtering admits the shooter's pulses, the shape the spray-free
     // routing relies on.
     let stun = net.stun_server();
-    let spec = NatSpec {
-        mapping: Mapping::AddressSequential { step: 2 },
-        filtering: nat_lab::FilterClass::EndpointIndependent,
-        port_range: 30000..40000,
-    };
+    let spec =
+        NatSpec::address_sequential(2).with_filtering(nat_lab::FilterClass::EndpointIndependent);
     let (ra, rb) = common::punch_pair(
         net.host(spec.clone()),
         config(&stun),

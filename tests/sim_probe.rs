@@ -10,7 +10,7 @@ use std::{
 };
 
 use common::config;
-use nat_lab::sim::{Mapping, NatSpec, Net};
+use nat_lab::sim::{NatSpec, Net};
 use punch_hole::{
     StrategyId,
     error::PunchError,
@@ -157,7 +157,6 @@ async fn cached_nat_info_skips_probe() {
     rb.expect("cached session punches");
     assert_eq!(pa.report.phase_ms.probe_ms, 0, "Probe was skipped");
     let _ = net.mapping_count();
-    let _ = Mapping::Cone;
 }
 
 /// Runs one pair of `spec` hosts against `servers` sim STUN servers and
@@ -246,11 +245,8 @@ async fn address_dependent_nat_reads_as_cone() {
     // The sim server puts all four ports on one address, so an ADM NAT
     // answers the whole fan-out through one mapping and the probe reports
     // the cone it cannot distinguish from address dependence.
-    let spec = NatSpec {
-        mapping: Mapping::AddressSequential { step: 2 },
-        filtering: nat_lab::FilterClass::EndpointIndependent,
-        port_range: 30000..40000,
-    };
+    let spec =
+        NatSpec::address_sequential(2).with_filtering(nat_lab::FilterClass::EndpointIndependent);
     let hellos = pair_hellos("adm_reads_cone", spec, 1).await;
     for info in &hellos {
         let v4 = info.v4.as_ref().expect("v4 evidence");

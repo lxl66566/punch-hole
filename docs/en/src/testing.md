@@ -27,7 +27,7 @@ let stun = net.stun_server();
 let host = net.host(nat_lab::NatSpec::cone_apdf());  // behind a NAT
 ```
 
-A `NatSpec` combines a mapping policy and a filtering class. The mapping policies are `Cone`, `Sequential { step }`, `AddressSequential { step }`, and `Random`, and the specs `cone_eif()`, `cone_apdf()`, `sequential(step)`, `address_sequential(step)`, and `random(range)` cover the common shapes. A symmetric spec defaults to address-dependent filtering, the common CGNAT shape.
+A `NatSpec` crosses two orthogonal RFC 4787 axes with a filtering class: the mapping behavior (`MappingBehavior::EndpointIndependent`, `AddressDependent`, or `AddressPortDependent`) decides which destinations reuse a mapping, and the allocation policy (`Allocation::Increment { step }`, `Random`, or `Preserve`) decides how a fresh external port is chosen. The presets `cone_eif()`, `cone_apdf()`, `sequential(step)`, `address_sequential(step)`, `random(range)`, `random_eif(range)`, and `preserved(filtering)` cover the common shapes, and `with_*` builders adjust single fields. A symmetric preset defaults to address-dependent filtering, the common CGNAT shape.
 
 The router exposes observation hooks for assertions: forwarded and dropped counters, the live mapping table, the peak mapping count, and a bounded wait until every mapping drains. Setting the `NAT_LAB_TRACE` environment variable prints every forwarded packet, which narrows failures fast.
 
