@@ -322,8 +322,8 @@ impl<S: UdpIo> Engine<S> {
             .max()
             .unwrap_or(0);
         let (pool, mut events) = SocketPool::bind(factory, &self.cfg, v4, v6).await?;
-        for (group, family) in [(0, Family::V4), (1, Family::V6)] {
-            self.syn_bufs[group] = (0..pool.bound(family))
+        for family in [Family::V4, Family::V6] {
+            self.syn_bufs[family.index()] = (0..pool.bound(family))
                 .map(|i| {
                     encode_packet(&DataPacket::Syn {
                         nonce: self.nonce,
@@ -1011,10 +1011,7 @@ impl<S: UdpIo> Engine<S> {
             && let Some(targets) = targets
             && !targets.is_empty()
         {
-            let group = match stage.family {
-                Family::V4 => &self.syn_bufs[0],
-                Family::V6 => &self.syn_bufs[1],
-            };
+            let group = &self.syn_bufs[stage.family.index()];
             // Peer traffic observed means handshake replies and event
             // processing need the rate budget, so a multi-target spray backs
             // off to one packet per sweep. Single-pulse stages stay as they

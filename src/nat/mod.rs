@@ -3,6 +3,7 @@
 pub mod classify;
 pub mod predict;
 pub mod probe;
+pub(crate) mod stun;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
@@ -121,7 +122,7 @@ impl NatInfo {
 #[cfg(fuzzing)]
 #[must_use]
 pub fn parse_stun_response(buf: &[u8], txid: &[u8; 12]) -> Option<std::net::SocketAddr> {
-    probe::parse_mapped(buf, txid)
+    stun::parse_mapped(buf, txid)
 }
 
 #[cfg(test)]
