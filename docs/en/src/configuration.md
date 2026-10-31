@@ -24,7 +24,7 @@
 | `target_success` | 0.5 | Success rate the burst sizing aims for. |
 | `min_success` | 0.1 | Estimates below this fail Negotiate with `Unpunchable`. |
 | `overall_deadline` | 60 s | Hard wall-clock limit for the whole session. |
-| `ipv6` | true | Whether to probe and punch over IPv6. |
+| `ip_policy` | `Dual` | Which address families a session uses: `Ipv4Only`, `Dual`, or `Ipv6Only`. `Dual` runs an IPv6 Direct stage before the IPv4 matrix; `Ipv6Only` skips the IPv4 classification and matrix entirely, so a pair without an IPv6 path on both sides aborts as `Unpunchable`. |
 | `tick` | 50 ms | Engine heartbeat cadence. |
 
 ## Validation rules

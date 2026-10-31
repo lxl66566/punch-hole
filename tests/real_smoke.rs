@@ -13,7 +13,7 @@ use std::{
 };
 
 use punch_hole::{
-    PunchConfig, Punched, Puncher,
+    IpPolicy, PunchConfig, Punched, Puncher,
     socket::{TokioFactory, UdpFactory},
 };
 
@@ -121,7 +121,7 @@ fn connect(a: punch_hole::signaling::HostEnd, b: punch_hole::signaling::HostEnd)
 fn loopback_config(stun: &LocalStun) -> PunchConfig {
     let mut cfg = PunchConfig::default();
     cfg.stun_servers = stun.addrs.clone();
-    cfg.ipv6 = false;
+    cfg.ip_policy = IpPolicy::Ipv4Only;
     cfg.overall_deadline = Duration::from_secs(20);
     cfg
 }
@@ -143,7 +143,11 @@ async fn recv_business(sock: &tokio::net::UdpSocket, buf: &mut [u8]) -> (usize, 
 
 async fn punch_loopback() -> (Punched, Punched) {
     let stun = local_stun().await.expect("local stun binds");
-    let cfg = loopback_config(&stun);
+    punch_with(loopback_config(&stun)).await
+}
+
+/// Runs both roles against each other with one config.
+async fn punch_with(cfg: PunchConfig) -> (Punched, Punched) {
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
     connect(ha, hb);
@@ -151,8 +155,8 @@ async fn punch_loopback() -> (Punched, Punched) {
     let a = tokio::spawn(async move { Puncher::new(cfg)?.with_signaling(la).initiator().await });
     let b = tokio::spawn(async move { Puncher::new(cfg_b)?.with_signaling(lb).responder().await });
     (
-        a.await.expect("initiator task").expect("loopback punch"),
-        b.await.expect("responder task").expect("loopback punch"),
+        a.await.expect("initiator task").expect("punch"),
+        b.await.expect("responder task").expect("punch"),
     )
 }
 
@@ -247,14 +251,17 @@ async fn keepalive_beats_and_stops_with_guard() {
     );
 }
 
-/// A full session whose Direct stage runs over IPv6.
+/// Full sessions whose Direct stage runs over IPv6.
 ///
 /// The prober records any IPv6 reflexive address, so `::1` stands in for a
 /// global one and the whole path runs on loopback: v6 probe, v6 PortUpdate,
-/// v6 handshake, and a v6 winner socket. Routing and firewall behavior with
+/// v6 handshake, and a v6 winner socket. The first session runs the dual
+/// policy, where the v4 probe still classifies both sides as public; the
+/// second runs v6-only, where no v4 packet leaves at all and the v6 Direct
+/// stage carries the session alone. Routing and firewall behavior with
 /// real global addresses stay untested here.
 #[tokio::test]
-async fn direct_v6_session_runs_on_loopback() {
+async fn direct_v6_sessions_run_on_loopback() {
     let v6 = match stun_endpoints(IpAddr::from(Ipv6Addr::LOCALHOST), 2).await {
         Ok(v6) => v6,
         Err(e) => {
@@ -262,28 +269,29 @@ async fn direct_v6_session_runs_on_loopback() {
             return;
         },
     };
-    let stun = local_stun().await.expect("local stun binds");
-    let mut cfg = loopback_config(&stun);
-    cfg.ipv6 = true;
-    cfg.stun_servers.extend(v6);
     // Real time drives this test; the margin keeps the window from closing
     // before the PortUpdate pair crosses.
-    cfg.direct_window = Duration::from_secs(2);
-
-    let (ha, la) = punch_hole::signaling::bridge(64);
-    let (hb, lb) = punch_hole::signaling::bridge(64);
-    connect(ha, hb);
-    let cfg_b = cfg.clone();
-    let a = tokio::spawn(async move { Puncher::new(cfg)?.with_signaling(la).initiator().await });
-    let b = tokio::spawn(async move { Puncher::new(cfg_b)?.with_signaling(lb).responder().await });
-    let pa = a.await.expect("initiator task").expect("v6 punch");
-    let pb = b.await.expect("responder task").expect("v6 punch");
-
+    let mut dual = loopback_config(&local_stun().await.expect("local stun binds"));
+    dual.ip_policy = IpPolicy::Dual;
+    dual.stun_servers.extend(v6.clone());
+    dual.direct_window = Duration::from_secs(2);
+    let (pa, pb) = punch_with(dual).await;
     // A v6 peer address can only come from the Direct stage, because the
     // matrix strategies bind IPv4 only.
     assert!(pa.peer_addr.is_ipv6(), "got {}", pa.peer_addr);
     assert!(pb.peer_addr.is_ipv6(), "got {}", pb.peer_addr);
     assert_eq!(pa.report.local_class, Some(punch_hole::NatClass::Public));
+
+    let mut v6_only = PunchConfig::default();
+    v6_only.stun_servers = v6;
+    v6_only.ip_policy = IpPolicy::Ipv6Only;
+    v6_only.overall_deadline = Duration::from_secs(20);
+    v6_only.direct_window = Duration::from_secs(2);
+    let (pa, pb) = punch_with(v6_only).await;
+    assert!(pa.peer_addr.is_ipv6(), "got {}", pa.peer_addr);
+    assert!(pb.peer_addr.is_ipv6(), "got {}", pb.peer_addr);
+    // No v4 probe ran, so no v4 class is claimed.
+    assert_eq!(pa.report.local_class, None);
 
     let mut buf = [0u8; 64];
     pa.socket

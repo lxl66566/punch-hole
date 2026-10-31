@@ -12,7 +12,7 @@ use super::{
     predictive_burst, sym_cone,
 };
 use crate::{
-    config::PunchConfig,
+    config::{IpPolicy, PunchConfig},
     error::PunchError,
     msg::{Nonce, StrategyId},
     nat::{FilterClass, NatClass, NatInfo, classify::easy_confident},
@@ -172,7 +172,7 @@ pub(crate) fn select(
     // no packet can reach. One side's local list suffices for the LAN,
     // because the side that holds one aims and the other replies from the
     // source it observes.
-    let both_v6 = cfg.ipv6
+    let both_v6 = cfg.ip_policy.allows_v6()
         && mine.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty())
         && peer.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty());
     let (same_ip, both_hairpin) = shared_nat_shape(mine, peer);
@@ -182,6 +182,25 @@ pub(crate) fn select(
         return Err(PunchError::Unpunchable {
             local: mine_class,
             peer: peer_class,
+        });
+    }
+
+    // A v6-only policy drops the IPv4 matrix: the Direct stage over IPv6
+    // is the whole plan, one socket per side, the same shape a public
+    // IPv4 pair resolves to. A pair without a v6 path on both sides has
+    // nothing to run and aborts here.
+    if cfg.ip_policy == IpPolicy::Ipv6Only {
+        if !both_v6 {
+            return Err(PunchError::Unpunchable {
+                local: mine_class,
+                peer: peer_class,
+            });
+        }
+        return Ok(Selection {
+            strategy: StrategyId::ConeExchange,
+            initiator_sockets: 1,
+            responder_sockets: 1,
+            estimate: None,
         });
     }
 
@@ -303,18 +322,20 @@ pub(crate) fn select(
 /// Whether the Direct stage runs before the matrix strategy.
 ///
 /// Direct runs when both sides reported global IPv6 addresses, or when both
-/// IPv4 paths are public.
+/// IPv4 paths are public, each family subject to the policy.
 pub(crate) fn direct_first(mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) -> bool {
-    let both_v6 = cfg.ipv6
+    let both_v6 = cfg.ip_policy.allows_v6()
         && mine.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty())
         && peer.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty());
     // A public path is an observed claim, so a side without IPv4 evidence
     // never qualifies: its v4 Direct stage would have skipped itself for
-    // lack of a reflexive address anyway.
-    let both_public = matches!(
-        (mine.v4_class(), peer.v4_class()),
-        (Some(NatClass::Public), Some(NatClass::Public))
-    );
+    // lack of a reflexive address anyway. A cached reading under a v6-only
+    // policy does not qualify either.
+    let both_public = cfg.ip_policy.allows_v4()
+        && matches!(
+            (mine.v4_class(), peer.v4_class()),
+            (Some(NatClass::Public), Some(NatClass::Public))
+        );
     both_v6 || both_public
 }
 
@@ -406,7 +427,9 @@ pub(crate) fn build_plan(
     // and the announce that feeds it names the local punch port, which is
     // the port the peer aims at when no NAT sits between.
     let (same_ip, both_hairpin) = shared_nat_shape(mine, peer);
-    let local_only = same_ip && !both_hairpin;
+    // The Local stage is an IPv4 stage, so a v6-only policy drops it along
+    // with the matrix; cached IPv4 evidence cannot revive either.
+    let local_only = cfg.ip_policy.allows_v4() && same_ip && !both_hairpin;
 
     let mut stages = Vec::new();
     if direct_first(mine, peer, cfg) {
@@ -415,7 +438,7 @@ pub(crate) fn build_plan(
     if local_only {
         stages.extend(direct::local_stage(peer, cfg));
     }
-    if !local_only {
+    if !local_only && cfg.ip_policy.allows_v4() {
         match sel.strategy {
             StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
             StrategyId::SymProbe => {
@@ -517,6 +540,8 @@ pub(crate) fn build_plan(
     // Local stage aims there, and no NAT sits between to remap it.
     let refresh_v4 = if local_only {
         Refresh::Local
+    } else if !cfg.ip_policy.allows_v4() {
+        Refresh::None
     } else {
         match sel.strategy {
             StrategyId::ConeExchange => {
@@ -944,6 +969,80 @@ mod tests {
             plan.stages.iter().any(|s| s.duration == cfg.direct_window),
             "a public pair runs Direct"
         );
+    }
+
+    /// A v6-only policy drops the IPv4 matrix wholesale: the plan is the
+    /// v6 Direct stage alone with no v4 refresh to announce, and a pair
+    /// without a v6 path on both sides aborts as unpunchable. Cached IPv4
+    /// evidence cannot revive a v4 stage under the policy.
+    #[test]
+    fn v6_only_policy_plans_the_direct_stage_alone() {
+        use crate::report::Role;
+
+        let cfg = PunchConfig {
+            ip_policy: IpPolicy::Ipv6Only,
+            ..PunchConfig::default()
+        };
+        let mut mine = sample_info(NatClass::Cone, &[5000, 5000]);
+        let mut peer = sample_info(NatClass::EasySym { step: 2 }, &[6000, 6002, 6004, 6006]);
+        let v6 = || {
+            Some(crate::nat::V6Nat {
+                addrs: vec![SocketAddrV6::new(
+                    [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+                    5000,
+                    0,
+                    0,
+                )],
+            })
+        };
+        mine.v6 = v6();
+        peer.v6 = v6();
+        let sel = select(&mine, &peer, &cfg).expect("a v6 pair selects");
+        assert_eq!(sel.strategy, StrategyId::ConeExchange);
+        assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 1));
+        let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(plan.stages.len(), 1, "the Direct stage alone");
+        assert_eq!(plan.stages[0].family, Family::V6);
+        assert_eq!(plan.refresh_v4, Refresh::None);
+        assert!(!plan.sequence_marker);
+        assert!(!plan.predicts_peer);
+
+        peer.v6 = None;
+        assert!(matches!(
+            select(&mine, &peer, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+    }
+
+    /// An IPv4-only policy ignores v6 evidence: no v6 Direct stage, no v6
+    /// announce, the plain v4 matrix.
+    #[test]
+    fn v4_only_policy_ignores_v6_evidence() {
+        use crate::report::Role;
+
+        let cfg = PunchConfig {
+            ip_policy: IpPolicy::Ipv4Only,
+            ..PunchConfig::default()
+        };
+        let mut mine = sample_info(NatClass::Cone, &[5000, 5000]);
+        let mut peer = sample_info(NatClass::Cone, &[6000, 6000]);
+        let v6 = || {
+            Some(crate::nat::V6Nat {
+                addrs: vec![SocketAddrV6::new(
+                    [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1].into(),
+                    5000,
+                    0,
+                    0,
+                )],
+            })
+        };
+        mine.v6 = v6();
+        peer.v6 = v6();
+        assert!(!direct_first(&mine, &peer, &cfg));
+        let sel = select(&mine, &peer, &cfg).expect("a cone pair selects");
+        let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert!(plan.stages.iter().all(|s| s.family == Family::V4));
+        assert!(!plan.announce_v6);
     }
 
     fn sample_info(class: NatClass, seq: &[u16]) -> NatInfo {

@@ -4,6 +4,34 @@ use std::time::Duration;
 
 use crate::error::PunchError;
 
+/// Which address families a session probes and punches over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IpPolicy {
+    /// Probe and punch over IPv4 only.
+    Ipv4Only,
+    /// Use every family the path offers: an IPv6 Direct stage before the
+    /// IPv4 matrix.
+    #[default]
+    Dual,
+    /// Drop the IPv4 classification and matrix; the IPv6 Direct stage is
+    /// the whole plan.
+    Ipv6Only,
+}
+
+impl IpPolicy {
+    /// Whether the session probes over IPv4 and builds IPv4 stages.
+    #[must_use]
+    pub fn allows_v4(self) -> bool {
+        !matches!(self, Self::Ipv6Only)
+    }
+
+    /// Whether the session collects IPv6 addresses and builds IPv6 stages.
+    #[must_use]
+    pub fn allows_v6(self) -> bool {
+        !matches!(self, Self::Ipv4Only)
+    }
+}
+
 /// Every knob a session reads. All limits are enforced by the socket pool.
 #[derive(Debug, Clone)]
 pub struct PunchConfig {
@@ -44,8 +72,8 @@ pub struct PunchConfig {
     pub min_success: f64,
     /// Hard wall-clock limit for the whole session.
     pub overall_deadline: Duration,
-    /// Whether to probe and punch over IPv6 when the peer reports addresses.
-    pub ipv6: bool,
+    /// Which address families the session uses.
+    pub ip_policy: IpPolicy,
     /// Engine heartbeat; every retransmission and pulse decision is checked
     /// on this cadence.
     pub tick: Duration,
@@ -88,7 +116,7 @@ impl Default for PunchConfig {
             target_success: 0.5,
             min_success: 0.1,
             overall_deadline: Duration::from_secs(60),
-            ipv6: true,
+            ip_policy: IpPolicy::Dual,
             tick: Duration::from_millis(50),
         }
     }

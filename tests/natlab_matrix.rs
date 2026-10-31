@@ -13,7 +13,7 @@ use std::{
 
 use nat_lab::{LabHost, LabSocket, NatLab, StunServer, lab as natlab, sim::NatSpec};
 use punch_hole::{
-    NatClass, PunchConfig, Punched, Puncher, StrategyId,
+    IpPolicy, NatClass, PunchConfig, Punched, Puncher, StrategyId,
     error::PunchFailure,
     msg::{MAX_DATA_PACKET, is_protocol_packet},
     signaling,
@@ -24,7 +24,7 @@ use punch_hole::{
 fn lab_config(stun: &StunServer) -> PunchConfig {
     PunchConfig {
         stun_servers: stun.addrs.clone(),
-        ipv6: false,
+        ip_policy: IpPolicy::Ipv4Only,
         probe_timeout: Duration::from_secs(2),
         punch_timeout: Duration::from_secs(8),
         overall_deadline: Duration::from_secs(15),

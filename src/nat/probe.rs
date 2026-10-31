@@ -50,9 +50,34 @@ pub(crate) async fn probe<F: UdpFactory>(
     factory: &F,
     overall: Instant,
 ) -> Result<NatInfo, PunchError> {
-    let start = Instant::now();
-    let deadline = (start + cfg.probe_timeout).min(overall);
+    let deadline = (Instant::now() + cfg.probe_timeout).min(overall);
 
+    // The fan-out, the filtering tests, the hairpin self-test, and the
+    // local candidates all ride the IPv4 probe socket, so a v6-only policy
+    // skips them as one.
+    let (v4, local) = if cfg.ip_policy.allows_v4() {
+        let (v4, local) = probe_v4(cfg, factory, deadline).await?;
+        (Some(v4), local)
+    } else {
+        (None, Vec::new())
+    };
+    let v6 = if cfg.ip_policy.allows_v6() {
+        probe_v6(cfg, factory, deadline).await
+    } else {
+        None
+    };
+    Ok(NatInfo { v4, v6, local })
+}
+
+/// The IPv4 classification round over one socket: the filtering tests,
+/// the fan-out that yields the allocation sequence, the hairpin self-test,
+/// and the local candidates the route read surfaces.
+async fn probe_v4<F: UdpFactory>(
+    cfg: &PunchConfig,
+    factory: &F,
+    deadline: Instant,
+) -> Result<(V4Nat, Vec<Ipv4Addr>), PunchError> {
+    let start = Instant::now();
     let v4_dests = resolve(cfg, false, deadline).await;
     if v4_dests.is_empty() {
         return Err(PunchError::NoStunDestination);
@@ -116,19 +141,7 @@ pub(crate) async fn probe<F: UdpFactory>(
         filtering,
         hairpin: hairpin_test(&socket, reflexive, deadline).await,
     };
-
-    let v6 = if cfg.ipv6 {
-        probe_v6(cfg, factory, deadline).await
-    } else {
-        None
-    };
-    let local = local_candidates(&socket, round.dest(first_idx));
-
-    Ok(NatInfo {
-        v4: Some(v4),
-        v6,
-        local,
-    })
+    Ok((v4, local_candidates(&socket, round.dest(first_idx))))
 }
 
 /// Collects global IPv6 reflexive addresses when a server and a route exist.

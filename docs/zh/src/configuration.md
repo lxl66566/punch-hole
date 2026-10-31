@@ -24,7 +24,7 @@
 | `target_success` | 0.5 | 脉冲定尺寸瞄准的成功率。 |
 | `min_success` | 0.1 | 估算低于此值时协商直接报 `Unpunchable`。 |
 | `overall_deadline` | 60 s | 整场会话的硬性时钟上限。 |
-| `ipv6` | true | 是否在 IPv6 上探测和打洞。 |
+| `ip_policy` | `Dual` | 会话使用的地址族：`Ipv4Only`、`Dual` 或 `Ipv6Only`。`Dual` 在 IPv4 矩阵前先跑 IPv6 Direct 段；`Ipv6Only` 整体跳过 IPv4 分类与矩阵，任一侧没有 IPv6 路径的组合以 `Unpunchable` 告终。 |
 | `tick` | 50 ms | 引擎心跳节奏。 |
 
 ## 校验规则

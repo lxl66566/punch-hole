@@ -9,7 +9,7 @@ use crate::{config::PunchConfig, nat::NatInfo, socket::Family};
 ///
 /// A peer without any usable address yields None, which skips the stage.
 pub(crate) fn stage(mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) -> Option<StageSpec> {
-    let v6_available = cfg.ipv6
+    let v6_available = cfg.ip_policy.allows_v6()
         && mine.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty())
         && peer.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty());
     if v6_available {

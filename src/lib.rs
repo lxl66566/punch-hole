@@ -99,7 +99,7 @@ pub mod compat;
 mod session;
 mod strategy;
 
-pub use config::PunchConfig;
+pub use config::{IpPolicy, PunchConfig};
 pub use error::{Phase, PunchError, PunchFailure};
 pub use msg::{AbortReason, StrategyId};
 pub use nat::{FilterClass, NatClass, NatInfo, PortPredictor};
