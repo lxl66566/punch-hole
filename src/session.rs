@@ -8,7 +8,7 @@ use crate::{
     config::PunchConfig,
     error::{Phase, PunchError, PunchFailure},
     msg::{AbortReason, Frame, Nonce, Offer, new_nonce},
-    nat::{NatClass, NatInfo},
+    nat::{NatClass, NatInfo, probe::lookup_server},
     report::{PhaseDurations, PunchReport, Role, SessionDiagnostics, StrategySummary},
     signaling::{LibEnd, SigIo},
     socket::{TokioFactory, UdpFactory, UdpIo},
@@ -160,6 +160,17 @@ impl<F: UdpFactory> PunchSession<F> {
         if let Some(events) = &self.events {
             let _ = events.try_send(event);
         }
+    }
+
+    /// Re-sends one previously encoded frame under the phase deadline, so
+    /// every retransmission carries the same bound as the initial send.
+    async fn resend(
+        &mut self,
+        raw: bytes::Bytes,
+        deadline: Instant,
+        phase: Phase,
+    ) -> Result<(), PunchError> {
+        send_deadlined(self.sig.send_raw(raw), deadline, phase).await
     }
 
     async fn drive(
@@ -336,16 +347,10 @@ impl<F: UdpFactory> PunchSession<F> {
             Phase::Exchange,
         )
         .await?;
-        // The initial send just left, so the first retransmission waits one
-        // full cadence instead of firing immediately.
-        let mut retry = tokio::time::interval_at(
-            Instant::now() + self.config.signaling_retry,
-            self.config.signaling_retry,
-        );
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut retry = resend_ticker(self.config.signaling_retry);
         loop {
             tokio::select! {
-                _ = retry.tick() => send_deadlined(self.sig.send_raw(hello.clone()), deadline, Phase::Exchange).await?,
+                _ = retry.tick() => self.resend(hello.clone(), deadline, Phase::Exchange).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Hello(peer) => return Ok(peer),
                     // An Offer while we are ourselves the Initiator means
@@ -402,16 +407,10 @@ impl<F: UdpFactory> PunchSession<F> {
             start_delay_ms: delay.as_millis() as u32,
         });
         let offer = send_deadlined(self.sig.send(offer), deadline, Phase::Negotiate).await?;
-        // The initial send just left, so the first retransmission waits one
-        // full cadence instead of firing immediately.
-        let mut retry = tokio::time::interval_at(
-            Instant::now() + self.config.signaling_retry,
-            self.config.signaling_retry,
-        );
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut retry = resend_ticker(self.config.signaling_retry);
         loop {
             tokio::select! {
-                _ = retry.tick() => send_deadlined(self.sig.send_raw(offer.clone()), deadline, Phase::Negotiate).await?,
+                _ = retry.tick() => self.resend(offer.clone(), deadline, Phase::Negotiate).await?,
                 frame = self.sig.recv() => match frame?.body {
                     Frame::Accept => {
                         // The Accept left the peer about half an RTT before
@@ -487,12 +486,10 @@ impl<F: UdpFactory> PunchSession<F> {
                             .min(deadline);
                         let cadence =
                             self.config.signaling_retry.min(Duration::from_millis(150));
-                        let mut retry =
-                            tokio::time::interval_at(Instant::now() + cadence, cadence);
-                        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        let mut retry = resend_ticker(cadence);
                         loop {
                             tokio::select! {
-                                _ = retry.tick() => send_deadlined(self.sig.send_raw(accept.clone()), resend_until, Phase::Negotiate).await?,
+                                _ = retry.tick() => self.resend(accept.clone(), resend_until, Phase::Negotiate).await?,
                                 frame = self.sig.recv() => {
                                     // Only a peer Abort ends the window early.
                                     if let Frame::Abort(reason) = frame?.body {
@@ -519,6 +516,17 @@ impl<F: UdpFactory> PunchSession<F> {
 
 fn elapsed_ms(t: Instant) -> u64 {
     t.elapsed().as_millis() as u64
+}
+
+/// Builds the retransmission cadence every signaling loop shares.
+///
+/// The ticker starts one full cadence after the initial send, so the
+/// first repeat never fires immediately, and a tick missed while another
+/// select branch ran fires late instead of bursting.
+fn resend_ticker(cadence: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval_at(Instant::now() + cadence, cadence);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 /// Runs one signaling send under its phase deadline.
@@ -553,26 +561,17 @@ fn clamp_nat_info(mut nat: NatInfo) -> NatInfo {
 }
 
 /// The first configured STUN server as a socket address, for refresh
-/// queries. Literal addresses resolve without any network access. Each
-/// lookup runs under its own short budget inside `deadline`, so a hung
-/// resolver cannot stall the phase or shift the aligned start.
+/// queries. Literal addresses resolve without any network access, each
+/// lookup runs under its own short budget inside `deadline`, and the
+/// search stops at the first hit so the remaining servers cost no lookups.
 async fn first_stun_addr(cfg: &PunchConfig, deadline: Instant) -> Option<SocketAddr> {
     for server in &cfg.stun_servers {
-        // A literal IP resolves on the first poll even with no budget left.
-        let per_lookup = cfg
-            .probe_timeout
-            .min(Duration::from_secs(2))
-            .min(deadline.saturating_duration_since(Instant::now()));
-        let lookup = tokio::net::lookup_host(server);
-        let Ok(list) = tokio::time::timeout(per_lookup, lookup).await else {
-            continue;
-        };
-        if let Ok(list) = list {
-            for addr in list {
-                if addr.is_ipv4() {
-                    return Some(addr);
-                }
-            }
+        if let Some(addr) = lookup_server(cfg, server, deadline)
+            .await
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+        {
+            return Some(addr);
         }
     }
     None

@@ -166,10 +166,13 @@ async fn garbage_frame_is_ignored() {
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tap_seen = Arc::clone(&seen);
     punch_hole::signaling::connect_with(ha, hb, move |frame| {
-        // Replace the second frame that crosses in either direction. The
-
+        // Replace the first Offer that crosses. The Offer retransmits on
+        // the retry cadence until the Accept answers it, so one garbled
+        // copy costs one cadence and nothing else; a Hello copy has no
+        // such recovery once its sender's own exchange completed. The
         // version byte stays valid so the garbage reaches the body decoder.
-        if tap_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        let is_offer = decode_sig(frame).is_ok_and(|f| matches!(f.body, Frame::Offer(_)));
+        if is_offer && tap_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             Some(vec![punch_hole::msg::VERSION, 0xff, 0xfe])
         } else {
             Some(frame.to_vec())

@@ -457,26 +457,36 @@ fn local_candidates<S: UdpIo>(socket: &S, server: SocketAddr) -> Vec<Ipv4Addr> {
     local_v4_ip(local.ip(), server).into_iter().collect()
 }
 
+/// Resolves one configured server to addresses, under a short budget
+/// inside `deadline`.
+///
+/// A literal IP resolves on the first poll even with no budget left. A
+/// failed or timed-out lookup yields no addresses, so a hung system
+/// resolver costs one lookup, not the phase.
+pub(crate) async fn lookup_server(
+    cfg: &PunchConfig,
+    server: &str,
+    deadline: Instant,
+) -> Vec<SocketAddr> {
+    let per_lookup = cfg
+        .probe_timeout
+        .min(Duration::from_secs(2))
+        .min(deadline.saturating_duration_since(Instant::now()));
+    match tokio::time::timeout(per_lookup, tokio::net::lookup_host(server)).await {
+        Ok(Ok(list)) => list.collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Resolves configured servers to addresses of one family.
 ///
 /// Every address of a hostname joins the destination list, and a literal IP
 /// resolves to itself. Duplicates drop out, so one destination means one
-/// mapping. Each lookup runs under its own short budget inside the phase
-/// deadline, so a hung system resolver costs one lookup, not the session.
+/// mapping.
 async fn resolve(cfg: &PunchConfig, want_v6: bool, deadline: Instant) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for server in &cfg.stun_servers {
-        // A literal IP resolves on the first poll even with no budget left.
-        let per_lookup = cfg
-            .probe_timeout
-            .min(Duration::from_secs(2))
-            .min(deadline.saturating_duration_since(Instant::now()));
-        let lookup = tokio::net::lookup_host(server);
-        let Ok(list) = tokio::time::timeout(per_lookup, lookup).await else {
-            continue
-        };
-        let Ok(list) = list else { continue };
-        for addr in list {
+        for addr in lookup_server(cfg, server, deadline).await {
             if addr.is_ipv6() == want_v6 && !out.contains(&addr) {
                 out.push(addr);
             }
