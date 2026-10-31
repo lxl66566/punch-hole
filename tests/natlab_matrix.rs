@@ -15,7 +15,7 @@ use nat_lab::{LabHost, LabSocket, NatLab, StunServer, lab as natlab, sim::NatSpe
 use punch_hole::{
     NatClass, PunchConfig, Punched, Puncher, StrategyId,
     error::PunchFailure,
-    msg::{DATA_MAGIC, MAX_DATA_PACKET},
+    msg::{MAX_DATA_PACKET, is_protocol_packet},
     signaling,
     socket::UdpIo,
 };
@@ -132,14 +132,15 @@ async fn punch_pair_retried(
     last.expect("tries is nonzero")
 }
 
-/// Reads until a business datagram arrives, skipping handshake retries.
+/// Reads until a business datagram arrives, skipping handshake retries by
+/// the library's shape rule for its own traffic.
 async fn recv_business(sock: &LabSocket, buf: &mut [u8]) -> (usize, SocketAddr) {
     loop {
         let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(buf))
             .await
             .expect("business datagram within 2s")
             .expect("socket alive");
-        if buf[0] != DATA_MAGIC {
+        if !is_protocol_packet(&buf[..n]) {
             return (n, from);
         }
     }

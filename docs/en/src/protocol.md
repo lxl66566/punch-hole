@@ -191,7 +191,7 @@ Initiator socket k                    Responder socket m
 
 Each side closes its loser sockets at its own confirmation.
 
-**Keepalive** holds the NAT mapping open after handover. Hosts discard any datagram whose first byte is `0x70` and whose length stays under 64 bytes.
+**Keepalive** holds the NAT mapping open after handover. Hosts discard any datagram whose first byte is `0x70` and whose length stays at or under 64 bytes; `msg::is_protocol_packet` implements that predicate.
 
 ## Loss handling on the signaling plane
 

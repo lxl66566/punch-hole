@@ -186,7 +186,7 @@ Initiator socket k                    Responder socket m
 
 两端各自在自己确认的那一刻关闭落选套接字。
 
-**Keepalive** 在交付后保住 NAT 映射。宿主丢弃首字节为 `0x70` 且长度小于 64 字节的数据报。
+**Keepalive** 在交付后保住 NAT 映射。宿主丢弃首字节为 `0x70` 且长度不超过 64 字节的数据报；`msg::is_protocol_packet` 实现了这个判定。
 
 ## 信令平面的丢包处理
 

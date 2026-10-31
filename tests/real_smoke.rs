@@ -135,7 +135,7 @@ async fn recv_business(sock: &tokio::net::UdpSocket, buf: &mut [u8]) -> (usize, 
             .await
             .expect("business datagram within 2s")
             .expect("socket alive");
-        if buf[0] != punch_hole::msg::DATA_MAGIC {
+        if !punch_hole::msg::is_protocol_packet(&buf[..n]) {
             return (n, from);
         }
     }
@@ -230,8 +230,7 @@ async fn keepalive_beats_and_stops_with_guard() {
     for _ in 0..12 {
         match tokio::time::timeout(Duration::from_millis(120), receiver.recv_from(&mut buf)).await {
             Ok(Ok((n, _))) => {
-                assert_eq!(buf[0], punch_hole::msg::DATA_MAGIC);
-                assert!(n <= punch_hole::msg::MAX_DATA_PACKET);
+                assert!(punch_hole::msg::is_protocol_packet(&buf[..n]));
                 beats += 1;
             },
             _ => break,

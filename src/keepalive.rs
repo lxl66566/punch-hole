@@ -36,8 +36,9 @@ impl Drop for KeepaliveGuard {
 /// Lets an `Arc`-shared tokio socket flow into the generic [`spawn_io`].
 ///
 /// `tokio::net::UdpSocket` has no `Clone`, so hosts share the winner behind
-/// an `Arc`. Hosts discard any datagram whose first byte is the data-plane
-/// magic and whose length stays under the protocol limit.
+/// an `Arc`. Hosts discard any datagram that satisfies
+/// [`crate::msg::is_protocol_packet`], which covers these heartbeat beats
+/// and any late handshake retransmissions.
 impl UdpIo for Arc<tokio::net::UdpSocket> {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         (**self).send_to(buf, target).await

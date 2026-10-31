@@ -203,6 +203,19 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DataPacket, DecodeError> {
     postcard::from_bytes(&bytes[2..]).map_err(|_| DecodeError::BadFrame)
 }
 
+/// Whether `bytes` has the shape of a library protocol packet: every
+/// data-plane variant starts with the magic byte and stays within the
+/// size cap.
+///
+/// Hosts use this to skip keepalive beats and late handshake
+/// retransmissions that still arrive on the handed-over socket. The
+/// predicate matches on shape alone; business datagrams that must never
+/// read as protocol traffic should avoid a magic first byte.
+#[must_use]
+pub fn is_protocol_packet(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&DATA_MAGIC) && bytes.len() <= MAX_DATA_PACKET
+}
+
 #[cfg(test)]
 fn sample_nat_info() -> NatInfo {
     NatInfo {
@@ -380,6 +393,24 @@ mod tests {
             decode_packet(&ack[..ack.len() - 1]),
             Err(DecodeError::BadFrame)
         );
+    }
+
+    #[test]
+    fn is_protocol_packet_matches_shape_only() {
+        let beat = encode_packet(&DataPacket::Keepalive { nonce: [0; 16] });
+        assert!(is_protocol_packet(&beat));
+        // The size cap is the upper edge, the smallest real packet the lower.
+        assert!(is_protocol_packet(&[DATA_MAGIC; MAX_DATA_PACKET]));
+        assert!(!is_protocol_packet(&[]));
+        // Over the cap reads as business traffic even with the magic.
+        let mut overlong = beat.clone();
+        overlong.resize(MAX_DATA_PACKET + 1, 0);
+        assert!(!is_protocol_packet(&overlong));
+        // One wrong first byte is business traffic, matching what a host
+        // must skip on the handed-over socket.
+        let mut business = beat;
+        business[0] = 0x00;
+        assert!(!is_protocol_packet(&business));
     }
 
     #[test]

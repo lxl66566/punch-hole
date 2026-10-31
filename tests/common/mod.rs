@@ -58,14 +58,15 @@ pub async fn punch_pair(
 }
 
 /// Reads until a business datagram arrives, skipping handshake packets
-/// still in flight around handover.
+/// still in flight around handover by the library's shape rule for its
+/// own traffic.
 async fn recv_business<S: punch_hole::socket::UdpIo>(
     sock: &S,
     buf: &mut [u8],
 ) -> (usize, std::net::SocketAddr) {
     loop {
         let (n, from) = sock.recv_from(buf).await.expect("business recv");
-        if buf[0] != punch_hole::msg::DATA_MAGIC {
+        if !punch_hole::msg::is_protocol_packet(&buf[..n]) {
             return (n, from);
         }
     }
