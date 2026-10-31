@@ -80,7 +80,7 @@ mod tests {
     use super::*;
     use crate::{
         nat::{FilterClass, V4Nat},
-        strategy::{PREDICTION_SLACK, peer_space, spray_hit_chance},
+        strategy::{PREDICTION_SLACK, model::spray_hit_chance, peer_space},
     };
 
     fn hard_peer(seq: &[u16]) -> NatInfo {

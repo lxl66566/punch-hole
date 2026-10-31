@@ -1,8 +1,8 @@
 //! The Direct stages that run before the NAT matrix.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
-use super::StageSpec;
+use super::{StageSpec, select::local_stage_reachable};
 use crate::{config::PunchConfig, nat::NatInfo, socket::Family};
 
 /// Builds the Direct stage from the addresses both sides reported.
@@ -50,21 +50,16 @@ pub(crate) fn stage(mine: &NatInfo, peer: &NatInfo, cfg: &PunchConfig) -> Option
 ///
 /// Datagrams between the two die at the NAT whichever matrix stage runs,
 /// while the LAN underneath it delivers a datagram to a local address
-/// with no NAT cooperation at all. The stage aims at every local address
-/// the peer reported, once its PortUpdate names the local punch port,
-/// which is what a local-only plan announces. A peer that reported no
-/// usable local address yields None, which skips the stage.
+/// with no NAT cooperation at all. The stage carries no targets of its
+/// own: the engine builds them from the peer's reachable local addresses
+/// once its PortUpdate names the local punch port, which is what a
+/// local-only plan announces. A peer that reported no reachable local
+/// address yields None, which skips the stage.
 pub(crate) fn local_stage(peer: &NatInfo, cfg: &PunchConfig) -> Option<StageSpec> {
-    let targets: Vec<SocketAddr> = peer
-        .local
-        .iter()
-        .filter(|ip| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast())
-        .map(|ip| SocketAddr::new(IpAddr::V4(*ip), 0))
-        .collect();
-    if targets.is_empty() {
+    if !peer.local.iter().any(|ip| local_stage_reachable(*ip)) {
         return None;
     }
-    let mut stage = StageSpec::send(Family::V4, 1, targets, true, cfg.direct_window);
+    let mut stage = StageSpec::send(Family::V4, 1, Vec::new(), true, cfg.direct_window);
     stage.local_targets = true;
     Some(stage)
 }
