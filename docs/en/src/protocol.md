@@ -54,7 +54,8 @@ pub enum FilterClass {
     EndpointIndependent,
     AddressDependent,
     AddressPortDependent,
-    /// The filtering behavior was not measured. A probe always reports this.
+    /// The filtering behavior was not measured: no server advertised
+    /// OTHER-ADDRESS, or the discovery probe was lost.
     Unknown,
 }
 
@@ -91,8 +92,9 @@ pub struct V4Nat {
     /// single-IP fan-out crossed one mapping on an address-dependent NAT,
     /// so a cone reading built from it rests on one mapping's behavior.
     pub distinct_probe_ips: u8,
-    /// Inbound filtering evidence. A probe runs no filtering test, so the
-    /// value is always `Unknown`.
+    /// Inbound filtering evidence from the RFC 5780 change-request tests,
+    /// run against one discovery-capable server before the fan-out.
+    /// `Unknown` when no probe server advertised OTHER-ADDRESS.
     pub filtering: FilterClass,
 }
 

@@ -18,7 +18,7 @@ use crate::{
     config::PunchConfig,
     error::{Phase, PunchError},
     msg::{DataPacket, DecodeError, Frame, Nonce, StrategyId, decode_packet, encode_packet},
-    nat::{NatClass, NatInfo, classify::easy_confident},
+    nat::{FilterClass, NatClass, NatInfo, classify::easy_confident},
     signaling::SigIo,
     socket::{Family, SocketPool, UdpFactory, UdpIo},
 };
@@ -54,7 +54,13 @@ impl Selection {
             StrategyId::BirthdayBurst => {
                 let (space_i, space_r) = (peer_space(mine), peer_space(peer));
                 let sized = size_burst(space_i, space_r, cfg);
-                Some(burst_hit_chance(&sized, space_i, space_r))
+                Some(burst_hit_chance(
+                    &sized,
+                    space_i,
+                    space_r,
+                    filter_of(mine),
+                    filter_of(peer),
+                ))
             },
             StrategyId::PredictiveBurst => Some(predictive_burst_estimate()),
             _ => None,
@@ -112,6 +118,31 @@ fn initiator_shoots(mine: &NatInfo, peer: &NatInfo) -> bool {
         return mine_symmetric;
     }
     !cone_confident(mine) && cone_confident(peer)
+}
+
+/// The filtering evidence a side's IPv4 probe carries.
+///
+/// A side without IPv4 evidence never reaches a symmetric-pair model, so
+/// the missing reading reads as `Unknown`, the regime the models assumed
+/// before the probe grew its filtering tests.
+fn filter_of(info: &NatInfo) -> FilterClass {
+    info.v4
+        .as_ref()
+        .map_or(FilterClass::Unknown, |v4| v4.filtering)
+}
+
+/// Whether both sides measured address-and-port-dependent filtering.
+///
+/// Under a port-strict filter, a hit into one side also needs the
+/// sender's source port to pair with the destination the receiver's
+/// mapping wrote, which is the regime no one-directional model describes.
+/// One non-port-strict side suffices for a one-directional handshake: its
+/// mapping admits any source on the peer's address, and the port-strict
+/// side's own mapping admits the reply that names the destination it
+/// wrote. `Unknown` reads as non-port-strict, the documented assumption.
+fn pair_port_strict(mine: &NatInfo, peer: &NatInfo) -> bool {
+    filter_of(mine) == FilterClass::AddressPortDependent
+        && filter_of(peer) == FilterClass::AddressPortDependent
 }
 
 /// Applies the selection matrix to both classes.
@@ -194,12 +225,18 @@ pub(crate) fn select(
         return Ok(sel);
     }
     match (mine_class, peer_class) {
-        (NatClass::EasySym { .. }, NatClass::EasySym { .. }) => Ok(Selection {
-            strategy: StrategyId::PredictiveExchange,
-            initiator_sockets: cfg.predictive_sockets,
-            responder_sockets: cfg.predictive_sockets,
-            estimate: None,
-        }),
+        // Both port-strict filters invalidate the one-directional regime
+        // every predictable-window strategy leans on, so the pair routes
+        // to the burst sizing, whose arithmetic states the pairing penalty
+        // and refuses the pair below `min_success`.
+        (NatClass::EasySym { .. }, NatClass::EasySym { .. }) if !pair_port_strict(mine, peer) => {
+            Ok(Selection {
+                strategy: StrategyId::PredictiveExchange,
+                initiator_sockets: cfg.predictive_sockets,
+                responder_sockets: cfg.predictive_sockets,
+                estimate: None,
+            })
+        },
         // One predictable side is enough: the side facing the easy peer
         // aims its continuation window, the side facing the hard peer
         // keeps its random spray, and either direction completes the
@@ -207,19 +244,29 @@ pub(crate) fn select(
         // peer, so the predictable side still gets used instead of a
         // birthday attack against it.
         (NatClass::EasySym { .. }, NatClass::HardSym)
-        | (NatClass::HardSym, NatClass::EasySym { .. }) => Ok(Selection {
-            strategy: StrategyId::PredictiveBurst,
-            initiator_sockets: 1,
-            responder_sockets: 1,
-            estimate: Some(predictive_burst_estimate()),
-        }),
+        | (NatClass::HardSym, NatClass::EasySym { .. })
+            if !pair_port_strict(mine, peer) =>
+        {
+            Ok(Selection {
+                strategy: StrategyId::PredictiveBurst,
+                initiator_sockets: 1,
+                responder_sockets: 1,
+                estimate: Some(predictive_burst_estimate()),
+            })
+        },
         _ => {
-            // The probe cannot read a symmetric peer's filtering class, so
-            // the estimate assumes address-dependent filtering, the common
-            // CGNAT shape; `burst_hit_chance` states what that costs.
-            let (space_i, space_r) = (peer_space(mine), peer_space(peer));
-            let sized = size_burst(space_i, space_r, cfg);
-            let estimate = burst_hit_chance(&sized, space_i, space_r);
+            // The estimate picks its regime from the measured filters: one
+            // non-port-strict side admits a one-directional hit, the
+            // common CGNAT shape; two port-strict sides need both
+            // directions to pair exactly, which the model prices honestly.
+            let sized = size_burst(peer_space(mine), peer_space(peer), cfg);
+            let estimate = burst_hit_chance(
+                &sized,
+                peer_space(mine),
+                peer_space(peer),
+                filter_of(mine),
+                filter_of(peer),
+            );
             if estimate < cfg.min_success {
                 return Err(PunchError::Unpunchable {
                     local: mine_class,
@@ -329,25 +376,45 @@ pub(crate) struct BurstSize {
     pub responder_coverage: usize,
 }
 
-/// Chance that two synchronized bursts pair up under address-dependent
-/// filtering, the regime selection assumes for a symmetric pair.
+/// Chance that two synchronized bursts pair up, by measured filtering
+/// regime.
 ///
-/// A hit into side X needs the peer's coverage to land on one of X's live
+/// Under one non-port-strict side — the regime `Unknown` also reads as — a
+/// hit into side X needs the peer's coverage to land on one of X's live
 /// mappings, `coverage_peer * sockets_X * coverage_X / space_X` in
 /// expectation. Sockets and coverage enter only as their product, so the
 /// sizing spends every mapping on coverage and this model carries one
 /// socket per side: the expected hits add up to
-/// `c_i * c_r * (1/space_i + 1/space_r)`. A probe cannot read a symmetric
-/// peer's filtering class, so the estimate states this regime instead of
-/// measuring it. Port-strict filtering needs both directions to pair
-/// exactly, which lands near `(c_i * c_r)^2 / (space_i * space_r)` and
-/// stays negligible at any bounded budget.
-pub(crate) fn burst_hit_chance(sized: &BurstSize, space_i: usize, space_r: usize) -> f64 {
+/// `c_i * c_r * (1/space_i + 1/space_r)`.
+///
+/// With both sides measured address-and-port-dependent, a hit also needs
+/// the sender's source port to pair with the destination the receiver's
+/// mapping wrote. Per direction that prices the coverage product once per
+/// space, so the expected hits read
+/// `c_i * c_r * (c_i + c_r) / (space_i * space_r)` — the quadratic regime
+/// a bounded budget cannot buy, which the `min_success` bar rejects.
+pub(crate) fn burst_hit_chance(
+    sized: &BurstSize,
+    space_i: usize,
+    space_r: usize,
+    filter_i: FilterClass,
+    filter_r: FilterClass,
+) -> f64 {
     if space_i == 0 || space_r == 0 {
         return 1.0;
     }
-    let hits = sized.initiator_coverage as f64 * sized.responder_coverage as f64;
-    1.0 - (-hits * (1.0 / space_i as f64 + 1.0 / space_r as f64)).exp()
+    let (c_i, c_r) = (
+        sized.initiator_coverage as f64,
+        sized.responder_coverage as f64,
+    );
+    let hits = if filter_i == FilterClass::AddressPortDependent
+        && filter_r == FilterClass::AddressPortDependent
+    {
+        c_i * c_r * (c_i + c_r) / (space_i as f64 * space_r as f64)
+    } else {
+        c_i * c_r * (1.0 / space_i as f64 + 1.0 / space_r as f64)
+    };
+    1.0 - (-hits).exp()
 }
 
 /// Headroom between the sized burst and the conntrack bound: the peer's
@@ -1737,6 +1804,7 @@ impl<S: UdpIo> Engine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::FilterClass::Unknown;
 
     #[test]
     fn spray_model_is_monotonic() {
@@ -1755,8 +1823,8 @@ mod tests {
         };
         // A 300 x 20000 pair: the directional terms add, so the same
         // coverage buys far more than a shared 20000-wide space would.
-        let directional = burst_hit_chance(&narrow_wide, 300, 20_000);
-        let shared = burst_hit_chance(&narrow_wide, 20_000, 20_000);
+        let directional = burst_hit_chance(&narrow_wide, 300, 20_000, Unknown, Unknown);
+        let shared = burst_hit_chance(&narrow_wide, 20_000, 20_000, Unknown, Unknown);
         assert!(directional > 0.5, "got {directional}");
         assert!(shared < 0.05, "got {shared}");
         // Sockets and coverage enter the model only as their product, so
@@ -1768,6 +1836,8 @@ mod tests {
             },
             1000,
             1000,
+            Unknown,
+            Unknown,
         );
         let skewed = burst_hit_chance(
             &BurstSize {
@@ -1776,6 +1846,8 @@ mod tests {
             },
             1000,
             1000,
+            Unknown,
+            Unknown,
         );
         assert!((balanced - skewed).abs() < 1e-12);
         // Dense bursts saturate toward certainty.
@@ -1786,6 +1858,8 @@ mod tests {
             },
             8,
             8,
+            Unknown,
+            Unknown,
         );
         assert!(dense > 0.999);
     }
@@ -1806,9 +1880,9 @@ mod tests {
             (19, 19)
         );
         assert!(
-            burst_hit_chance(&sized, 1000, 1000) >= cfg.target_success - 1e-9,
+            burst_hit_chance(&sized, 1000, 1000, Unknown, Unknown) >= cfg.target_success - 1e-9,
             "estimate {} under the target",
-            burst_hit_chance(&sized, 1000, 1000)
+            burst_hit_chance(&sized, 1000, 1000, Unknown, Unknown)
         );
     }
 
@@ -1825,7 +1899,9 @@ mod tests {
             (sized.initiator_coverage, sized.responder_coverage),
             (15, 15)
         );
-        assert!(burst_hit_chance(&sized, 300, 20_000) >= cfg.target_success - 1e-9);
+        assert!(
+            burst_hit_chance(&sized, 300, 20_000, Unknown, Unknown) >= cfg.target_success - 1e-9
+        );
     }
 
     #[test]
@@ -1843,7 +1919,7 @@ mod tests {
             (sized.initiator_coverage, sized.responder_coverage),
             (25, 25)
         );
-        assert!(burst_hit_chance(&sized, space, space) < cfg.min_success);
+        assert!(burst_hit_chance(&sized, space, space, Unknown, Unknown) < cfg.min_success);
     }
 
     #[test]
@@ -1854,7 +1930,7 @@ mod tests {
         // side with no cap binding.
         let sized = size_burst(132, 132, &cfg);
         assert_eq!((sized.initiator_coverage, sized.responder_coverage), (7, 7));
-        assert!(burst_hit_chance(&sized, 132, 132) >= cfg.target_success - 1e-9);
+        assert!(burst_hit_chance(&sized, 132, 132, Unknown, Unknown) >= cfg.target_success - 1e-9);
         // A conntrack bound below the solve clamps both coverages and the
         // estimate states the shortfall instead of hiding it.
         let cfg = PunchConfig {
@@ -1863,7 +1939,7 @@ mod tests {
         };
         let sized = size_burst(132, 132, &cfg);
         assert_eq!((sized.initiator_coverage, sized.responder_coverage), (5, 5));
-        assert!(burst_hit_chance(&sized, 132, 132) < cfg.target_success);
+        assert!(burst_hit_chance(&sized, 132, 132, Unknown, Unknown) < cfg.target_success);
     }
 
     #[test]
@@ -1983,6 +2059,73 @@ mod tests {
         let sel = select(&one_sample, &one_sample, &cfg).expect("thin samples select");
         assert_eq!(sel.strategy, StrategyId::SymProbe);
         assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 16));
+    }
+
+    /// Both port-strict filters invalidate the one-directional regime the
+    /// burst model states: the estimate prices the pairing penalty, which
+    /// the default budget cannot clear, so Negotiate refuses the pair.
+    /// One relaxed filter — `Unknown` included — restores the historical
+    /// assumption and the estimate with it.
+    #[test]
+    fn port_strict_symmetric_pairs_go_unpunchable() {
+        use crate::nat::FilterClass;
+        let seq = [31_000, 33_000, 35_000, 37_000];
+        let mut a = sample_info(NatClass::HardSym, &seq);
+        let mut b = sample_info(NatClass::HardSym, &seq);
+        for info in [&mut a, &mut b] {
+            info.v4.as_mut().expect("v4 evidence").filtering = FilterClass::AddressPortDependent;
+        }
+        let cfg = PunchConfig::default();
+        assert!(matches!(
+            select(&a, &b, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+        b.v4.as_mut().expect("v4 evidence").filtering = FilterClass::AddressDependent;
+        let sel = select(&a, &b, &cfg).expect("one relaxed side selects");
+        assert_eq!(sel.strategy, StrategyId::BirthdayBurst);
+        assert!(sel.estimate.expect("burst estimate") >= cfg.min_success);
+        b.v4.as_mut().expect("v4 evidence").filtering = Unknown;
+        assert!(select(&a, &b, &cfg).is_ok(), "unknown reads as relaxed");
+    }
+
+    /// The predictable-window strategies lean on the same one-directional
+    /// regime, so both port-strict filters demote the pair to the burst
+    /// sizing. The quadratic regime still admits a narrow enough space,
+    /// where full coverage buys the pairing honestly.
+    #[test]
+    fn port_strict_filters_demote_the_window_strategies() {
+        use crate::nat::FilterClass;
+        let cfg = PunchConfig::default();
+        let mut easy = sample_info(NatClass::EasySym { step: 2000 }, &[
+            31_000, 33_000, 35_000, 37_000,
+        ]);
+        let mut other = easy.clone();
+        for info in [&mut easy, &mut other] {
+            info.v4.as_mut().expect("v4 evidence").filtering = FilterClass::AddressPortDependent;
+        }
+        // A wide space prices the pairing below the bar for both window
+        // strategies.
+        assert!(matches!(
+            select(&easy, &other, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+        let mut hard = sample_info(NatClass::HardSym, &[31_000, 33_000, 35_000, 37_000]);
+        hard.v4.as_mut().expect("v4 evidence").filtering = FilterClass::AddressPortDependent;
+        assert!(matches!(
+            select(&easy, &hard, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+        // One relaxed side keeps the window strategies.
+        other.v4.as_mut().expect("v4 evidence").filtering = FilterClass::AddressDependent;
+        assert_eq!(
+            select(&easy, &other, &cfg).expect("relaxed pair").strategy,
+            StrategyId::PredictiveExchange
+        );
+        other.v4.as_mut().expect("v4 evidence").class = NatClass::HardSym;
+        assert_eq!(
+            select(&easy, &other, &cfg).expect("relaxed pair").strategy,
+            StrategyId::PredictiveBurst
+        );
     }
 
     #[test]
@@ -3423,7 +3566,7 @@ mod tests {
                 reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), seq[0]),
                 alloc_seq: seq.to_vec(),
                 distinct_probe_ips: 2,
-                filtering: crate::nat::FilterClass::Unknown,
+                filtering: Unknown,
             }),
             v6: None,
         }

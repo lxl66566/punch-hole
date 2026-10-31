@@ -2,11 +2,15 @@
 
 The library is explicit about what it covers. This chapter lists the boundaries, so a host can plan around them before they show up.
 
-## The filtering axis stays unmeasured
+## The filtering axis needs a discovery server
 
-A probe reads the port sequence, which measures mapping. Filtering needs a change-port request or a third-party echo, and the probe sequence carries binding requests only, so `NatInfo.filtering` always reports `Unknown`. The strategies consume mapping classes only, and the symmetric-pair arithmetic carries its assumption in the open: it assumes address-dependent filtering, the common CGNAT shape. Under address-and-port-dependent filtering on both sides of a symmetric pair, the collision chance falls with the square of the port space and a bounded budget buys effectively nothing. A host that expects that regime plans a relay from the start.
+The probe measures filtering with the RFC 5780 change-request tests, which only a discovery server that advertises OTHER-ADDRESS can answer. A host whose server list speaks plain RFC 5389 keeps `FilterClass::Unknown`, and the strategies read that as the relaxed case: the symmetric-pair arithmetic assumes address-dependent filtering, the common CGNAT shape. Under address-and-port-dependent filtering on both sides of a symmetric pair, the collision chance falls with the square of the port space and a bounded budget buys effectively nothing; with the tests answered, the pair aborts as `Unpunchable` before any socket opens instead of burning the budget on a near miss. A host that expects that regime plans a relay from the start.
 
 The estimate is a model value. Real CGNAT port spaces vary, and the model reads the peer's observed span, so a wide real space can land the measured rate below the estimate.
+
+## Two ambiguous cone readings with strict filters
+
+A cone reading from a single answered server IP can be an address-dependent mapping seen through one mapping, so a pair of such readings routes to SymProbe, whose reply-side spray writes the peer's observed ports. When the true shape is two address-dependent mappings and the peer filters port-strict or address-strict, the shooter's pulses die on the peer's filter and the spray cannot name the peer's fresh punch ports. The probe's own filtering tests do not lift the ambiguity: they measure the filter axis, not the mapping axis a second server IP would settle. A host that serves single-address server lists behind such NATs plans a relay or a second discovery server.
 
 ## One attempt per session
 

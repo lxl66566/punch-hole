@@ -4,7 +4,12 @@
 //! per the architecture notes. The prober resolves every address of every
 //! configured server and queries all destinations from one socket in one
 //! fan-out round, which yields the allocation sequence that classification
-//! fits.
+//! fits. Before the fan-out, one discovery probe asks the first server for
+//! OTHER-ADDRESS, and a discovery-capable answer takes the two RFC 5780
+//! filtering tests right there: the tests need a mapping whose destination
+//! set holds only the test target, and a fan-out that ran first would have
+//! written every grid port, letting a port-strict filter admit the
+//! change-port reply through an already-written destination.
 
 use std::{
     io,
@@ -26,6 +31,21 @@ const COOKIE: [u8; 4] = 0x2112_a442u32.to_be_bytes();
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_RESPONSE: u16 = 0x0101;
 const ATTR_XOR_MAPPED: u16 = 0x0020;
+/// OTHER-ADDRESS (RFC 5780 §3.4), the discovery capability marker.
+const ATTR_OTHER_ADDRESS: u16 = 0x802c;
+/// CHANGE-REQUEST (RFC 5780 §7.2) with its two flag bits.
+const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+const CHANGE_IP: u32 = 0x0000_0004;
+const CHANGE_PORT: u32 = 0x0000_0002;
+
+/// How long one filtering test waits for its answer.
+///
+/// Real servers answer within one RTT; the window only runs out against a
+/// server that silently dropped the change request, which is exactly the
+/// outcome the test records. Two tests plus the hairpin probe of the same
+/// socket stay inside this many multiples of the window under the phase
+/// deadline.
+const FILTER_TEST_WAIT: Duration = Duration::from_millis(400);
 
 /// Runs the Probe phase and returns the evidence it collected.
 ///
@@ -53,6 +73,14 @@ pub(crate) async fn probe<F: UdpFactory>(
             phase: Phase::Probe,
             source,
         })?;
+
+    // The filter axis takes the two RFC 5780 tests against the first server
+    // while its mapping holds one written destination; a server without
+    // discovery support or a lost discovery probe leaves `Unknown`.
+    let filtering = match discover_other(&socket, v4_dests[0], deadline).await {
+        Some(other) => measure_filtering(&socket, v4_dests[0], other, deadline).await,
+        None => FilterClass::Unknown,
+    };
 
     // Destination count above the wire cap adds evidence the frames cannot
     // carry, so the fan-out stops there.
@@ -82,11 +110,6 @@ pub(crate) async fn probe<F: UdpFactory>(
     // sockets can still be coincidence inside a narrow allocation range, so
     // no socket-independence check overrides the sequence.
     let class = classify::classify(public, &observed);
-
-    // One port shared across destinations proves endpoint-independent
-    // mapping. Filtering is a separate axis that only a change-port or
-    // third-party echo test measures, and the prober runs neither.
-    let filtering = FilterClass::Unknown;
 
     let v4 = V4Nat {
         class,
@@ -172,10 +195,11 @@ struct Fanout {
 
 impl Fanout {
     fn new(dests: Vec<SocketAddr>) -> Self {
-        let slots = vec![None; dests.len()];
+        let count = dests.len();
+        let slots = vec![None; count];
         let txids = dests.iter().map(|_| rand::random()).collect();
-        let sent = vec![false; dests.len()];
-        let answered_in = vec![0; dests.len()];
+        let sent = vec![false; count];
+        let answered_in = vec![0; count];
         Self {
             dests,
             txids,
@@ -250,9 +274,9 @@ impl Fanout {
         for (idx, (slot, txid)) in self.slots.iter_mut().zip(&self.txids).enumerate() {
             if slot.is_none()
                 && from == self.dests[idx]
-                && let Some(addr) = parse_mapped(buf, txid)
+                && let Some(answer) = parse_response(buf, txid)
             {
-                *slot = Some(addr);
+                *slot = Some(answer.mapped);
                 self.answered_in[idx] = self.collecting;
                 break;
             }
@@ -409,15 +433,144 @@ pub(crate) fn binding_request(txid: &[u8; 12]) -> Vec<u8> {
     out
 }
 
+/// A binding request that asks the server to answer from an alternate
+/// source (RFC 5780 §4.4): `change_ip` moves the reply to the other IP,
+/// `change_port` to the port partner on the same IP.
+fn change_request(txid: &[u8; 12], change_ip: bool, change_port: bool) -> Vec<u8> {
+    let mut flags = 0u32;
+    if change_ip {
+        flags |= CHANGE_IP;
+    }
+    if change_port {
+        flags |= CHANGE_PORT;
+    }
+    let mut out = binding_request(txid);
+    out.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out
+}
+
+/// The filtering verdict from the two RFC 5780 test outcomes.
+///
+/// A reply from the alternate IP names an address the mapping never wrote,
+/// so only an endpoint-independent filter admits it. A reply from the
+/// alternate port on the written address is what an address-dependent
+/// filter admits and a port-strict one drops. Both silent reads as the
+/// port-strict class.
+fn filtering_class(alternate_ip: bool, alternate_port: bool) -> FilterClass {
+    if alternate_ip {
+        FilterClass::EndpointIndependent
+    } else if alternate_port {
+        FilterClass::AddressDependent
+    } else {
+        FilterClass::AddressPortDependent
+    }
+}
+
+/// Asks one destination for a binding answer that advertises OTHER-ADDRESS.
+///
+/// The call runs before the fan-out, so the socket's mapping holds exactly
+/// the destination this probe wrote — the state the filtering tests need.
+/// Silence costs one retry, a datagram's worth of loss; an answer without
+/// the attribute names a plain RFC 5389 server and ends the search, because
+/// the other destinations face the same fan-out constraint and `Unknown`
+/// beats a filter class the fan-out's written ports could corrupt.
+async fn discover_other<S: UdpIo>(
+    socket: &S,
+    dest: SocketAddr,
+    deadline: Instant,
+) -> Option<SocketAddrV4> {
+    for _ in 0..2 {
+        let txid: [u8; 12] = rand::random();
+        let request = binding_request(&txid);
+        socket.send_to(&request, dest).await.ok()?;
+        let until = (Instant::now() + FILTER_TEST_WAIT).min(deadline);
+        loop {
+            let mut buf = [0u8; 1024];
+            let Ok(Ok((len, from))) =
+                tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            if from == dest
+                && let Some(answer) = parse_response(&buf[..len], &txid)
+            {
+                return answer.other;
+            }
+        }
+    }
+    None
+}
+
+/// Runs the two RFC 5780 filtering tests against one discovery server.
+///
+/// Test one carries CHANGE-IP: its answer must come back from the
+/// alternate IP. Test two carries CHANGE-PORT and only runs when test one
+/// stayed silent, so an endpoint-independent filter spends one request
+/// where the stricter classes spend two. The answer source check accepts
+/// either of the server's two IPs: the port partner of a wide port list
+/// is unknowable to the client, and the transaction id plus the server
+/// pair carry the match.
+async fn measure_filtering<S: UdpIo>(
+    socket: &S,
+    dest: SocketAddr,
+    other: SocketAddrV4,
+    deadline: Instant,
+) -> FilterClass {
+    let server_ips = [dest.ip(), IpAddr::V4(*other.ip())];
+    let alternate_ip = filter_test(socket, dest, &server_ips, true, deadline).await;
+    let alternate_port =
+        !alternate_ip && filter_test(socket, dest, &server_ips, false, deadline).await;
+    filtering_class(alternate_ip, alternate_port)
+}
+
+/// Sends one change request and reports whether its answer came back.
+async fn filter_test<S: UdpIo>(
+    socket: &S,
+    dest: SocketAddr,
+    server_ips: &[IpAddr],
+    change_ip: bool,
+    deadline: Instant,
+) -> bool {
+    let txid: [u8; 12] = rand::random();
+    let request = change_request(&txid, change_ip, !change_ip);
+    if socket.send_to(&request, dest).await.is_err() {
+        return false;
+    }
+    let until = (Instant::now() + FILTER_TEST_WAIT).min(deadline);
+    loop {
+        let mut buf = [0u8; 1024];
+        let Ok(Ok((len, from))) = tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
+        else {
+            return false;
+        };
+        // A datagram of another probe — a late fan-out answer — is drained
+        // and ignored; only the matching transaction from a server IP ends
+        // the wait.
+        if server_ips.contains(&from.ip()) && parse_response(&buf[..len], &txid).is_some() {
+            return true;
+        }
+    }
+}
+
+/// The addresses one binding response carries.
+pub(crate) struct BindingAnswer {
+    mapped: SocketAddr,
+    /// OTHER-ADDRESS of an RFC 5780 discovery server, when present.
+    other: Option<SocketAddrV4>,
+}
+
 /// Parses a binding response with a matching transaction id.
 ///
 /// The wire subset is RFC 5389 and RFC 8489: the response must carry the
-/// magic cookie, and only an XOR-MAPPED-ADDRESS attribute yields an
-/// address. RFC 3489 servers — no cookie, MAPPED-ADDRESS in the clear —
-/// are deliberately unsupported: 3489 is historic and the servers a host
-/// configures speak 5389+, so a 3489-only answer fails the cookie check
-/// and counts as silence.
-pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+/// magic cookie, and the XOR-MAPPED-ADDRESS attribute yields the reflexive
+/// address while a MAPPED-ADDRESS-shaped OTHER-ATTRIBUTE yields the
+/// discovery server's alternate address. RFC 3489 servers — no cookie,
+/// MAPPED-ADDRESS in the clear — are deliberately unsupported: 3489 is
+/// historic and the servers a host configures speak 5389+, so a 3489-only
+/// answer fails the cookie check and counts as silence.
+pub(crate) fn parse_response(buf: &[u8], txid: &[u8; 12]) -> Option<BindingAnswer> {
     if buf.len() < 20 {
         return None;
     }
@@ -430,6 +583,8 @@ pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
     let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     let end = (20 + msg_len).min(buf.len());
     let mut i = 20;
+    let mut mapped = None;
+    let mut other = None;
     while i + 4 <= end {
         let attr = u16::from_be_bytes([buf[i], buf[i + 1]]);
         let len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
@@ -438,35 +593,62 @@ pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
             return None;
         }
         let body = &buf[i + 4..i + 4 + len];
-        if attr == ATTR_XOR_MAPPED && len >= 8 {
-            let family = body[1];
-            let xport = u16::from_be_bytes([body[2], body[3]]) ^ 0x2112;
-            return match family {
-                0x01 if len >= 8 => {
-                    let mut ip = [body[4], body[5], body[6], body[7]];
-                    for (b, k) in ip.iter_mut().zip(COOKIE) {
-                        *b ^= k;
-                    }
-                    Some(SocketAddr::V4(SocketAddrV4::new(ip.into(), xport)))
-                },
-                0x02 if len >= 20 => {
-                    let mut ip = [0u8; 16];
-                    for (j, b) in ip.iter_mut().enumerate() {
-                        let key = if j < 4 {
-                            COOKIE[j]
-                        } else {
-                            txid[j - 4]
-                        };
-                        *b = body[4 + j] ^ key;
-                    }
-                    Some(SocketAddr::V6(SocketAddrV6::new(ip.into(), xport, 0, 0)))
-                },
-                _ => None,
-            };
+        if attr == ATTR_XOR_MAPPED && mapped.is_none() {
+            mapped = parse_xor_address(body, txid);
+        } else if attr == ATTR_OTHER_ADDRESS && other.is_none() {
+            other = parse_plain_v4(body);
         }
         i += 4 + len.div_ceil(4) * 4;
     }
-    None
+    mapped.map(|mapped| BindingAnswer { mapped, other })
+}
+
+/// The XOR-MAPPED-ADDRESS body: an IPv4 or IPv6 reflexive address.
+fn parse_xor_address(body: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    if body.len() < 8 {
+        return None;
+    }
+    let family = body[1];
+    let xport = u16::from_be_bytes([body[2], body[3]]) ^ 0x2112;
+    match family {
+        0x01 if body.len() >= 8 => {
+            let mut ip = [body[4], body[5], body[6], body[7]];
+            for (b, k) in ip.iter_mut().zip(COOKIE) {
+                *b ^= k;
+            }
+            Some(SocketAddr::V4(SocketAddrV4::new(ip.into(), xport)))
+        },
+        0x02 if body.len() >= 20 => {
+            let mut ip = [0u8; 16];
+            for (j, b) in ip.iter_mut().enumerate() {
+                let key = if j < 4 {
+                    COOKIE[j]
+                } else {
+                    txid[j - 4]
+                };
+                *b = body[4 + j] ^ key;
+            }
+            Some(SocketAddr::V6(SocketAddrV6::new(ip.into(), xport, 0, 0)))
+        },
+        _ => None,
+    }
+}
+
+/// A clear-text MAPPED-ADDRESS-shaped body naming an IPv4 address.
+fn parse_plain_v4(body: &[u8]) -> Option<SocketAddrV4> {
+    if body.len() < 8 || body[1] != 0x01 {
+        return None;
+    }
+    let port = u16::from_be_bytes([body[2], body[3]]);
+    Some(SocketAddrV4::new(
+        [body[4], body[5], body[6], body[7]].into(),
+        port,
+    ))
+}
+
+/// The reflexive address of one binding response.
+pub(crate) fn parse_mapped(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    parse_response(buf, txid).map(|answer| answer.mapped)
 }
 
 #[cfg(test)]
@@ -659,6 +841,76 @@ mod tests {
         let other = SocketAddr::V4(SocketAddrV4::new([1, 1, 1, 1].into(), 9999));
         round.absorb(&binding_response(&round.txids[0], 5010), other);
         assert_eq!(round.pending(), 1);
+    }
+
+    /// A discovery response carries the alternate address in the clear.
+    ///
+    /// Builds a response the way [`crate::stun`]'s responders do:
+    /// XOR-MAPPED-ADDRESS first, then RESPONSE-ORIGIN and OTHER-ADDRESS.
+    fn discovery_response(txid: &[u8; 12], port: u16, other: (u16, [u8; 4])) -> Vec<u8> {
+        let ip: Ipv4Addr = [203, 0, 113, 7].into();
+        let attr = |ty: u16, body: Vec<u8>| {
+            let mut out = ty.to_be_bytes().to_vec();
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(&body);
+            out
+        };
+        let mut xor = vec![0x00, 0x01];
+        xor.extend_from_slice(&(port ^ 0x2112).to_be_bytes());
+        xor.extend(ip.octets().iter().zip(COOKIE).map(|(b, k)| b ^ k));
+        let mut plain = vec![0x00, 0x01];
+        plain.extend_from_slice(&other.0.to_be_bytes());
+        plain.extend_from_slice(&other.1);
+
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&COOKIE);
+        resp.extend_from_slice(txid);
+        for body in [attr(ATTR_XOR_MAPPED, xor), attr(ATTR_OTHER_ADDRESS, plain)] {
+            resp.extend_from_slice(&body);
+        }
+        let msg_len = (resp.len() - 20) as u16;
+        resp[2..4].copy_from_slice(&msg_len.to_be_bytes());
+        resp
+    }
+
+    #[test]
+    fn discovery_answers_carry_the_other_address() {
+        let txid = [5u8; 12];
+        let resp = discovery_response(&txid, 5010, (3479, [198, 51, 100, 9]));
+        let answer = parse_response(&resp, &txid).expect("parses");
+        assert_eq!(answer.mapped.port(), 5010);
+        let other = answer.other.expect("discovery server");
+        assert_eq!(other.ip().to_string(), "198.51.100.9");
+        assert_eq!(other.port(), 3479);
+        // A plain response keeps the field empty.
+        let plain = binding_response(&txid, 5010);
+        assert!(
+            parse_response(&plain, &txid)
+                .expect("parses")
+                .other
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn change_requests_carry_their_flags() {
+        let mut req = change_request(&[6u8; 12], true, false);
+        assert_eq!(req.len(), 28);
+        let bits = u32::from_be_bytes([req[24], req[25], req[26], req[27]]);
+        assert_eq!(bits, CHANGE_IP);
+        req = change_request(&[6u8; 12], false, true);
+        let bits = u32::from_be_bytes([req[24], req[25], req[26], req[27]]);
+        assert_eq!(bits, CHANGE_PORT);
+    }
+
+    #[test]
+    fn filtering_verdict_reads_both_test_outcomes() {
+        use FilterClass as F;
+        assert_eq!(filtering_class(true, false), F::EndpointIndependent);
+        assert_eq!(filtering_class(false, true), F::AddressDependent);
+        assert_eq!(filtering_class(false, false), F::AddressPortDependent);
     }
 
     #[test]

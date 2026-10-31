@@ -67,7 +67,7 @@ The estimate states its regime, the way the burst arithmetic states its filterin
 
 Both sides are symmetric with at least one hard side. Prediction is out of the picture, so the strategy plays the collision game: each side opens sockets, each socket covers distinct ports drawn from the peer's observed span, and both sides pulse at once until a covered port pair collides in both directions.
 
-One sizing function feeds both the decision and the execution. The model assumes address-dependent filtering, the common CGNAT shape, under which one directional hit completes the handshake. A hit into side X needs the peer's coverage to land on one of X's live mappings, and sockets and coverage contribute to that only through their product — the live-mapping count — so each side opens one socket and spends its whole mapping share on coverage. The spaces are directional: A's live mappings sit inside A's own port space, so with `c_A` and `c_B` covered ports per side the hit chance is:
+One sizing function feeds both the decision and the execution. Its regime comes from the measured filters: while at least one side filters non-port-strict — the common CGNAT shape, and the reading `Unknown` stands in for — one directional hit completes the handshake. A hit into side X needs the peer's coverage to land on one of X's live mappings, and sockets and coverage contribute to that only through their product — the live-mapping count — so each side opens one socket and spends its whole mapping share on coverage. The spaces are directional: A's live mappings sit inside A's own port space, so with `c_A` and `c_B` covered ports per side the hit chance is:
 
 ```text
 chance = 1 - exp(-c_A * c_B * (1/space_A + 1/space_B))
@@ -81,8 +81,14 @@ An estimate below `min_success` fails Negotiate with `Unpunchable` before any da
 
 ## Estimates
 
-SymProbe, PredictiveBurst, and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A pair routed to SymProbe on low cone confidence carries no estimate; its outcome rests on inbound filtering the probe does not measure, while PredictiveBurst's estimate states its continuation regime instead of measuring it. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
+SymProbe, PredictiveBurst, and BirthdayBurst report `success_estimate` in `PunchReport`. Both sides compute the same value from their own pair of views, so the reports agree. A pair routed to SymProbe on low cone confidence carries no estimate; its outcome rests on the inbound filters the probe measured, which the selection reads but the spray arithmetic does not price. A host reads the estimate to decide early whether a relay path serves better than a punch attempt.
 
 ## The boundary the model states
 
-The burst arithmetic states its assumption in the open: it assumes address-dependent filtering on both symmetric NATs. Under address-and-port-dependent filtering on both sides, a hit needs both directions to pair on the exact ports, the chance falls near `(n * c)² / space²`, and a bounded budget buys effectively nothing. A host that expects port-strict symmetric peers on both sides plans a relay from the start.
+The burst regime comes from the measured filters, and the two regimes price honestly different games. While at least one side filters non-port-strict, one directional hit completes the handshake and the estimate above holds. When both sides measure port-strict, a hit needs both directions to pair on the exact ports, the chance falls to:
+
+```text
+chance = 1 - exp(-c_A * c_B * (c_A + c_B) / (space_A * space_B))
+```
+
+which against the default budget clears `min_success` only for narrow spaces, and a wide space aborts the pair as `Unpunchable` in Negotiate before any data packet is sent. `Unknown` on either side reads as the relaxed regime, the historical assumption; the probe reports it when no server speaks RFC 5780 discovery. A host that expects port-strict symmetric peers on both sides and runs without discovery servers plans a relay from the start.

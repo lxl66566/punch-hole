@@ -4,7 +4,7 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::{
     msg::{Nonce, StrategyId},
-    nat::NatClass,
+    nat::{FilterClass, NatClass},
 };
 
 /// Which side of an attempt a session drove.
@@ -26,6 +26,12 @@ pub struct PunchReport {
     /// The peer's IPv4 mapping class, `None` when it reported no IPv4
     /// evidence at all.
     pub peer_class: Option<NatClass>,
+    /// The local IPv4 filtering evidence, from the RFC 5780 change-request
+    /// tests. `None` when the side reported no IPv4 evidence at all.
+    pub local_filtering: Option<FilterClass>,
+    /// The peer's IPv4 filtering evidence, `None` when it reported no IPv4
+    /// evidence at all.
+    pub peer_filtering: Option<FilterClass>,
     /// Local IPv4 reflexive address Probe observed. `None` when a cached
     /// classification carried no IPv4 evidence.
     pub local_reflexive_v4: Option<SocketAddrV4>,

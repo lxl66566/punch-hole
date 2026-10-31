@@ -12,6 +12,15 @@ Each request carries its own transaction id, and each answer fills the slot of t
 
 The whole phase ends by `probe_timeout`, three seconds by default. The first round waits half the budget and the retry round waits until the deadline. A short IPv6 pass collects global addresses inside what remains.
 
+## The filtering tests
+
+Before the fan-out, one discovery probe asks the first destination for a plain binding answer and reads its OTHER-ADDRESS, the marker an RFC 5780 discovery server advertises. An answer that carries the attribute takes the two change-request tests right there, against the same destination and from the same socket:
+
+- a request with both change flags, which the server answers from the other IP and the port partner: a reply names a source the mapping never wrote, so only an endpoint-independent filter admits it,
+- otherwise a request with the port flag only, answered from the written IP and the port partner: an address-dependent filter admits it, a port-strict one drops it.
+
+A reply to the first test reads `EndpointIndependent`; a reply to only the second reads `AddressDependent`; both silent read `AddressPortDependent`. The tests run before the fan-out on purpose: the fan-out writes every grid port into the mapping's destination set, and a port-strict filter then admits the change-port reply through a destination the mapping already sent to, which would read the stricter class as `AddressDependent`. A silent discovery probe retries once; a server that answers without OTHER-ADDRESS, or stays silent twice, leaves the axis `Unknown` rather than a class the fan-out's written ports could corrupt. All of it costs at most four packets beyond the fan-out.
+
 ## Reading the allocation sequence
 
 The answer ports, in allocation order, form `alloc_seq`. The sequence is the NAT's allocation history for this socket, one port per outbound flow in the order the flows were created. Three rules turn it into a class:
@@ -33,7 +42,7 @@ Two consistent deltas can be coincidence. A fit needs three deltas, which means 
 
 ## What the probe measures, and what it leaves out
 
-The port sequence measures mapping. Filtering stays unmeasured: telling endpoint-independent filtering from address-and-port-dependent filtering needs a change-port request or a third-party echo, and the probe sequence carries binding requests only. The probe reports `FilterClass::Unknown`, and the strategies make the decisions that need no filtering knowledge. The estimate arithmetic for symmetric pairs carries its filtering assumption explicitly, which the strategies chapter covers.
+The port sequence measures mapping; the change-request tests measure filtering. The two axes travel together in `V4Nat` — `class` and `filtering` — and both reach the peer inside the `Hello`. The strategies read the measured filters where the difference matters: symmetric pairs price their estimate under the one-directional regime when at least one side filters non-port-strict, and under the quadratic pairing regime when both sides are port-strict, which fails the default budget's bar and aborts the pair as `Unpunchable` before any socket opens. `FilterClass::Unknown` remains for a host whose servers speak no RFC 5780 discovery; the strategies read it as the relaxed case, the historical assumption. The hairpin question — whether a NAT loops a datagram aimed at its own external address back — stays unmeasured, which the limitations chapter covers.
 
 ## Port prediction
 

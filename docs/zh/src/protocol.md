@@ -54,7 +54,8 @@ pub enum FilterClass {
     EndpointIndependent,
     AddressDependent,
     AddressPortDependent,
-    /// 过滤行为未经测量。探测结果恒为此值。
+    /// 过滤行为未经测量：没有服务器通告 OTHER-ADDRESS，
+    /// 或者发现探测丢失。
     Unknown,
 }
 
@@ -90,7 +91,9 @@ pub struct V4Nat {
     /// 应答了探测的目的地中不同的服务器 IP 数。单 IP 扇出在地址相关
     /// NAT 上只跨越一个映射，据此读出的锥形只代表该映射的行为。
     pub distinct_probe_ips: u8,
-    /// 入站过滤证据。探测不测过滤，值恒为 `Unknown`。
+    /// 入站过滤证据，来自 RFC 5780 改址请求测试——扇出前对一台
+    /// 支持发现的服务器运行。没有探测服务器通告 OTHER-ADDRESS 时为
+    /// `Unknown`。
     pub filtering: FilterClass,
 }
 

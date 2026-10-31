@@ -201,16 +201,40 @@ fn max_seq_len(infos: &[NatInfo]) -> usize {
         .unwrap_or(0)
 }
 
+/// The RFC 5780 change-request tests measure the filter axis against the
+/// sim server's two-IP grid, so each preset's declared filtering class
+/// comes back in the Hello. The three cases walk the three verdict
+/// branches: a CHANGE-IP reply received reads EIF, only the CHANGE-PORT
+/// reply received reads ADF, both silent read APDF. Two servers give the
+/// fan-out two IPs, which keeps a cone reading confident and the pair on
+/// ConeExchange: a single-IP view routes even a true cone to SymProbe,
+/// whose reply-side spray cannot carry a non-EIF filter.
 #[tokio::test(start_paused = true)]
-async fn cone_filtering_stays_unknown() {
-    // Four destinations answered through one port, the case an
-    // endpoint-independent mapping used to be reported as. Filtering is a
-    // separate axis the probe runs no test for, so it stays Unknown.
-    let hellos = pair_hellos("cone_filtering", NatSpec::cone_eif(), 1).await;
-    for info in &hellos {
-        let v4 = info.v4.as_ref().expect("v4 evidence");
-        assert_eq!(v4.class, NatClass::Cone);
-        assert_eq!(v4.filtering, punch_hole::FilterClass::Unknown);
+async fn filtering_classes_follow_the_change_request_tests() {
+    let cases = [
+        (
+            "filtering_eif",
+            NatSpec::cone_eif(),
+            punch_hole::FilterClass::EndpointIndependent,
+        ),
+        (
+            "filtering_apdf",
+            NatSpec::cone_apdf(),
+            punch_hole::FilterClass::AddressPortDependent,
+        ),
+        (
+            "filtering_adf",
+            NatSpec::sequential(2),
+            punch_hole::FilterClass::AddressDependent,
+        ),
+    ];
+    for (name, spec, expected) in cases {
+        let hellos = pair_hellos(name, spec, 2).await;
+        assert!(!hellos.is_empty(), "{name} exchanged Hellos");
+        for info in &hellos {
+            let v4 = info.v4.as_ref().expect("v4 evidence");
+            assert_eq!(v4.filtering, expected, "{name} filtering");
+        }
     }
 }
 

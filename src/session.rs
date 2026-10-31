@@ -215,6 +215,8 @@ impl<F: UdpFactory> PunchSession<F> {
             strategy: sel.strategy,
             local_class: mine.v4_class(),
             peer_class: peer.v4_class(),
+            local_filtering: mine.v4.as_ref().map(|v4| v4.filtering),
+            peer_filtering: peer.v4.as_ref().map(|v4| v4.filtering),
             local_reflexive_v4: mine.reflexive_v4(),
             local_reflexive_v6: mine
                 .v6

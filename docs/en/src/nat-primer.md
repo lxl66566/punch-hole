@@ -34,6 +34,8 @@ The **filtering** decides which inbound datagrams the NAT forwards through an ex
 
 A **cone** NAT maps endpoint-independently, which makes one mapping serve every destination. A **symmetric** NAT maps per destination, so the port aimed at one server differs from the port aimed at another. The filtering classes cut across that split. The most common home router maps endpoint-independently and filters on address and port, the combination that older literature calls a port-restricted cone.
 
+Both axes are measurable from outside. Mapping shows in the port sequence a fan-out of binding requests produces; filtering shows in the RFC 5780 change-request tests, which ask a discovery server to answer from its other address and from its port partner and watch which replies a NAT lets through. punch-hole measures both in the Probe phase.
+
 ## The reflexive address
 
 A host behind a NAT sees its private address and stays blind to its public one. A STUN server tells it. The host sends a binding request to the server, the server reads the source address the datagram arrived with, and that source, `203.0.113.7:61000` in the example, is the **reflexive address**.

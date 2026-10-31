@@ -41,9 +41,10 @@ pub enum NatClass {
 ///
 /// Mapping and filtering are separate axes. One external port across
 /// destinations proves endpoint-independent mapping, while the filtering
-/// class needs a change-port or third-party echo test, which the prober
-/// does not run. The simulator sets these variants to model a NAT; probe
-/// results always carry `Unknown`.
+/// class comes from the RFC 5780 change-request tests the probe runs
+/// against a discovery-capable server. The simulator sets these variants
+/// to model a NAT; probe results carry `Unknown` only when no server
+/// advertised OTHER-ADDRESS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterClass {
     EndpointIndependent,
@@ -74,8 +75,8 @@ pub struct V4Nat {
     /// dimension once and a cone reading built from it rests on one
     /// mapping's behavior.
     pub distinct_probe_ips: u8,
-    /// Inbound filtering evidence. A probe runs no filtering test, so its
-    /// value is always `Unknown`.
+    /// Inbound filtering evidence from the RFC 5780 change-request tests.
+    /// `Unknown` when no probe server advertised OTHER-ADDRESS.
     pub filtering: FilterClass,
 }
 
