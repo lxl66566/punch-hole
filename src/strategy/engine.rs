@@ -422,10 +422,7 @@ impl<S: UdpIo> Engine<S> {
             if self.plan.sequence_marker {
                 self.plan.refresh_v4 = Refresh::None;
             } else {
-                return Err(PunchError::Io {
-                    phase: Phase::Punch,
-                    source: std::io::Error::other("stun refresh has no server or bound socket"),
-                });
+                return Err(PunchError::RefreshUnavailable);
             }
         }
         let mut ticker = tokio::time::interval_at(start + self.cfg.tick, self.cfg.tick);
@@ -447,15 +444,11 @@ impl<S: UdpIo> Engine<S> {
             tokio::select! {
                 ev = events.recv() => {
                     let Some(ev) = ev else {
-                        // A pool whose every bind failed carries the real
-                        // cause; any other stop keeps the generic reason.
-                        let source = match (pool.live_sockets(), pool.last_bind_error()) {
-                            (0, Some(e)) => std::io::Error::other(format!(
-                                "pool receive tasks stopped: every bind failed: {e}"
-                            )),
-                            _ => std::io::Error::other("pool receive tasks stopped"),
-                        };
-                        return Err(PunchError::Io { phase: Phase::Punch, source });
+                        // A receive task ends only by cancellation or a
+                        // failed socket, and cancellation has not run yet,
+                        // so every socket the pool had is gone. A pool that
+                        // bound nothing at all fails at bind instead.
+                        return Err(PunchError::PoolStopped);
                     };
                     self.on_data(pool, ev).await?;
                 }
@@ -961,10 +954,7 @@ impl<S: UdpIo> Engine<S> {
             // crossed only leaves the peer's prediction on its probe-time
             // base, so the plan continues.
             if self.handshake.first_traffic.is_none() && !self.plan.sequence_marker {
-                return Err(PunchError::Io {
-                    phase: Phase::Punch,
-                    source: std::io::Error::other("stun refresh retries exhausted"),
-                });
+                return Err(PunchError::RefreshExhausted);
             }
             self.announce.stun = None;
         } else if let Some(pending) = &mut self.announce.stun
@@ -1982,11 +1972,7 @@ mod tests {
         // A server that stays silent turns the exhausted retries into a
         // phase error for a session with no handshake traffic yet.
         let err = engine.on_tick(&pool).await.expect_err("retries exhausted");
-        assert!(
-            matches!(&err, PunchError::Io { phase: Phase::Punch, source }
-                if source.to_string().contains("stun refresh")),
-            "got {err:?}"
-        );
+        assert!(matches!(err, PunchError::RefreshExhausted), "got {err:?}");
         pool.shutdown().await;
     }
 

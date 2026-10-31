@@ -192,10 +192,6 @@ pub(crate) struct SocketPool<S: UdpIo> {
     dests: RwLock<HashSet<SocketAddr>>,
     max_mappings: usize,
     sent: AtomicU32,
-    /// The most recent bind failure, reported when no socket ever bound so
-    /// the session names the real cause (for example descriptor exhaustion)
-    /// instead of a generic stopped-stream error.
-    last_bind_error: Option<io::Error>,
 }
 
 impl<S: UdpIo> SocketPool<S> {
@@ -223,29 +219,31 @@ impl<S: UdpIo> SocketPool<S> {
             dests: RwLock::new(HashSet::new()),
             max_mappings: cfg.max_mappings,
             sent: AtomicU32::new(0),
-            last_bind_error: None,
         };
+        let mut bound = 0;
+        let mut last_bind_error = None;
         for (family, count) in [(Family::V4, v4), (Family::V6, v6)] {
             for _ in 0..count {
                 // A family that cannot bind on this host stays empty.
                 match factory.bind(family.any_addr()).await {
-                    Ok(sock) => pool.push_socket(sock, family, &tx),
-                    Err(e) => pool.last_bind_error = Some(e),
+                    Ok(sock) => {
+                        pool.push_socket(sock, family, &tx);
+                        bound += 1;
+                    },
+                    Err(e) => last_bind_error = Some(e),
                 }
             }
         }
+        // A pool that bound nothing can neither send nor receive, so the
+        // session fails at bind with the real cause instead of surfacing
+        // a stopped stream later in the engine. A pool that bound nothing
+        // because nothing was requested constructs empty.
+        if bound == 0
+            && let Some(source) = last_bind_error
+        {
+            return Err(PunchError::BindFailed { source });
+        }
         Ok((pool, rx))
-    }
-
-    /// Live sockets across both families.
-    pub(crate) fn live_sockets(&self) -> usize {
-        self.groups.iter().map(Vec::len).sum()
-    }
-
-    /// The most recent bind failure, kept for diagnosis when no socket
-    /// ever bound.
-    pub(crate) fn last_bind_error(&self) -> Option<&io::Error> {
-        self.last_bind_error.as_ref()
     }
 
     fn push_socket(&mut self, sock: S, family: Family, tx: &mpsc::Sender<RecvEvent>) {
@@ -307,10 +305,7 @@ impl<S: UdpIo> SocketPool<S> {
         // The one choke point every outbound target crosses, because every
         // target list ultimately comes from peer-signaled data.
         if let Some(reason) = unusable_reason(target) {
-            return Err(PunchError::Io {
-                phase: Phase::Punch,
-                source: io::Error::new(io::ErrorKind::InvalidInput, reason),
-            });
+            return Err(PunchError::UnusableTarget { target, reason });
         }
         if !self
             .dests
@@ -341,14 +336,14 @@ impl<S: UdpIo> SocketPool<S> {
             return Err(PunchError::BudgetExhausted);
         }
         self.limiter.acquire().await;
-        let sent = match self.group_ref(family).get(idx as usize) {
-            Some(sock) => sock.send_to(buf, target).await,
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pool index out of range",
-            )),
+        let Some(sock) = self.group_ref(family).get(idx as usize) else {
+            // The engine sizes sends by the pool's bound counts, so an
+            // index past the group is a bug in this crate. The reserved
+            // budget unit returns with every other failure here.
+            self.budget.fetch_add(1, Ordering::Relaxed);
+            return Err(PunchError::Internal("send index past the pool group"));
         };
-        if let Err(err) = sent {
+        if let Err(err) = sock.send_to(buf, target).await {
             // No packet left the host, so the reserved budget unit goes back.
             self.budget.fetch_add(1, Ordering::Relaxed);
             // The rate slot stays spent: a token cannot return to the limiter.
@@ -378,28 +373,23 @@ impl<S: UdpIo> SocketPool<S> {
             return Err(PunchError::BudgetExhausted);
         }
         self.limiter.acquire().await;
-        let sent = match self.group_ref(Family::V4).get(idx as usize) {
-            Some(sock) => sock.send_to(buf, server).await,
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pool index out of range",
-            )),
+        let Some(sock) = self.group_ref(Family::V4).get(idx as usize) else {
+            // Same invariant as the data-plane send, and the reserved
+            // quota unit returns the same way.
+            self.refresh_budget.fetch_add(1, Ordering::Relaxed);
+            return Err(PunchError::Internal("refresh index past the pool group"));
         };
-        match sent {
-            Ok(_) => {
-                self.sent.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-            Err(err) => {
-                // No packet left the host, so the reserved quota unit goes
-                // back.
-                self.refresh_budget.fetch_add(1, Ordering::Relaxed);
-                Err(PunchError::Io {
-                    phase: Phase::Punch,
-                    source: err,
-                })
-            },
+        if let Err(err) = sock.send_to(buf, server).await {
+            // No packet left the host, so the reserved quota unit goes
+            // back.
+            self.refresh_budget.fetch_add(1, Ordering::Relaxed);
+            return Err(PunchError::Io {
+                phase: Phase::Punch,
+                source: err,
+            });
         }
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Packets the pool actually sent.
@@ -418,17 +408,14 @@ impl<S: UdpIo> SocketPool<S> {
         }
         let group = self.group(family);
         if group.get(winner as usize).is_none() {
-            return Err(PunchError::Io {
-                phase: Phase::Punch,
-                source: io::Error::new(io::ErrorKind::InvalidInput, "winner index out of range"),
-            });
+            return Err(PunchError::Internal("winner index past the pool group"));
         }
         let sock = group.swap_remove(winner as usize);
         self.groups = [Vec::new(), Vec::new()];
-        let sock = Arc::try_unwrap(sock).map_err(|_| PunchError::Io {
-            phase: Phase::Punch,
-            source: io::Error::other("winner socket still shared after election"),
-        })?;
+        // Every receive task was joined above, so no clone of the winner
+        // can still exist.
+        let sock = Arc::try_unwrap(sock)
+            .map_err(|_| PunchError::Internal("winner socket still shared after election"))?;
         sock.into_delivered().map_err(|source| PunchError::Io {
             phase: Phase::Punch,
             source,

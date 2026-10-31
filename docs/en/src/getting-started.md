@@ -81,7 +81,7 @@ pub struct PunchFailure {
 }
 ```
 
-`error` names the phase that failed; match on it as before. `diagnostics` carries what the session had learned by then: the local and peer `NatInfo` once collected, the settled `StrategySummary`, the attempt nonce, and the wall time of each completed phase. Each field appears as its phase completes, so the populated set alone names the phase the failure belongs to. Errors from before the session, such as `Puncher::new` rejecting a config, convert with empty diagnostics.
+`error` names the phase that failed; match on it as before. `Io` always carries a real OS error; states the library derives itself, such as no STUN destination, every pool bind failing, or the refresh running out of retries, carry dedicated variants, so matching separates socket failure from the session's own conclusions. `diagnostics` carries what the session had learned by then: the local and peer `NatInfo` once collected, the settled `StrategySummary`, the attempt nonce, and the wall time of each completed phase. Each field appears as its phase completes, so the populated set alone names the phase the failure belongs to. Errors from before the session, such as `Puncher::new` rejecting a config, convert with empty diagnostics.
 
 Progress is observable without polling. `Puncher::with_events(sender)` feeds one `SessionEvent` per completed stage, Probe, Exchange, Negotiate in that order, into an `mpsc` channel. Emission is best-effort: a full or closed channel loses the event and never stalls the session, so no dedicated drain task is required.
 

@@ -39,14 +39,55 @@ pub enum PunchError {
     /// The data-plane handshake never completed both directions.
     #[error("data-plane handshake never completed both directions")]
     ConfirmFailed,
+    /// No configured STUN server resolved to an IPv4 address, so the
+    /// probe had no destination to query.
+    #[error("no STUN server resolved to an IPv4 address")]
+    NoStunDestination,
+    /// Every socket the pool tried to bind failed, so the session has no
+    /// socket to punch with. `source` is the last bind failure and names
+    /// the real cause, such as descriptor exhaustion.
+    #[error("every pool socket failed to bind: {source}")]
+    BindFailed {
+        #[source]
+        source: std::io::Error,
+    },
+    /// The pool's receive tasks all stopped while the engine still ran.
+    ///
+    /// A receive task ends only by cancellation or a failed socket, and
+    /// cancellation has not run at that point, so the pool lost its
+    /// sockets to errors it does not attribute to one address.
+    #[error("pool receive tasks stopped")]
+    PoolStopped,
+    /// A STUN refresh the plan depends on could not run: no server
+    /// resolved or no IPv4 socket bound to query from.
+    #[error("stun refresh unavailable: no server or bound socket")]
+    RefreshUnavailable,
+    /// A STUN refresh the plan depends on sent its retries and none
+    /// answered before any handshake traffic arrived.
+    #[error("stun refresh retries exhausted")]
+    RefreshExhausted,
+    /// A target derived from peer-signaled data cannot carry punch
+    /// traffic: port zero, or an unspecified, multicast, or broadcast
+    /// address. Loopback stays valid.
+    #[error("unusable punch target {target}: {reason}")]
+    UnusableTarget {
+        target: std::net::SocketAddr,
+        reason: &'static str,
+    },
+    /// A state this crate treats as unreachable: a bug, not a network
+    /// condition. The detail names the invariant that broke.
+    #[error("internal error: {0}")]
+    Internal(&'static str),
     /// The configuration failed validation.
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
-    /// Socket or STUN level failure in the phase that produced it.
+    /// A real socket error from the phase that produced it.
     ///
-    /// Only Probe and the punch engine construct these. The engine covers
-    /// the Punch and Confirm windows as one phase, so failures from its
-    /// post-handshake window still report `Phase::Punch`.
+    /// Only Probe and the punch engine construct these, and the source is
+    /// always an OS error; states the library derives itself carry
+    /// dedicated variants. The engine covers the Punch and Confirm
+    /// windows as one phase, so failures from its post-handshake window
+    /// still report `Phase::Punch`.
     #[error("phase {phase:?} io: {source}")]
     Io {
         phase: Phase,

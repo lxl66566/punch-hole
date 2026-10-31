@@ -101,10 +101,10 @@ async fn failed_send_refunds_the_budget() {
 
     // The out-of-range index fails after the reservation and refunds.
     let err = pool.send(Family::V4, 9, b"x", target).await.unwrap_err();
-    assert!(matches!(err, PunchError::Io {
-        phase: Phase::Punch,
-        ..
-    }));
+    assert!(matches!(
+        err,
+        PunchError::Internal("send index past the pool group")
+    ));
 
     pool.send(Family::V4, 0, b"x", target)
         .await
@@ -145,12 +145,12 @@ async fn an_empty_pool_admits_no_destination() {
     pool.shutdown().await;
 }
 
-/// Every failed bind must stay diagnosable: the pool keeps the last
-/// bind error so a session with no live socket names the real cause
-/// instead of a generic stopped-stream error.
+/// A pool whose every bind failed fails at bind with the last error as
+/// its source, so the session names the real cause instead of surfacing
+/// a stopped stream later.
 #[cfg(feature = "test-util")]
 #[tokio::test(start_paused = true)]
-async fn all_failed_binds_keep_their_cause() {
+async fn all_failed_binds_fail_fast_with_their_cause() {
     struct Failing;
     impl UdpFactory for Failing {
         type Socket = nat_lab::sim::SimSocket;
@@ -160,17 +160,19 @@ async fn all_failed_binds_keep_their_cause() {
         }
     }
 
-    let cfg = PunchConfig::default();
-    let (pool, _rx) = SocketPool::bind(&Failing, &cfg, 2, 1)
+    let err = SocketPool::bind(&Failing, &PunchConfig::default(), 2, 1)
         .await
-        .expect("pool still constructs");
-    assert_eq!(pool.live_sockets(), 0);
-    let err = pool.last_bind_error().expect("bind failure recorded");
-    assert!(
-        err.to_string().contains("simulated descriptor exhaustion"),
-        "recorded cause carries the bind error, got {err}"
-    );
-    pool.shutdown().await;
+        .map(|_| ())
+        .expect_err("a pool that bound nothing fails");
+    match err {
+        PunchError::BindFailed { source } => assert!(
+            source
+                .to_string()
+                .contains("simulated descriptor exhaustion"),
+            "bind failure carries the real cause, got {source}"
+        ),
+        other => panic!("expected BindFailed, got {other:?}"),
+    }
 }
 
 /// Targets that cannot be a punch peer never leave the host, whatever
@@ -199,8 +201,7 @@ async fn unusable_targets_are_rejected() {
     for target in bad {
         let err = pool.send(Family::V4, 0, b"x", target).await.unwrap_err();
         assert!(
-            matches!(&err, PunchError::Io { source, .. }
-                if source.kind() == io::ErrorKind::InvalidInput),
+            matches!(&err, PunchError::UnusableTarget { target: t, .. } if *t == target),
             "target {target} rejected with {err:?}"
         );
     }
