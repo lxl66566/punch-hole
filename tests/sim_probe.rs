@@ -140,8 +140,10 @@ async fn cached_nat_info_skips_probe() {
             alloc_seq: vec![40000, 40000, 40000, 40000],
             distinct_probe_ips: 2,
             filtering: punch_hole::FilterClass::Unknown,
+            hairpin: true,
         }),
         v6: None,
+        local: Vec::new(),
     };
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
@@ -602,4 +604,66 @@ async fn mid_probe_rebind_degrades_to_hard_sym() {
         NatClass::HardSym,
         "a split sequence never carries a fitted stride"
     );
+}
+
+/// Two hosts behind one shared NAT punch through the matrix when the NAT
+/// hairpins: the reflexive-aimed pulses loop back inside the NAT, and the
+/// winner path names the shared public address.
+#[tokio::test(start_paused = true)]
+async fn shared_nat_hairpin_pair_punches_through_the_matrix() {
+    let net = Net::seeded("shared_nat_hairpin");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_eif());
+    let b = net.host_sharing(&a);
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("shared-NAT hairpin pair punches");
+    let pb = rb.expect("peer side punches");
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
+    assert_eq!(
+        pa.report.local_filtering,
+        Some(punch_hole::FilterClass::EndpointIndependent)
+    );
+    // The winner path crossed the NAT's hairpin, not the LAN: the peer's
+    // address is the shared public one.
+    assert_eq!(pa.peer_addr.ip().to_string(), "100.64.2.1");
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// Two hosts behind one shared NAT that does not loop datagrams back
+/// punch over the LAN underneath it: the hairpin measurement fails, the
+/// reflexive-aimed matrix stages are dead, and the local stage aims at
+/// the peer's reported local address, so the winner path names that
+/// address.
+#[tokio::test(start_paused = true)]
+async fn shared_nat_without_hairpin_punches_over_the_lan() {
+    let net = Net::seeded("shared_nat_lan");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_apdf().with_hairpin(false));
+    let b = net.host_sharing(&a);
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("shared-NAT LAN pair punches");
+    let pb = rb.expect("peer side punches");
+    // The port-strict filter dropped the looped hairpin probe, so the
+    // matrix stages are dead and the local stage carried the punch.
+    assert_eq!(pa.peer_addr.ip().to_string(), "192.168.2.3");
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// Two hosts behind one shared NAT with port-strict filtering punch
+/// through the matrix: the hairpin measurement passes — the self-loop's
+/// source is a destination the mapping itself just wrote — which proves
+/// one endpoint-independent mapping per socket and routes the mutual
+/// sweep of ConeExchange, whose crossing pulses write each other's
+/// sources into the shared NAT's mappings.
+#[tokio::test(start_paused = true)]
+async fn shared_nat_strict_filter_pair_punches_through_the_matrix() {
+    let net = Net::seeded("shared_nat_apdf");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_apdf());
+    let b = net.host_sharing(&a);
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("shared-NAT strict-filter pair punches");
+    let pb = rb.expect("peer side punches");
+    assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
+    common::assert_business_traffic(&pa, &pb).await;
 }

@@ -14,13 +14,19 @@ Selection runs on the **effective** classes, which means a weak EasySym fit has 
 
 The Initiator applies the matrix and sends the result in an `Offer` that also carries the socket counts for both sides and the pulse schedule. The Responder clamps the socket counts to its own limits and answers `Accept`.
 
-Cone readings enter the matrix with confidence. Identical ports across destinations also fall out of an address-dependent symmetric NAT when the whole fan-out crossed one server IP, and a probe that answered fewer than two destinations says nothing at all, so a cone reading counts only when its fan-out answered from at least two IPs with at least two samples. When either cone reading falls short, the pair runs SymProbe with the ambiguous side shooting: the shooter's sockets punch whether that side turns out to be a cone or symmetric, and the price is the port-strict corner of the trusted side, which ConeExchange would have covered.
+Cone readings enter the matrix with confidence. Identical ports across destinations also fall out of an address-dependent symmetric NAT when the whole fan-out crossed one server IP, and a probe that answered fewer than two destinations says nothing at all, so a cone reading counts only when its fan-out answered from at least two IPs with at least two samples. One exception needs no second IP: reflexive addresses on one IP whose hairpin tests both passed prove one endpoint-independent mapping per socket — a per-destination mapping fails the self-loop — so the shared-NAT cone reading is confident and the pair runs ConeExchange. When a cone reading falls short any other way, the pair runs SymProbe with the ambiguous side shooting: the shooter's sockets punch whether that side turns out to be a cone or symmetric, and the price is the port-strict corner of the trusted side, which ConeExchange would have covered.
 
 ## The Direct stage
 
 Before the matrix strategy runs, a Direct stage checks whether the pair needs no NAT work at all. It runs whenever both sides reported global IPv6 addresses, or whenever both IPv4 paths are public. The stage gets `direct_window`, one second by default, counted inside the punch budget, and the matrix strategy spends whatever remains.
 
 The addresses a `Hello` carries belong to the sender's probe socket, which is closed by then. So the stage, like every fixed-port stage, waits for the peer's `PortUpdate`, the frame that names the live punch socket's port.
+
+## The Local stage
+
+Two hosts whose reflexive addresses name one NAT may share the LAN underneath it, where a datagram to the peer's local address needs no NAT cooperation at all. When the reflexive IPs match, the plan grows a Local stage that aims at every local address the peer's `Hello` reported, once the peer's `PortUpdate` names its local punch port — a local-only plan announces the pool socket's own port, because no NAT sits between to remap it.
+
+The probe's hairpin self-test decides between the LAN and the matrix. A datagram the probe sent to its own reflexive address looped back — hairpin measured — means the NAT translates between its own hosts and, one mapping per socket, admits the peer once the simultaneous open writes it: the matrix runs, and the mutual sweep of ConeExchange punches the shared NAT. Without the loop, every reflexive-aimed stage dies at the NAT's own loopback drop and the Local stage replaces the matrix outright. With no local addresses on either side, no IPv6 path, and no hairpin, the pair is honestly dead and Negotiate aborts it as `Unpunchable` before any socket opens.
 
 ## Estimating a symmetric peer's port span
 

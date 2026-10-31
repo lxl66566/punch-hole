@@ -29,7 +29,7 @@ Durations travel as plain millisecond integers. The API accepts `Duration` and c
 
 ## Versioning
 
-Both sides must run the same `VERSION`, currently 3. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
+Both sides must run the same `VERSION`, currently 4. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
 
 Adding a variant requires the bump just as much. postcard cannot tell an unknown variant index from corrupt bytes, so an old peer that receives a frame carrying a newer variant sees a plain decode error: on the signaling plane the frame is skipped and the peer burns to a phase timeout without ever learning of the mismatch. The version discipline is the only guard on that plane. The data plane checks the version byte before the body, so the first foreign-version packet fails the session with `VersionMismatch` on the spot.
 
@@ -80,6 +80,10 @@ pub enum AbortReason {
 pub struct NatInfo {
     pub v4: Option<V4Nat>,
     pub v6: Option<V6Nat>,
+    /// The host's own interface addresses on the path the probe ran,
+    /// for the Local stage between two hosts behind one NAT. Capped at
+    /// 8 entries.
+    pub local: Vec<Ipv4Addr>,
 }
 
 pub struct V4Nat {
@@ -96,6 +100,10 @@ pub struct V4Nat {
     /// run against one discovery-capable server before the fan-out.
     /// `Unknown` when no probe server advertised OTHER-ADDRESS.
     pub filtering: FilterClass,
+    /// Whether a datagram the probe sent to its own reflexive address
+    /// looped back (RFC 4787 §6), which also proves the mapping is
+    /// endpoint-independent: a per-destination mapping fails the self-loop.
+    pub hairpin: bool,
 }
 
 pub struct V6Nat {

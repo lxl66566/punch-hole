@@ -16,7 +16,7 @@ use crate::nat::{FilterClass, NatClass};
 /// Wire protocol version shared by both planes. Frames stamped with a
 /// different version are rejected, so incompatible layouts never decode
 /// halfway.
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 /// First byte of every data-plane packet.
 pub const DATA_MAGIC: u8 = 0x70;
 /// Signaling frames longer than this are rejected.
@@ -32,6 +32,8 @@ pub(crate) const MIN_DATA_PACKET: usize = 2 + 1 + size_of::<Nonce>();
 pub const MAX_ALLOC_SEQ: usize = 64;
 /// Upper bound on collected IPv6 addresses.
 pub const MAX_V6_ADDRS: usize = 8;
+/// Upper bound on reported local interface addresses.
+pub const MAX_LOCAL_ADDRS: usize = 8;
 
 /// Random 16 bytes drawn by the Initiator. Tags every packet of one attempt.
 pub type Nonce = [u8; 16];
@@ -171,6 +173,7 @@ pub fn decode_sig(bytes: &[u8]) -> Result<SigFrame, DecodeError> {
         if let Some(v6) = &mut info.v6 {
             v6.addrs.truncate(MAX_V6_ADDRS);
         }
+        info.local.truncate(MAX_LOCAL_ADDRS);
     }
     Ok(frame)
 }
@@ -209,6 +212,7 @@ fn sample_nat_info() -> NatInfo {
             alloc_seq: vec![40001, 40003, 40005, 40007],
             distinct_probe_ips: 4,
             filtering: FilterClass::AddressPortDependent,
+            hairpin: true,
         }),
         v6: Some(crate::nat::V6Nat {
             addrs: vec![SocketAddrV6::new(
@@ -218,6 +222,7 @@ fn sample_nat_info() -> NatInfo {
                 0,
             )],
         }),
+        local: vec![[192, 168, 1, 10].into()],
     }
 }
 

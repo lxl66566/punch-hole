@@ -122,8 +122,10 @@ mod tests {
                 alloc_seq: seq.to_vec(),
                 distinct_probe_ips: 4,
                 filtering: FilterClass::Unknown,
+                hairpin: true,
             }),
             v6: None,
+            local: Vec::new(),
         }
     }
 

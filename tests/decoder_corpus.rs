@@ -9,9 +9,9 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 
 use punch_hole::{
     msg::{
-        AbortReason, DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_SIG_FRAME,
-        MAX_V6_ADDRS, Offer, SigFrame, StrategyId, VERSION, decode_packet, decode_sig,
-        encode_packet, encode_sig,
+        AbortReason, DATA_MAGIC, DataPacket, DecodeError, Frame, MAX_DATA_PACKET, MAX_LOCAL_ADDRS,
+        MAX_SIG_FRAME, MAX_V6_ADDRS, Offer, SigFrame, StrategyId, VERSION, decode_packet,
+        decode_sig, encode_packet, encode_sig,
     },
     nat::{FilterClass, NatClass, NatInfo, V4Nat, V6Nat},
 };
@@ -27,12 +27,17 @@ fn hello_frame() -> SigFrame {
             alloc_seq: (0..64u16).map(|p| 30000 + p).collect(),
             distinct_probe_ips: 4,
             filtering: FilterClass::AddressPortDependent,
+            hairpin: true,
         }),
         v6: Some(V6Nat {
             addrs: (0..8u16)
                 .map(|i| SocketAddrV6::new([0x2001, i, 0, 0, 0, 0, 0, 1].into(), 5300 + i, 0, 0))
                 .collect(),
         }),
+        // Every vector sits at its cap, so the encoding is maximal.
+        local: (0..8u8)
+            .map(|i| std::net::Ipv4Addr::new(192, 168, i, 10))
+            .collect(),
     };
     SigFrame {
         ts: 42,
@@ -247,6 +252,7 @@ fn oversized_peer_v6_list_is_truncated() {
         body: Frame::Hello(NatInfo {
             v4: None,
             v6: Some(V6Nat { addrs }),
+            local: Vec::new(),
         }),
     };
     let bytes = encode_sig(&frame);
@@ -258,4 +264,34 @@ fn oversized_peer_v6_list_is_truncated() {
         panic!("hello body survives");
     };
     assert_eq!(decoded.v6.expect("v6 survives").addrs, expected);
+}
+
+/// A peer that ignored the send-side local-address cap cannot push an
+/// oversized list into the session either: decode truncates it to the
+/// wire limit whatever the frame carries otherwise.
+#[test]
+fn oversized_peer_local_list_is_truncated() {
+    let count = u8::try_from(MAX_LOCAL_ADDRS * 3).expect("cap fits u8");
+    let ips: Vec<_> = (1..=count)
+        .map(|i| std::net::Ipv4Addr::new(192, 168, i, i))
+        .collect();
+    let expected = ips[..MAX_LOCAL_ADDRS].to_vec();
+    let frame = SigFrame {
+        ts: 0,
+        echo: 0,
+        body: Frame::Hello(NatInfo {
+            v4: None,
+            v6: None,
+            local: ips,
+        }),
+    };
+    let bytes = encode_sig(&frame);
+    assert!(
+        bytes.len() <= MAX_SIG_FRAME,
+        "the oversized list still fits the frame cap"
+    );
+    let Frame::Hello(decoded) = decode_sig(&bytes).expect("frame decodes").body else {
+        panic!("hello body survives");
+    };
+    assert_eq!(decoded.local, expected);
 }

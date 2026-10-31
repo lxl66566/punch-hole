@@ -21,6 +21,12 @@ Before the fan-out, one discovery probe asks the first destination for a plain b
 
 A reply to the first test reads `EndpointIndependent`; a reply to only the second reads `AddressDependent`; both silent read `AddressPortDependent`. The tests run before the fan-out on purpose: the fan-out writes every grid port into the mapping's destination set, and a port-strict filter then admits the change-port reply through a destination the mapping already sent to, which would read the stricter class as `AddressDependent`. A silent discovery probe retries once; a server that answers without OTHER-ADDRESS, or stays silent twice, leaves the axis `Unknown` rather than a class the fan-out's written ports could corrupt. All of it costs at most four packets beyond the fan-out.
 
+## The hairpin self-test and the local addresses
+
+After the fan-out fixes the reflexive address, one binding request travels to that address itself and waits to come back. A NAT that hairpins (RFC 4787 §6) delivers it to the sending socket, where the transaction id identifies it; silence after one retry reads as a NAT that drops its own loopback traffic. The test doubles as a mapping probe: a looped request names a source the mapping itself just wrote, so only an endpoint-independent mapping produces a positive reading — a per-destination mapping answers from a port the filter has never seen. The measured value says what a punch between two hosts behind this NAT can rely on, which is exactly the state a reflexive-aimed punch target faces.
+
+The probe also records the local address the socket is bound to — or, on a wildcard bind, the interface the route to the first server picks. The list rides the `Hello` as `local`, and the strategies chapter's Local stage aims at the peer's entries when both reflexive addresses name one NAT.
+
 ## Reading the allocation sequence
 
 The answer ports, in allocation order, form `alloc_seq`. The sequence is the NAT's allocation history for this socket, one port per outbound flow in the order the flows were created. Three rules turn it into a class:
@@ -42,7 +48,7 @@ Two consistent deltas can be coincidence. A fit needs three deltas, which means 
 
 ## What the probe measures, and what it leaves out
 
-The port sequence measures mapping; the change-request tests measure filtering. The two axes travel together in `V4Nat` — `class` and `filtering` — and both reach the peer inside the `Hello`. The strategies read the measured filters where the difference matters: symmetric pairs price their estimate under the one-directional regime when at least one side filters non-port-strict, and under the quadratic pairing regime when both sides are port-strict, which fails the default budget's bar and aborts the pair as `Unpunchable` before any socket opens. `FilterClass::Unknown` remains for a host whose servers speak no RFC 5780 discovery; the strategies read it as the relaxed case, the historical assumption. The hairpin question — whether a NAT loops a datagram aimed at its own external address back — stays unmeasured, which the limitations chapter covers.
+The port sequence measures mapping; the change-request tests measure filtering; the hairpin self-test measures the loopback behavior. All three travel in the `Hello` — `class`, `filtering`, `hairpin`, and the `local` list beside them. The strategies read the measured filters where the difference matters: symmetric pairs price their estimate under the one-directional regime when at least one side filters non-port-strict, and under the quadratic pairing regime when both sides are port-strict, which fails the default budget's bar and aborts the pair as `Unpunchable` before any socket opens. `FilterClass::Unknown` remains for a host whose servers speak no RFC 5780 discovery; the strategies read it as the relaxed case, the historical assumption.
 
 ## Port prediction
 

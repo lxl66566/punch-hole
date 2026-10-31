@@ -156,8 +156,41 @@ pub(crate) fn select(
     let i_am_symmetric = is_symmetric(mine_class);
     let peer_is_symmetric = is_symmetric(peer_class);
 
+    // Two hosts whose reflexive addresses share one NAT that hairpins for
+    // neither can only punch over the LAN underneath it or over IPv6:
+    // every reflexive-aimed stage dies at the NAT's own loopback drop.
+    // With neither path available the pair is honestly dead, and the
+    // attempt aborts here instead of burning the punch window on targets
+    // no packet can reach. One side's local list suffices for the LAN,
+    // because the side that holds one aims and the other replies from the
+    // source it observes.
+    let both_v6 = cfg.ipv6
+        && mine.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty())
+        && peer.v6.as_ref().is_some_and(|v6| !v6.addrs.is_empty());
+    let shared_dead_end = matches!(
+        (&mine.v4, &peer.v4),
+        (Some(a), Some(b)) if a.reflexive.ip() == b.reflexive.ip() && !(a.hairpin && b.hairpin)
+    ) && !both_v6
+        && mine.local.is_empty()
+        && peer.local.is_empty();
+    if shared_dead_end {
+        return Err(PunchError::Unpunchable {
+            local: mine_class,
+            peer: peer_class,
+        });
+    }
+
+    // Two reflexive addresses on one IP that both hairpinned prove one
+    // endpoint-independent mapping serves each socket: a per-destination
+    // mapping fails the self-loop, so the cone reading needs no second
+    // server IP, and the matrix shape that punches a shared NAT is the
+    // mutual sweep.
+    let hairpin_proven_cone = matches!(
+        (&mine.v4, &peer.v4),
+        (Some(a), Some(b)) if a.reflexive.ip() == b.reflexive.ip() && a.hairpin && b.hairpin
+    );
     if !i_am_symmetric && !peer_is_symmetric {
-        if cone_confident(mine) && cone_confident(peer) {
+        if (cone_confident(mine) && cone_confident(peer)) || hairpin_proven_cone {
             // Cone against cone, or public against either: one socket per
             // side aimed at the reflexive address.
             return Ok(Selection {
@@ -312,6 +345,15 @@ fn is_symmetric(class: NatClass) -> bool {
 /// address a probe would have collected.
 fn usable_peer_v6(ip: Ipv6Addr) -> bool {
     crate::nat::usable_v6(ip)
+}
+
+/// Whether a peer-signaled local address is worth a Local stage packet.
+///
+/// The Local stage aims at the LAN underneath a shared NAT, so the list
+/// keeps loopback, which lab tests stand in for a LAN with, and drops
+/// the shapes that name no peer: unspecified, multicast, and broadcast.
+fn local_stage_reachable(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
 }
 
 /// Widening multiplier on the unbiased per-side extension of a span.
@@ -678,6 +720,10 @@ pub(crate) struct StageSpec {
     /// pulses stop after the racing pass and one settled pass over the
     /// target list.
     pub fixed_peer_ports: bool,
+    /// Sweeps aim at the peer's reported local addresses instead of its
+    /// reflexive one: two hosts behind one non-hairpinning NAT reach each
+    /// other on the LAN underneath it and nowhere else.
+    pub local_targets: bool,
 }
 
 impl StageSpec {
@@ -699,6 +745,7 @@ impl StageSpec {
             per_sweep: 1,
             hold_for_peer: false,
             fixed_peer_ports: false,
+            local_targets: false,
         }
     }
 
@@ -714,6 +761,7 @@ impl StageSpec {
             per_sweep: 1,
             hold_for_peer: false,
             fixed_peer_ports: false,
+            local_targets: false,
         }
     }
 }
@@ -740,6 +788,9 @@ pub(crate) struct ExecPlan {
     pub peer_ip: Ipv4Addr,
     /// The peer's global IPv6 addresses, from its Hello.
     pub peer_v6: Vec<SocketAddrV6>,
+    /// The peer's local interface addresses, from its Hello, for a stage
+    /// with `local_targets`.
+    pub peer_local: Vec<Ipv4Addr>,
 }
 
 /// Builds the stage list for one side from the agreed selection.
@@ -753,82 +804,106 @@ pub(crate) fn build_plan(
     refresh_server: Option<SocketAddr>,
     cfg: &PunchConfig,
 ) -> ExecPlan {
+    // Two hosts whose reflexive addresses share one NAT that hairpins for
+    // neither reach each other only on the LAN underneath it: every matrix
+    // stage aims at the shared public address, where the NAT drops its own
+    // loopback traffic. The Local stage replaces the matrix for the pair,
+    // and the announce that feeds it names the local punch port, which is
+    // the port the peer aims at when no NAT sits between.
+    let both_hairpin = matches!(
+        (&mine.v4, &peer.v4),
+        (Some(a), Some(b)) if a.hairpin && b.hairpin
+    );
+    let same_ip = matches!(
+        (&mine.v4, &peer.v4),
+        (Some(a), Some(b)) if a.reflexive.ip() == b.reflexive.ip()
+    );
+    let local_only = same_ip && !both_hairpin;
+
     let mut stages = Vec::new();
     if direct_first(mine, peer, cfg) {
         stages.extend(direct::stage(mine, peer, cfg));
     }
-    match sel.strategy {
-        StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
-        StrategyId::SymProbe => {
-            // The socket counts carry the shape: the shooter side holds
-            // the assistant count, the replying side one socket. A tie is
-            // one assistant socket per side, which the initiator shoots,
-            // so the derivation stays role-keyed instead of re-reading
-            // the classes the Offer may have crossed.
-            let i_shoot = match role {
-                crate::report::Role::Initiator => sel.initiator_sockets >= sel.responder_sockets,
-                crate::report::Role::Responder => sel.responder_sockets > sel.initiator_sockets,
-            };
-            let peer_sockets = match role {
-                crate::report::Role::Initiator => sel.responder_sockets,
-                crate::report::Role::Responder => sel.initiator_sockets,
-            };
-            stages.extend(sym_cone::stage(
-                i_shoot,
-                my_sockets,
-                peer_sockets,
-                peer,
-                nonce,
-                cfg,
-            ));
-        },
-        StrategyId::PredictiveExchange => {
-            let peer_sockets = match role {
-                crate::report::Role::Initiator => sel.responder_sockets,
-                crate::report::Role::Responder => sel.initiator_sockets,
-            };
-            let window = (my_sockets as usize * peer_sockets as usize * PREDICTION_WINDOW_MULTIPLE)
-                .min(PREDICTION_WINDOW_CAP);
-            stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
-        },
-        StrategyId::PredictiveBurst => {
-            let i_am_easy = matches!(effective_class(mine), NatClass::EasySym { .. });
-            // The sizing always reads the hard side's space, whichever
-            // side builds the stage, so both roles derive the same
-            // coverage pair from the same views.
-            let hard_space = if i_am_easy {
-                peer_space(peer)
-            } else {
-                peer_space(mine)
-            };
-            stages.extend(predictive_burst::stage(
-                i_am_easy,
-                my_sockets,
-                hard_space,
-                peer,
-                nonce,
-                role as u64,
-                cfg,
-            ));
-        },
-        StrategyId::BirthdayBurst => {
-            // Selection sized the same pure solve over the same pair of
-            // views, so the role-keyed coverage here matches what the
-            // estimate reported.
-            let sized = size_burst(peer_space(mine), peer_space(peer), cfg);
-            let coverage = match role {
-                crate::report::Role::Initiator => sized.initiator_coverage,
-                crate::report::Role::Responder => sized.responder_coverage,
-            };
-            stages.extend(birthday::stage(
-                my_sockets,
-                coverage,
-                peer,
-                nonce,
-                role as u64,
-                cfg,
-            ));
-        },
+    if local_only {
+        stages.extend(direct::local_stage(peer, cfg));
+    }
+    if !local_only {
+        match sel.strategy {
+            StrategyId::ConeExchange => stages.extend(cone::stage(peer, cfg)),
+            StrategyId::SymProbe => {
+                // The socket counts carry the shape: the shooter side holds
+                // the assistant count, the replying side one socket. A tie is
+                // one assistant socket per side, which the initiator shoots,
+                // so the derivation stays role-keyed instead of re-reading
+                // the classes the Offer may have crossed.
+                let i_shoot = match role {
+                    crate::report::Role::Initiator => {
+                        sel.initiator_sockets >= sel.responder_sockets
+                    },
+                    crate::report::Role::Responder => sel.responder_sockets > sel.initiator_sockets,
+                };
+                let peer_sockets = match role {
+                    crate::report::Role::Initiator => sel.responder_sockets,
+                    crate::report::Role::Responder => sel.initiator_sockets,
+                };
+                stages.extend(sym_cone::stage(
+                    i_shoot,
+                    my_sockets,
+                    peer_sockets,
+                    peer,
+                    nonce,
+                    cfg,
+                ));
+            },
+            StrategyId::PredictiveExchange => {
+                let peer_sockets = match role {
+                    crate::report::Role::Initiator => sel.responder_sockets,
+                    crate::report::Role::Responder => sel.initiator_sockets,
+                };
+                let window =
+                    (my_sockets as usize * peer_sockets as usize * PREDICTION_WINDOW_MULTIPLE)
+                        .min(PREDICTION_WINDOW_CAP);
+                stages.extend(easy_sym::stage(my_sockets, peer, window, cfg));
+            },
+            StrategyId::PredictiveBurst => {
+                let i_am_easy = matches!(effective_class(mine), NatClass::EasySym { .. });
+                // The sizing always reads the hard side's space, whichever
+                // side builds the stage, so both roles derive the same
+                // coverage pair from the same views.
+                let hard_space = if i_am_easy {
+                    peer_space(peer)
+                } else {
+                    peer_space(mine)
+                };
+                stages.extend(predictive_burst::stage(
+                    i_am_easy,
+                    my_sockets,
+                    hard_space,
+                    peer,
+                    nonce,
+                    role as u64,
+                    cfg,
+                ));
+            },
+            StrategyId::BirthdayBurst => {
+                // Selection sized the same pure solve over the same pair of
+                // views, so the role-keyed coverage here matches what the
+                // estimate reported.
+                let sized = size_burst(peer_space(mine), peer_space(peer), cfg);
+                let coverage = match role {
+                    crate::report::Role::Initiator => sized.initiator_coverage,
+                    crate::report::Role::Responder => sized.responder_coverage,
+                };
+                stages.extend(birthday::stage(
+                    my_sockets,
+                    coverage,
+                    peer,
+                    nonce,
+                    role as u64,
+                    cfg,
+                ));
+            },
+        }
     }
     // A peer without any usable address leaves the plan empty; bind one idle
     // socket so the engine still runs and fails on its deadline.
@@ -850,21 +925,27 @@ pub(crate) fn build_plan(
     let my_class = effective_class(mine);
     let peer_class = effective_class(peer);
     let my_sym = is_symmetric(my_class);
-    let refresh_v4 = match sel.strategy {
-        StrategyId::ConeExchange => {
-            if my_class == NatClass::Public {
-                Refresh::Local
-            } else {
+    // A local-only plan announces the pool socket's own port: the peer's
+    // Local stage aims there, and no NAT sits between to remap it.
+    let refresh_v4 = if local_only {
+        Refresh::Local
+    } else {
+        match sel.strategy {
+            StrategyId::ConeExchange => {
+                if my_class == NatClass::Public {
+                    Refresh::Local
+                } else {
+                    Refresh::Stun
+                }
+            },
+            StrategyId::SymProbe if !my_sym => Refresh::Stun,
+            StrategyId::SymProbe | StrategyId::PredictiveExchange | StrategyId::PredictiveBurst
+                if my_sym && matches!(my_class, NatClass::EasySym { .. }) =>
+            {
                 Refresh::Stun
-            }
-        },
-        StrategyId::SymProbe if !my_sym => Refresh::Stun,
-        StrategyId::SymProbe | StrategyId::PredictiveExchange | StrategyId::PredictiveBurst
-            if my_sym && matches!(my_class, NatClass::EasySym { .. }) =>
-        {
-            Refresh::Stun
-        },
-        _ => Refresh::None,
+            },
+            _ => Refresh::None,
+        }
     };
     // The announce of a symmetric side marks its sequence position, while
     // every other announce names the port the peer aims at.
@@ -892,6 +973,7 @@ pub(crate) fn build_plan(
             .reflexive_v4()
             .map_or(Ipv4Addr::UNSPECIFIED, |a| *a.ip()),
         peer_v6: peer.v6.as_ref().map_or(Vec::new(), |v6| v6.addrs.clone()),
+        peer_local: peer.local.clone(),
     }
 }
 
@@ -1372,7 +1454,22 @@ impl<S: UdpIo> Engine<S> {
             return false;
         }
         match family {
-            Family::V4 => addr.ip() == IpAddr::from(self.plan.peer_ip),
+            // A local stage aims at the peer's reported local addresses, so
+            // an answer from one of those names the aimed peer the same way
+            // a reflexive answer does.
+            Family::V4 => {
+                addr.ip() == IpAddr::from(self.plan.peer_ip)
+                    || (self
+                        .plan
+                        .stages
+                        .iter()
+                        .any(|s| s.family == Family::V4 && s.local_targets)
+                        && self
+                            .plan
+                            .peer_local
+                            .iter()
+                            .any(|ip| IpAddr::V4(*ip) == addr.ip()))
+            },
             Family::V6 => self
                 .plan
                 .peer_v6
@@ -1570,7 +1667,17 @@ impl<S: UdpIo> Engine<S> {
                 // An unspecified peer IP means the peer reported no usable
                 // IPv4 address, so no V4 target is generated rather than an
                 // unusable one.
-                Family::V4 if self.plan.peer_ip.is_unspecified() => Vec::new(),
+                Family::V4 if self.plan.peer_ip.is_unspecified() && !stage.local_targets => {
+                    Vec::new()
+                },
+                Family::V4 if stage.local_targets => self
+                    .plan
+                    .peer_local
+                    .iter()
+                    .copied()
+                    .filter(|ip| local_stage_reachable(*ip))
+                    .map(|ip| SocketAddr::from((ip, port)))
+                    .collect(),
                 Family::V4 => vec![SocketAddr::from((self.plan.peer_ip, port))],
                 Family::V6 => self
                     .plan
@@ -2045,6 +2152,10 @@ mod tests {
             .as_mut()
             .expect("v4 evidence")
             .distinct_probe_ips = 1;
+        // The two sides sit behind different NATs: one reflexive IP on
+        // both, with hairpin measured, would read as a shared-NAT pair.
+        single_ip.v4.as_mut().expect("v4 evidence").reflexive =
+            SocketAddrV4::new([203, 0, 113, 8].into(), 50_000);
         let sel = select(&single_ip, &cone, &cfg).expect("ambiguous initiator selects");
         assert_eq!(sel.strategy, StrategyId::SymProbe);
         assert_eq!((sel.initiator_sockets, sel.responder_sockets), (16, 1));
@@ -2055,10 +2166,109 @@ mod tests {
         assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 16));
         // A single answered sample carries no range and no mapping
         // evidence; the pair still runs, with the responder shooting.
-        let one_sample = sample_info(NatClass::Cone, &[50_000]);
-        let sel = select(&one_sample, &one_sample, &cfg).expect("thin samples select");
+        // Different reflexive IPs keep it off the shared-NAT reading.
+        let mut one_sample = sample_info(NatClass::Cone, &[50_000]);
+        one_sample.v4.as_mut().expect("v4 evidence").reflexive =
+            SocketAddrV4::new([203, 0, 113, 9].into(), 50_000);
+        let mut peer_sample = one_sample.clone();
+        peer_sample.v4.as_mut().expect("v4 evidence").reflexive =
+            SocketAddrV4::new([203, 0, 113, 10].into(), 50_000);
+        let sel = select(&one_sample, &peer_sample, &cfg).expect("thin samples select");
         assert_eq!(sel.strategy, StrategyId::SymProbe);
         assert_eq!((sel.initiator_sockets, sel.responder_sockets), (1, 16));
+    }
+
+    /// One reflexive IP on both sides plus a measured hairpin proves one
+    /// endpoint-independent mapping per socket — a per-destination mapping
+    /// fails the self-loop — so a cone reading built from a single server
+    /// IP routes to the mutual sweep instead of SymProbe, whose reply-side
+    /// spray cannot punch a shared NAT.
+    #[test]
+    fn shared_nat_hairpin_proves_the_cone_reading() {
+        let mut a = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        let mut b = a.clone();
+        b.v4.as_mut().expect("v4 evidence").reflexive =
+            SocketAddrV4::new([203, 0, 113, 7].into(), 50_001);
+        a.v4.as_mut().expect("v4 evidence").distinct_probe_ips = 1;
+        b.v4.as_mut().expect("v4 evidence").distinct_probe_ips = 1;
+        let cfg = PunchConfig::default();
+        assert_eq!(
+            select(&a, &b, &cfg)
+                .expect("hairpin evidence proves the cone")
+                .strategy,
+            StrategyId::ConeExchange
+        );
+    }
+
+    /// Two hosts whose reflexive addresses share one NAT that hairpins
+    /// for neither can only punch over the LAN underneath it: every
+    /// reflexive-aimed stage dies at the NAT's own loopback drop. With no
+    /// local addresses on either side and no IPv6 path, Negotiate aborts
+    /// before any socket opens.
+    #[test]
+    fn same_nat_without_hairpin_or_lan_aborts_in_negotiate() {
+        let mut a = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        let mut b = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        for info in [&mut a, &mut b] {
+            info.v4.as_mut().expect("v4 evidence").hairpin = false;
+        }
+        let cfg = PunchConfig::default();
+        assert!(matches!(
+            select(&a, &b, &cfg),
+            Err(PunchError::Unpunchable { .. })
+        ));
+        // A global IPv6 path on both sides rescues the pair: the Direct
+        // stage needs no NAT cooperation.
+        for info in [&mut a, &mut b] {
+            info.v6 = Some(crate::nat::V6Nat {
+                addrs: vec![SocketAddrV6::new(
+                    "2001:db8::1".parse().expect("global address"),
+                    5000,
+                    0,
+                    0,
+                )],
+            });
+        }
+        assert!(select(&a, &b, &cfg).is_ok(), "v6 rescues a dead v4 pair");
+    }
+
+    /// One side's local list is enough for the LAN: the side that holds
+    /// one aims at the peer's local addresses and the other replies from
+    /// the source it observes. The local-only plan announces the pool
+    /// socket's own port, because no NAT sits between to remap it, and
+    /// no matrix stage runs whose targets would die at the NAT.
+    #[test]
+    fn same_nat_without_hairpin_runs_the_local_stage() {
+        use crate::report::Role;
+
+        let mut a = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        let mut b = sample_info(NatClass::Cone, &[50_000, 50_000, 50_000, 50_000]);
+        for info in [&mut a, &mut b] {
+            info.v4.as_mut().expect("v4 evidence").hairpin = false;
+        }
+        a.local = vec![[192, 168, 1, 10].into()];
+        b.local = vec![[192, 168, 1, 20].into()];
+        let cfg = PunchConfig::default();
+        let sel = select(&a, &b, &cfg).expect("the LAN rescues the pair");
+        let plan = build_plan(&a, &b, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        let local = plan.stages.last().expect("the local stage");
+        assert!(local.local_targets);
+        assert!(local.needs_peer_ports);
+        assert_eq!(local.duration, cfg.direct_window);
+        assert_eq!(plan.refresh_v4, Refresh::Local);
+        assert!(
+            plan.stages.iter().all(|s| s.duration <= cfg.direct_window),
+            "no matrix stage survives a local-only plan"
+        );
+        // Hairpinning measured on both sides restores the matrix and its
+        // STUN refresh, and no local stage runs.
+        for info in [&mut a, &mut b] {
+            info.v4.as_mut().expect("v4 evidence").hairpin = true;
+        }
+        let sel = select(&a, &b, &cfg).expect("hairpin pair selects");
+        let plan = build_plan(&a, &b, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert!(!plan.stages.iter().any(|s| s.local_targets));
+        assert_eq!(plan.refresh_v4, Refresh::Stun);
     }
 
     /// Both port-strict filters invalidate the one-directional regime the
@@ -2201,6 +2411,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: vec![peer_v6],
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
@@ -2267,6 +2478,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: Ipv4Addr::UNSPECIFIED,
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
@@ -2310,6 +2522,7 @@ mod tests {
                 v6("::ffff:203.0.113.9".parse().expect("mapped address")),
                 v6(Ipv6Addr::LOCALHOST),
             ],
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
@@ -2365,6 +2578,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             multicast,
@@ -2396,6 +2610,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             port_zero,
@@ -2539,6 +2754,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> =
             Engine::new(plan, cfg.clone(), [0; 16], tokio::time::Instant::now());
@@ -2627,6 +2843,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let punch_timeout = cfg.punch_timeout;
         let direct_window = cfg.direct_window;
@@ -2665,6 +2882,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
@@ -2726,6 +2944,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -2776,6 +2995,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -2862,6 +3082,7 @@ mod tests {
                 sequence_marker: false,
                 peer_ip: [203, 0, 113, 9].into(),
                 peer_v6: Vec::new(),
+                peer_local: Vec::new(),
             }
         };
         let syn = encode_packet(&DataPacket::Syn {
@@ -2981,6 +3202,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3055,6 +3277,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3141,6 +3364,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3211,6 +3435,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3270,6 +3495,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3361,6 +3587,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: [203, 0, 113, 9].into(),
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
             plan,
@@ -3452,6 +3679,7 @@ mod tests {
             sequence_marker: false,
             peer_ip,
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> =
             Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
@@ -3494,6 +3722,7 @@ mod tests {
             sequence_marker: false,
             peer_ip: peer,
             peer_v6: Vec::new(),
+            peer_local: Vec::new(),
         };
         let mut engine: Engine<tokio::net::UdpSocket> = Engine::new(
             plan,
@@ -3541,7 +3770,11 @@ mod tests {
         // no IPv4 evidence is not a public claim, so Direct does not even
         // qualify, and no stage builder finds a target either way.
         let mine = sample_info(NatClass::Public, &[5000, 5000]);
-        let peer = NatInfo { v4: None, v6: None };
+        let peer = NatInfo {
+            v4: None,
+            v6: None,
+            local: Vec::new(),
+        };
         assert!(!direct_first(&mine, &peer, &cfg));
         let sel = select(&mine, &peer, &cfg).expect("both public select");
         let plan = build_plan(&mine, &peer, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
@@ -3567,8 +3800,10 @@ mod tests {
                 alloc_seq: seq.to_vec(),
                 distinct_probe_ips: 2,
                 filtering: Unknown,
+                hairpin: true,
             }),
             v6: None,
+            local: Vec::new(),
         }
     }
 }

@@ -123,6 +123,7 @@ pub(crate) async fn probe<F: UdpFactory>(
         alloc_seq: observed.iter().map(|&(_, port)| port).collect(),
         distinct_probe_ips: distinct_answered_ips(&round.dests, &round.slots),
         filtering,
+        hairpin: hairpin_test(&socket, reflexive, deadline).await,
     };
 
     let v6 = if cfg.ipv6 {
@@ -130,8 +131,13 @@ pub(crate) async fn probe<F: UdpFactory>(
     } else {
         None
     };
+    let local = local_candidates(&socket, round.dest(first_idx));
 
-    Ok(NatInfo { v4: Some(v4), v6 })
+    Ok(NatInfo {
+        v4: Some(v4),
+        v6,
+        local,
+    })
 }
 
 /// Collects global IPv6 reflexive addresses when a server and a route exist.
@@ -394,6 +400,74 @@ fn is_public<S: UdpIo>(socket: &S, server: SocketAddr, reflexive: &SocketAddr) -
         return false
     };
     local_ip == reflexive_ip && local.port() == reflexive.port()
+}
+
+/// Whether a datagram aimed at the socket's own reflexive address loops
+/// back (RFC 4787 §6 hairpinning).
+///
+/// One binding request leaves for the reflexive address itself, and a NAT
+/// that hairpins delivers it back to the sending socket, where the
+/// transaction id identifies it. A public path delivers trivially: the
+/// reflexive address is the host's own. Silence costs one retry, a lost
+/// datagram's worth; a NAT without loopback stays silent both times.
+async fn hairpin_test<S: UdpIo>(socket: &S, reflexive: SocketAddr, deadline: Instant) -> bool {
+    if reflexive.is_ipv6() {
+        return false;
+    }
+    for _ in 0..2 {
+        let txid: [u8; 12] = rand::random();
+        let request = binding_request(&txid);
+        if socket.send_to(&request, reflexive).await.is_err() {
+            return false;
+        }
+        let until = (Instant::now() + FILTER_TEST_WAIT).min(deadline);
+        loop {
+            let mut buf = [0u8; 1024];
+            let Ok(Ok((len, from))) =
+                tokio::time::timeout_at(until, socket.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            // The looped request arrives from the translated source, which
+            // is the reflexive address; any other datagram is noise to
+            // drain.
+            if from == reflexive && is_binding_request(&buf[..len], &txid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `buf` is the binding request carrying `txid`.
+fn is_binding_request(buf: &[u8], txid: &[u8; 12]) -> bool {
+    buf.len() >= 20
+        && buf[0..2] == BINDING_REQUEST.to_be_bytes()
+        && buf[4..8] == COOKIE
+        && buf[8..20] == *txid
+}
+
+/// The local interface addresses the Local stage can aim at.
+///
+/// A specifically bound socket reports its own address; a wildcard bind
+/// falls back to the interface the route to the first server picks, via
+/// the connect trick. Loopback stays eligible, so a lab without a real
+/// interface can stand it in. The probe reads one route, so the list
+/// holds at most one address here; the wire cap admits a peer that
+/// enumerates more.
+fn local_candidates<S: UdpIo>(socket: &S, server: SocketAddr) -> Vec<Ipv4Addr> {
+    let Ok(local) = socket.local_addr() else {
+        return Vec::new();
+    };
+    let ip = match local.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        IpAddr::V4(_) => crate::socket::sys::routed_local_ip(server).ok().flatten(),
+        IpAddr::V6(v6) => match v6.to_canonical() {
+            IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
+            _ => None,
+        },
+    };
+    ip.into_iter().collect()
 }
 
 /// Resolves configured servers to addresses of one family.

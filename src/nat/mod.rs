@@ -4,7 +4,7 @@ pub mod classify;
 pub mod predict;
 pub mod probe;
 
-use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 pub use predict::PortPredictor;
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,12 @@ pub enum FilterClass {
 pub struct NatInfo {
     pub v4: Option<V4Nat>,
     pub v6: Option<V6Nat>,
+    /// The host's own interface addresses on the path the probe ran, for
+    /// the Local stage: two hosts whose reflexive addresses name one NAT
+    /// may still share the LAN underneath it, where datagrams to the
+    /// peer's local address need no NAT cooperation at all. Capped at 8
+    /// entries on the wire.
+    pub local: Vec<Ipv4Addr>,
 }
 
 /// IPv4 NAT observations.
@@ -78,6 +84,11 @@ pub struct V4Nat {
     /// Inbound filtering evidence from the RFC 5780 change-request tests.
     /// `Unknown` when no probe server advertised OTHER-ADDRESS.
     pub filtering: FilterClass,
+    /// Whether the NAT loops a datagram aimed at its own external address
+    /// back to the sender (RFC 4787 §6), measured by the probe's hairpin
+    /// self-test. Two hosts whose reflexive addresses share one NAT punch
+    /// through the matrix stages only when this holds for both.
+    pub hairpin: bool,
 }
 
 /// Global IPv6 addresses collected during Probe. Capped at 8 entries.
@@ -130,8 +141,10 @@ mod tests {
                 alloc_seq: vec![5000, 5000],
                 distinct_probe_ips: 2,
                 filtering: FilterClass::Unknown,
+                hairpin: true,
             }),
             v6: None,
+            local: Vec::new(),
         };
         assert_eq!(public.v4_class(), Some(NatClass::Public));
     }

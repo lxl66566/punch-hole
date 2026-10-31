@@ -878,6 +878,34 @@ impl Net {
         }
     }
 
+    /// Attaches a second host to the NAT of `first`, on the same LAN.
+    ///
+    /// Both hosts report one reflexive address and their local addresses
+    /// share one /24, which is the shape the Local stage targets: a
+    /// datagram between them crosses no NAT, and one that aims at the
+    /// NAT's own external address hairpins only when the spec's
+    /// filtering admits it. The NAT, its spec, and its allocation walk
+    /// are the first host's, so `first` must come from [`Net::host`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `first` is a public host with no NAT to share.
+    #[must_use]
+    pub fn host_sharing(&self, first: &Host) -> Host {
+        let nat = first
+            .nat
+            .clone()
+            .expect("host_sharing needs a NAT'd first host");
+        let mut octets = first.local_ip.octets();
+        octets[3] += 1;
+        Host {
+            inner: Arc::clone(&first.inner),
+            nat: Some(nat),
+            local_ip: Ipv4Addr::from(octets),
+            faults: Arc::new(StdMutex::new(UplinkFaults::default())),
+        }
+    }
+
     /// Attaches a host behind a new NAT that itself rides `uplink`
     /// upstream, building the NAT-behind-NAT shape a CGNAT gives every
     /// home router.
@@ -1232,6 +1260,14 @@ impl UdpIo for SimSocket {
                     return Ok(buf.len());
                 }
             }
+            // A datagram aimed at the sender's own subnet crosses no NAT:
+            // the LAN underneath delivers it to the destination host. Two
+            // hosts one NAT shares sit on one subnet, which is the path
+            // the Local stage targets.
+            if sock.nat.is_some() && Self::same_subnet(sock.local, target) {
+                self.emit(buf, sock.local, target)?;
+                return Ok(buf.len());
+            }
             let Some(nat) = &sock.nat else {
                 self.emit(buf, sock.local, target)?;
                 return Ok(buf.len());
@@ -1279,6 +1315,14 @@ impl UdpIo for SimSocket {
 }
 
 impl SimSocket {
+    /// Whether two addresses share the /24 the sim hands its hosts.
+    fn same_subnet(a: SocketAddr, b: SocketAddr) -> bool {
+        match (a, b) {
+            (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip().octets()[..3] == b.ip().octets()[..3],
+            _ => false,
+        }
+    }
+
     /// Hands one datagram to the router.
     fn emit(&self, buf: &[u8], src: SocketAddr, dst: SocketAddr) -> io::Result<()> {
         self.inner

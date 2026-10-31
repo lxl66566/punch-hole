@@ -29,7 +29,7 @@ data:      [magic: 0x70][version: u8][postcard DataPacket]
 
 ## 版本策略
 
-两端必须跑同一个 `VERSION`，当前是 3。枚举变体跨版本只增不减，postcard 用变体下标编码，新增、重排或删除变体都要升版本。
+两端必须跑同一个 `VERSION`，当前是 4。枚举变体跨版本只增不减，postcard 用变体下标编码，新增、重排或删除变体都要升版本。
 
 新增变体同样必须升版本。postcard 无法区分未知变体下标与损坏字节，旧端收到携带更新变体的帧只会看到一次普通的解码失败：在信令平面上这一帧被跳过，对端直到阶段超时也不知道版本不一致。版本纪律是这一平面唯一的防线。数据面在解包体之前先查版本字节，第一个版本不符的包就会让会话立即以 `VersionMismatch` 失败。
 
@@ -80,6 +80,9 @@ pub enum AbortReason {
 pub struct NatInfo {
     pub v4: Option<V4Nat>,
     pub v6: Option<V6Nat>,
+    /// 宿主在探测路径上的本机接口地址，供同一 NAT 后两台主机的
+    /// Local 段使用。上限 8 条。
+    pub local: Vec<Ipv4Addr>,
 }
 
 pub struct V4Nat {
@@ -95,6 +98,9 @@ pub struct V4Nat {
     /// 支持发现的服务器运行。没有探测服务器通告 OTHER-ADDRESS 时为
     /// `Unknown`。
     pub filtering: FilterClass,
+    /// 探测发往自身反射地址的数据报是否环回（RFC 4787 §6）；它同时
+    /// 证明映射是端点无关的：按目的地分配的映射过不了这个自环。
+    pub hairpin: bool,
 }
 
 pub struct V6Nat {

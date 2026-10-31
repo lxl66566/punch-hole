@@ -8,9 +8,9 @@ The probe measures filtering with the RFC 5780 change-request tests, which only 
 
 The estimate is a model value. Real CGNAT port spaces vary, and the model reads the peer's observed span, so a wide real space can land the measured rate below the estimate.
 
-## Two ambiguous cone readings with strict filters
+## Two ambiguous cone readings on different NATs
 
-A cone reading from a single answered server IP can be an address-dependent mapping seen through one mapping, so a pair of such readings routes to SymProbe, whose reply-side spray writes the peer's observed ports. When the true shape is two address-dependent mappings and the peer filters port-strict or address-strict, the shooter's pulses die on the peer's filter and the spray cannot name the peer's fresh punch ports. The probe's own filtering tests do not lift the ambiguity: they measure the filter axis, not the mapping axis a second server IP would settle. A host that serves single-address server lists behind such NATs plans a relay or a second discovery server.
+A cone reading from a single answered server IP can be an address-dependent mapping seen through one mapping, so a pair of such readings routes to SymProbe, whose reply-side spray writes the peer's observed ports. When the true shape is two address-dependent mappings on different NATs and the peer filters port-strict or address-strict, the shooter's pulses die on the peer's filter and the spray cannot name the peer's fresh punch ports. The hairpin self-test lifts this ambiguity only for hosts that share one NAT — a looped self-request proves one endpoint-independent mapping per socket — and the LAN underneath a shared NAT carries its own Local stage. Two single-IP cone readings on different NATs with strict filters keep the ambiguity: a host that serves single-address server lists behind such NATs plans a relay or a second discovery server.
 
 ## One attempt per session
 

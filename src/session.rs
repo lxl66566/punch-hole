@@ -471,6 +471,7 @@ fn clamp_nat_info(mut nat: NatInfo) -> NatInfo {
     if let Some(v6) = &mut nat.v6 {
         v6.addrs.truncate(crate::msg::MAX_V6_ADDRS);
     }
+    nat.local.truncate(crate::msg::MAX_LOCAL_ADDRS);
     nat
 }
 
@@ -522,6 +523,7 @@ mod tests {
                 alloc_seq: vec![40001; crate::msg::MAX_ALLOC_SEQ * 2],
                 distinct_probe_ips: 4,
                 filtering: FilterClass::Unknown,
+                hairpin: true,
             }),
             v6: Some(V6Nat {
                 addrs: vec![
@@ -529,6 +531,7 @@ mod tests {
                     crate::msg::MAX_V6_ADDRS * 2
                 ],
             }),
+            local: vec![Ipv4Addr::new(192, 168, 1, 10); crate::msg::MAX_LOCAL_ADDRS * 2],
         };
         let clamped = clamp_nat_info(nat);
         let v4 = clamped.v4.expect("v4 survives the clamp");
@@ -577,8 +580,10 @@ mod tests {
                 alloc_seq: vec![40000; 4],
                 distinct_probe_ips: 2,
                 filtering: FilterClass::Unknown,
+                hairpin: true,
             }),
             v6: None,
+            local: Vec::new(),
         }
     }
 

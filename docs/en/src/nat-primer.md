@@ -80,6 +80,8 @@ Filtering has the final word. When both symmetric NATs filter on address and por
 
 One asymmetric rescue remains: when a hard symmetric NAT faces a cone, the cone side writes first and the symmetric side's mapping then admits the reply. The strategies chapter shows how. A pair of port-strict symmetric NATs instead needs a relay, which the host provides.
 
+One shape escapes the NAT question entirely: two hosts behind the **same** NAT. A datagram aimed at the NAT's own external address can loop back inside it (hairpinning), and the LAN underneath it may deliver a datagram to a local address with no NAT involvement at all. punch-hole measures both: the probe sends a request to its own reflexive address and waits for it to come back, and the `Hello` carries the host's local addresses beside the reflexive one, so the pair can take the LAN when the loopback is broken.
+
 ## Glossary
 
 | term | meaning |
