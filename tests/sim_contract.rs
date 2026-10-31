@@ -13,8 +13,8 @@ use std::{
 use common::config;
 use nat_lab::sim::{NatSpec, Net};
 use punch_hole::{
-    AbortReason, PunchConfig, Puncher,
-    error::{Phase, PunchError},
+    AbortReason, PunchConfig, Puncher, SessionEvent,
+    error::{Phase, PunchError, PunchFailure},
     msg::{DataPacket, Frame, Offer, SigFrame, decode_sig, encode_packet, encode_sig},
     socket::{UdpFactory, UdpIo},
 };
@@ -32,7 +32,11 @@ async fn bridge_closed_by_host_fails_fast() {
     let err = common::run_initiator(host, config(&stun), lib_end)
         .await
         .unwrap_err();
-    assert!(matches!(err, PunchError::SignalingClosed), "got {err:?}");
+    assert!(
+        matches!(err.error, PunchError::SignalingClosed),
+        "got {:?}",
+        err.error
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -87,8 +91,26 @@ async fn both_sides_initiator_abort_with_role_conflict() {
     let b = tokio::spawn(common::run_initiator(b, config(&stun), lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
 
-    assert!(matches!(ra, Err(PunchError::PeerAborted(_))), "got {ra:?}");
-    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
+    assert!(
+        matches!(
+            ra,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {ra:?}"
+    );
+    assert!(
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {rb:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -110,11 +132,23 @@ async fn version_mismatch_fails_both_sides() {
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
 
     assert!(
-        matches!(ra, Err(PunchError::VersionMismatch { .. })),
+        matches!(
+            ra,
+            Err(PunchFailure {
+                error: PunchError::VersionMismatch { .. },
+                ..
+            })
+        ),
         "got {ra:?}"
     );
     assert!(
-        matches!(rb, Err(PunchError::VersionMismatch { .. })),
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::VersionMismatch { .. },
+                ..
+            })
+        ),
         "got {rb:?}"
     );
 }
@@ -202,8 +236,11 @@ async fn negotiate_deadline_is_not_the_overall_wall() {
         assert!(
             matches!(
                 r,
-                Err(PunchError::Timeout {
-                    phase: Phase::Negotiate
+                Err(PunchFailure {
+                    error: PunchError::Timeout {
+                        phase: Phase::Negotiate
+                    },
+                    ..
                 })
             ),
             "got {r:?}"
@@ -268,7 +305,13 @@ async fn oversized_offer_start_delay_aborts() {
 
     for r in [ra, rb] {
         assert!(
-            matches!(r, Err(PunchError::PeerAborted(AbortReason::Internal))),
+            matches!(
+                r,
+                Err(PunchFailure {
+                    error: PunchError::PeerAborted(AbortReason::Internal),
+                    ..
+                })
+            ),
             "got {r:?}"
         );
     }
@@ -599,4 +642,84 @@ async fn confirmed_lost_with_traffic_seen_still_succeeds() {
     let pa = ra.expect("initiator crowns after grace");
     let pb = rb.expect("responder crowns after grace");
     common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// A subscribed initiator hears each phase complete in order, and nothing
+/// past Negotiate: success speaks through the returned report.
+#[tokio::test(start_paused = true)]
+async fn progress_events_track_the_phases() {
+    let (_net, stun, a, b) = common::cone_net("progress_events");
+    let cfg_b = config(&stun);
+    let (events, mut progress) = tokio::sync::mpsc::channel(8);
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    punch_hole::signaling::connect(ha, hb);
+    let a = tokio::spawn(async move {
+        Puncher::with_factory(config(&stun), a)
+            .expect("config valid")
+            .with_events(events)
+            .with_signaling(la)
+            .initiator()
+            .await
+    });
+    let b = tokio::spawn(common::run_responder(b, cfg_b, lb));
+    let pa = a.await.unwrap().expect("events pair punches");
+    b.await.unwrap().expect("events pair punches");
+
+    let SessionEvent::Probe(local) = progress.recv().await.expect("probe event") else {
+        panic!("the first event is the local classification");
+    };
+    assert_eq!(local.v4_class(), pa.report.local_class);
+    let SessionEvent::Exchange(peer) = progress.recv().await.expect("exchange event") else {
+        panic!("the second event is the peer classification");
+    };
+    assert_eq!(peer.v4_class(), pa.report.peer_class);
+    let SessionEvent::Negotiate(plan) = progress.recv().await.expect("negotiate event") else {
+        panic!("the third event is the settled plan");
+    };
+    assert_eq!(plan.strategy, pa.report.strategy);
+    assert_eq!(plan.initiator_sockets, 1);
+    assert_eq!(plan.responder_sockets, 1);
+    assert!(
+        progress.try_recv().is_err(),
+        "no event past Negotiate on success"
+    );
+}
+
+/// Events are best-effort: a channel nobody drains, and a channel whose
+/// receiver is gone, both leave the session itself untouched.
+#[tokio::test(start_paused = true)]
+async fn ignored_events_channel_does_not_stall_the_session() {
+    let (_net, stun, a, b) = common::cone_net("ignored_events");
+    let cfg_b = config(&stun);
+    // Capacity one: the Probe event fills the channel, every later emit
+    // drops, and the receiver is never read.
+    let (events, _never_drained) = tokio::sync::mpsc::channel(1);
+    let (dropped_events, dropped_rx) = tokio::sync::mpsc::channel(8);
+    drop(dropped_rx);
+    let (ha, la) = punch_hole::signaling::bridge(64);
+    let (hb, lb) = punch_hole::signaling::bridge(64);
+    punch_hole::signaling::connect(ha, hb);
+    let a = tokio::spawn(async move {
+        Puncher::with_factory(config(&stun), a)
+            .expect("config valid")
+            .with_events(events)
+            .with_signaling(la)
+            .initiator()
+            .await
+    });
+    let b = tokio::spawn(async move {
+        Puncher::with_factory(cfg_b, b)
+            .expect("config valid")
+            .with_events(dropped_events)
+            .with_signaling(lb)
+            .responder()
+            .await
+    });
+    a.await
+        .unwrap()
+        .expect("a full channel does not stall the session");
+    b.await
+        .unwrap()
+        .expect("a closed channel does not stall the session");
 }

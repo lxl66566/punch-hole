@@ -8,7 +8,10 @@ mod common;
 
 use common::config;
 use nat_lab::sim::{NatSpec, Net};
-use punch_hole::{NatClass, PunchConfig, StrategyId, error::PunchError};
+use punch_hole::{
+    NatClass, PunchConfig, StrategyId,
+    error::{PunchError, PunchFailure},
+};
 
 #[tokio::test(start_paused = true)]
 async fn cone_cone_success() {
@@ -344,10 +347,25 @@ async fn birthday_starved_goes_unpunchable() {
     let forwarded_before = net.forwarded();
     let (ra, rb) = common::punch_pair(a, cfg_a, b, cfg_b).await;
     assert!(
-        matches!(ra, Err(PunchError::Unpunchable { .. })),
+        matches!(
+            ra,
+            Err(PunchFailure {
+                error: PunchError::Unpunchable { .. },
+                ..
+            })
+        ),
         "got {ra:?}"
     );
-    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
+    assert!(
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {rb:?}"
+    );
 
     // The decision happened in Negotiate: only the probe traffic crossed.
     let spent = net.forwarded() - forwarded_before;
@@ -421,10 +439,25 @@ async fn sym_probe_starved_goes_unpunchable() {
     let forwarded_before = net.forwarded();
     let (ra, rb) = common::punch_pair(a, cfg, b, cfg_b).await;
     assert!(
-        matches!(ra, Err(PunchError::Unpunchable { .. })),
+        matches!(
+            ra,
+            Err(PunchFailure {
+                error: PunchError::Unpunchable { .. },
+                ..
+            })
+        ),
         "got {ra:?}"
     );
-    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
+    assert!(
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {rb:?}"
+    );
     let spent = net.forwarded() - forwarded_before;
     assert!(spent < 60, "data plane sent {spent} packets");
 }

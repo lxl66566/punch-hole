@@ -14,9 +14,9 @@ punch-hole = "0.1"
 ```rust,no_run
 use std::sync::Arc;
 
-use punch_hole::{PunchConfig, PunchError, Puncher};
+use punch_hole::{PunchConfig, PunchFailure, Puncher};
 
-async fn run_initiator_side() -> Result<(), PunchError> {
+async fn run_initiator_side() -> Result<(), PunchFailure> {
     let puncher = Puncher::new(PunchConfig::default())?;
 
     // One bridge per attempt. The host pumps host_end against its own
@@ -69,6 +69,21 @@ pub struct Punched<S = tokio::net::UdpSocket> {
 ```
 
 The socket stays unconnected, so the host chooses its own receive pattern. `peer_addr` is the confirmed data-plane address of the peer. The report carries both NAT classes, the local reflexive addresses, the STUN server the engine's refresh queries used, the port-space estimate for each symmetric side, the strategy, the success estimate for burst strategies, packet counts, and the wall time of each phase, which covers logging, telemetry, and relay decisions.
+
+## Failures and progress
+
+A failed session returns `PunchFailure` instead of a bare error:
+
+```rust
+pub struct PunchFailure {
+    pub error: PunchError,
+    pub diagnostics: SessionDiagnostics,
+}
+```
+
+`error` names the phase that failed; match on it as before. `diagnostics` carries what the session had learned by then: the local and peer `NatInfo` once collected, the settled `StrategySummary`, the attempt nonce, and the wall time of each completed phase. Each field appears as its phase completes, so the populated set alone names the phase the failure belongs to. Errors from before the session, such as `Puncher::new` rejecting a config, convert with empty diagnostics.
+
+Progress is observable without polling. `Puncher::with_events(sender)` feeds one `SessionEvent` per completed stage, Probe, Exchange, Negotiate in that order, into an `mpsc` channel. Emission is best-effort: a full or closed channel loses the event and never stalls the session, so no dedicated drain task is required.
 
 ## Host responsibilities
 

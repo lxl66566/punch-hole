@@ -23,14 +23,14 @@
 src/
 ├── lib.rs         公开 API 与 crate 文档
 ├── config.rs      PunchConfig
-├── error.rs       PunchError 与 Phase
-├── report.rs      PunchReport 与分阶段统计
+├── error.rs       PunchError、PunchFailure 与 Phase
+├── report.rs      PunchReport、SessionDiagnostics 与分阶段统计
 ├── signaling.rs   信令桥（HostEnd / LibEnd）与会话帧 IO
 ├── msg/           信令帧与数据包及其编解码
 ├── nat/           探测、分类、端口预测
 ├── strategy/      选择、定尺寸、五个策略、引擎
 ├── socket/        UdpIo 与 UdpFactory、SocketPool、限速、平台选项
-├── session.rs     Puncher、PunchSession、阶段状态机
+├── session.rs     Puncher、PunchSession、SessionEvent、阶段状态机
 ├── keepalive.rs   交付后的可选心跳
 └── compat.rs      nat-lab 引擎的接缝实现，位于 `test-util` 特性之后
 ```
@@ -64,6 +64,8 @@ Probe -> Exchange -> Negotiate -> Punch -> Confirm -> Handover -> Done
 
 整场会话跑在 `overall_deadline` 之下，每个阶段的截止时间都在它之内。
 
+阶段失败时返回 `PunchFailure`：阶段级的 `PunchError` 加上会话到此为止收集到的 `SessionDiagnostics`，在会话边界一次组装。`Puncher::with_events` 把每个完成的阶段以 `SessionEvent` 的形式送到一条可选通道上；发送尽力而为，绝不阻塞会话。
+
 ## 引擎
 
 引擎是单个任务，吃三路输入：套接字池接收事件、信令帧、50 毫秒一拍的 tick。打洞期间发生的一切都在对这三路输入的 `select!` 里。
@@ -95,4 +97,4 @@ Probe -> Exchange -> Negotiate -> Punch -> Confirm -> Handover -> Done
 
 ## 交付后的心跳
 
-`keepalive::spawn_io` 每十秒发一个小心跳，宿主空闲时保住 NAT 映射，`Arc` 共享的 tokio 胜出套接字经 `UdpIo` 实现流入。返回的 guard 在 drop 时中止任务；任务持有传入的套接字值，宿主若把仅有的引用移进来，随 guard 一起关闭。心跳发送失败会结束任务，`KeepaliveGuard::is_alive` 能查到，映射的死亡可观察而非无声。心跳载荷带尝试 nonce，宿主要丢弃首字节是数据面魔数、长度小于协议上限的数据报。
+`keepalive::spawn_io` 每十秒发一个小心跳，宿主空闲时保住 NAT 映射，`Arc` 共享的 tokio 胜出套接字经 `UdpIo` 实现流入。返回的 guard 在 drop 时中止任务；任务持有传入的套接字值，宿主若把仅有的引用移进来，随 guard 一起关闭。心跳发送失败会结束任务，`KeepaliveGuard::is_alive` 能查到，映射的死亡可观察而非无声。心跳载荷带尝试 nonce，宿主用 `msg::is_protocol_packet` 丢弃协议形状的数据报，它同时覆盖心跳与迟到的握手重传。

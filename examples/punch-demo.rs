@@ -30,7 +30,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use punch_hole::{PunchConfig, Puncher};
+use punch_hole::{NatInfo, PunchConfig, Puncher};
 use tokio::{net::UdpSocket, time::timeout};
 
 const USAGE: &str = "usage:
@@ -231,10 +231,24 @@ async fn punch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     pump(Arc::new(sock), host_end);
 
     let session = Puncher::new(cfg)?.with_signaling(lib_end);
-    let punched = if a.role == "initiator" {
-        session.initiator().await?
+    let result = if a.role == "initiator" {
+        session.initiator().await
     } else {
-        session.responder().await?
+        session.responder().await
+    };
+    let punched = match result {
+        Ok(punched) => punched,
+        Err(failure) => {
+            let d = &failure.diagnostics;
+            println!("punch failed : {failure}");
+            println!(
+                "evidence    : local {:?} peer {:?} plan {:?}",
+                d.local.as_ref().map(NatInfo::v4_class),
+                d.peer.as_ref().map(NatInfo::v4_class),
+                d.selection
+            );
+            return Err(failure.into());
+        },
     };
 
     let r = &punched.report;

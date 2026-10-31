@@ -6,7 +6,9 @@ mod common;
 
 use common::config;
 use nat_lab::sim::{NatSpec, Net};
-use punch_hole::error::PunchError;
+use punch_hole::error::{PunchError, PunchFailure};
+
+type SimResult = Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchFailure>;
 
 #[tokio::test(start_paused = true)]
 async fn budget_exhaustion_releases_sockets() {
@@ -18,9 +20,29 @@ async fn budget_exhaustion_releases_sockets() {
     let b = net.host(NatSpec::sequential(2));
 
     let (ra, rb) = common::punch_pair(a, cfg, b, config(&stun)).await;
-    assert!(matches!(ra, Err(PunchError::BudgetExhausted)), "got {ra:?}");
+    let failure = ra.expect_err("budget runs out");
+    assert!(
+        matches!(failure.error, PunchError::BudgetExhausted),
+        "got {:?}",
+        failure.error
+    );
+    // The engine failed after every earlier phase completed, so the
+    // diagnostics carry both classifications and the agreed plan.
+    let d = &failure.diagnostics;
+    assert!(d.local.is_some() && d.peer.is_some());
+    assert!(d.selection.is_some() && d.nonce.is_some());
+    assert!(d.phase_ms.total_ms > 0);
     // The initiator told the peer, so the responder fails fast too.
-    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
+    assert!(
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {rb:?}"
+    );
 
     net.wait_mappings_drained().await;
     assert_eq!(net.mapping_count(), 0, "both pools released their sockets");
@@ -42,10 +64,25 @@ async fn conntrack_bound_stops_the_burst() {
 
     let (ra, rb) = common::punch_pair(a, cfg, b, config(&stun)).await;
     assert!(
-        matches!(ra, Err(PunchError::ConntrackExhausted)),
+        matches!(
+            ra,
+            Err(PunchFailure {
+                error: PunchError::ConntrackExhausted,
+                ..
+            })
+        ),
         "got {ra:?}"
     );
-    assert!(matches!(rb, Err(PunchError::PeerAborted(_))), "got {rb:?}");
+    assert!(
+        matches!(
+            rb,
+            Err(PunchFailure {
+                error: PunchError::PeerAborted(_),
+                ..
+            })
+        ),
+        "got {rb:?}"
+    );
     net.wait_mappings_drained().await;
     assert_eq!(net.mapping_count(), 0);
 }
@@ -107,10 +144,13 @@ async fn blackholed_signaling_times_out_and_releases() {
     // Without PortUpdate no sweep ever fires, so both sides end on their own
     // deadline. Whoever times out first closes its bridge, and the other
     // then sees SignalingClosed instead of its own timeout.
-    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &SimResult| {
         matches!(
             r,
-            Err(PunchError::Timeout { .. } | PunchError::SignalingClosed)
+            Err(PunchFailure {
+                error: PunchError::Timeout { .. } | PunchError::SignalingClosed,
+                ..
+            })
         )
     };
     assert!(bounded(&ra), "got {ra:?}");
@@ -135,12 +175,15 @@ async fn overall_deadline_bounds_the_engine() {
     let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
     let b = tokio::spawn(common::run_responder(b, cfg, lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &SimResult| {
         matches!(
             r,
-            Err(PunchError::Timeout { .. }
-                | PunchError::SignalingClosed
-                | PunchError::PeerAborted(_))
+            Err(PunchFailure {
+                error: PunchError::Timeout { .. }
+                    | PunchError::SignalingClosed
+                    | PunchError::PeerAborted(_),
+                ..
+            })
         )
     };
     assert!(bounded(&ra), "got {ra:?}");
@@ -213,12 +256,15 @@ async fn stuck_host_channel_bounds_the_engine() {
         .await
         .expect("responder session ends")
         .unwrap();
-    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &SimResult| {
         matches!(
             r,
-            Err(PunchError::Timeout { .. }
-                | PunchError::SignalingClosed
-                | PunchError::PeerAborted(_))
+            Err(PunchFailure {
+                error: PunchError::Timeout { .. }
+                    | PunchError::SignalingClosed
+                    | PunchError::PeerAborted(_),
+                ..
+            })
         )
     };
     assert!(bounded(&ra), "got {ra:?}");
@@ -262,10 +308,13 @@ async fn engine_start_never_sleeps_past_overall() {
     let a = tokio::spawn(common::run_initiator(a, cfg.clone(), la));
     let b = tokio::spawn(common::run_responder(b, cfg, lb));
     let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
-    let bounded = |r: &Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>| {
+    let bounded = |r: &SimResult| {
         matches!(
             r,
-            Err(PunchError::Timeout { .. } | PunchError::SignalingClosed)
+            Err(PunchFailure {
+                error: PunchError::Timeout { .. } | PunchError::SignalingClosed,
+                ..
+            })
         )
     };
     assert!(bounded(&ra), "got {ra:?}");

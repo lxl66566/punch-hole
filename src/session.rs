@@ -2,14 +2,14 @@
 
 use std::{future::Future, net::SocketAddr, time::Duration};
 
-use tokio::time::Instant;
+use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
     config::PunchConfig,
-    error::{Phase, PunchError},
+    error::{Phase, PunchError, PunchFailure},
     msg::{AbortReason, Frame, Nonce, Offer, new_nonce},
     nat::{NatClass, NatInfo},
-    report::{PhaseDurations, PunchReport, Role},
+    report::{PhaseDurations, PunchReport, Role, SessionDiagnostics, StrategySummary},
     signaling::{LibEnd, SigIo},
     socket::{TokioFactory, UdpFactory, UdpIo},
     strategy::{self, Engine, Selection},
@@ -20,6 +20,7 @@ pub struct Puncher<F: UdpFactory = TokioFactory> {
     config: PunchConfig,
     cached: Option<NatInfo>,
     factory: F,
+    events: Option<mpsc::Sender<SessionEvent>>,
 }
 
 impl Puncher<TokioFactory> {
@@ -37,6 +38,7 @@ impl<F: UdpFactory> Puncher<F> {
             config,
             cached: None,
             factory,
+            events: None,
         })
     }
 
@@ -44,6 +46,17 @@ impl<F: UdpFactory> Puncher<F> {
     #[must_use]
     pub fn with_cached_nat(mut self, nat: NatInfo) -> Self {
         self.cached = Some(clamp_nat_info(nat));
+        self
+    }
+
+    /// Subscribes a channel to the session's progress events.
+    ///
+    /// Emission is best-effort: a full or closed channel loses the event
+    /// and never stalls the session, which matches how the session treats
+    /// signaling frames on a channel the host stopped draining.
+    #[must_use]
+    pub fn with_events(mut self, events: mpsc::Sender<SessionEvent>) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -55,6 +68,7 @@ impl<F: UdpFactory> Puncher<F> {
             cached: self.cached,
             factory: self.factory,
             sig: SigIo::new(end),
+            events: self.events,
         }
     }
 }
@@ -65,6 +79,24 @@ pub struct PunchSession<F: UdpFactory> {
     cached: Option<NatInfo>,
     factory: F,
     sig: SigIo,
+    events: Option<mpsc::Sender<SessionEvent>>,
+}
+
+/// Progress updates from a running session.
+///
+/// One event per completed stage, in session order. Success needs no
+/// event, because the returned [`Punched`] carries the full report;
+/// failure needs none either, because the returned
+/// [`PunchFailure`] carries the same evidence plus its own error.
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    /// The local classification settled, from Probe or from the cache a
+    /// cached session skipped Probe with.
+    Probe(NatInfo),
+    /// Exchange completed with the peer's classification.
+    Exchange(NatInfo),
+    /// Negotiate settled the plan both sides will run.
+    Negotiate(StrategySummary),
 }
 
 /// The result of a successful session.
@@ -96,16 +128,45 @@ impl<F: UdpFactory> PunchSession<F> {
     const MAX_START_DELAY_MS: u64 = 10_000;
 
     /// Drives the session as the Initiator.
-    pub async fn initiator(self) -> Result<Punched<F::Socket>, PunchError> {
+    pub async fn initiator(self) -> Result<Punched<F::Socket>, PunchFailure> {
         self.run(Role::Initiator).await
     }
 
     /// Drives the session as the Responder.
-    pub async fn responder(self) -> Result<Punched<F::Socket>, PunchError> {
+    pub async fn responder(self) -> Result<Punched<F::Socket>, PunchFailure> {
         self.run(Role::Responder).await
     }
 
-    async fn run(mut self, role: Role) -> Result<Punched<F::Socket>, PunchError> {
+    /// Runs the session and assembles the failure boundary: the phase
+    /// error travels with whatever the failed session had learned.
+    async fn run(self, role: Role) -> Result<Punched<F::Socket>, PunchFailure> {
+        let start = Instant::now();
+        let mut diag = SessionDiagnostics::default();
+        match self.drive(role, &mut diag).await {
+            Ok(punched) => Ok(punched),
+            Err(error) => {
+                diag.phase_ms.total_ms = elapsed_ms(start);
+                Err(PunchFailure {
+                    error,
+                    diagnostics: diag,
+                })
+            },
+        }
+    }
+
+    /// Emits one progress event best-effort: a full or closed channel
+    /// loses the event instead of stalling the session.
+    fn emit(&self, event: SessionEvent) {
+        if let Some(events) = &self.events {
+            let _ = events.try_send(event);
+        }
+    }
+
+    async fn drive(
+        mut self,
+        role: Role,
+        diag: &mut SessionDiagnostics,
+    ) -> Result<Punched<F::Socket>, PunchError> {
         let total_start = Instant::now();
         let overall = total_start + self.config.overall_deadline;
 
@@ -116,6 +177,9 @@ impl<F: UdpFactory> PunchSession<F> {
             None => crate::nat::probe::probe(&self.config, &self.factory, overall).await?,
         };
         let probe_ms = elapsed_ms(t);
+        diag.local = Some(mine.clone());
+        self.emit(SessionEvent::Probe(mine.clone()));
+        diag.phase_ms.probe_ms = probe_ms;
 
         // Exchange: both sides publish their evidence. The window opens when
         // the phase starts, so a slow Probe leaves the full budget here.
@@ -125,6 +189,9 @@ impl<F: UdpFactory> PunchSession<F> {
             .exchange(role, &mine, exchange_deadline.min(overall))
             .await?;
         let exchange_ms = elapsed_ms(t);
+        diag.peer = Some(peer.clone());
+        self.emit(SessionEvent::Exchange(peer.clone()));
+        diag.phase_ms.exchange_ms = exchange_ms;
 
         // Negotiate, then align both engines on the shared Accept event.
         // The window opens at session start and stays inside the overall wall.
@@ -141,6 +208,16 @@ impl<F: UdpFactory> PunchSession<F> {
             },
         };
         let negotiate_ms = elapsed_ms(t);
+        let summary = StrategySummary {
+            strategy: sel.strategy,
+            initiator_sockets: sel.initiator_sockets,
+            responder_sockets: sel.responder_sockets,
+            estimate: sel.estimate,
+        };
+        diag.nonce = Some(nonce);
+        diag.selection = Some(summary);
+        self.emit(SessionEvent::Negotiate(summary));
+        diag.phase_ms.negotiate_ms = negotiate_ms;
 
         // A peer delay or a large measured RTT can push the shared start
         // past the session wall; the clamp keeps the sleep inside it, and
@@ -558,16 +635,25 @@ mod tests {
         // and the resend inside the retry arm blocks, where the deadline
         // branch of the select cannot reach it.
         let stuck = tokio::time::timeout(Duration::from_secs(120), session.initiator());
-        let err = stuck
+        let failure = stuck
             .await
             .expect("session returns")
             .expect_err("exchange cannot complete");
         assert!(
-            matches!(err, PunchError::Timeout {
+            matches!(failure.error, PunchError::Timeout {
                 phase: Phase::Exchange
             }),
-            "got {err:?}"
+            "got {:?}",
+            failure.error
         );
+        // The failure carries what Exchange had learned: the local
+        // classification from the cache, and nothing from the peer.
+        let d = &failure.diagnostics;
+        assert!(d.local.is_some(), "the cached classification survives");
+        assert!(d.peer.is_none(), "the peer never answered");
+        assert!(d.selection.is_none() && d.nonce.is_none());
+        assert_eq!(d.phase_ms.probe_ms, 0, "a cached session skips Probe");
+        assert!(d.phase_ms.total_ms >= 200, "total covers the attempt");
         drop(host);
     }
 
@@ -626,9 +712,18 @@ mod tests {
                 .expect("task joins")
                 .expect_err("zero-socket offer aborts");
             assert!(
-                matches!(err, PunchError::PeerAborted(super::AbortReason::Internal)),
-                "got {err:?}"
+                matches!(
+                    err.error,
+                    PunchError::PeerAborted(super::AbortReason::Internal)
+                ),
+                "got {:?}",
+                err.error
             );
+            // Both classifications crossed before the Offer aborted the
+            // attempt, and the selection never settled.
+            assert!(err.diagnostics.local.is_some());
+            assert!(err.diagnostics.peer.is_some());
+            assert!(err.diagnostics.selection.is_none());
             // The host channel saw our own Hello, then the Abort.
             let _ = host.to_peer.recv().await.expect("hello drains");
             let abort = host.to_peer.recv().await.expect("abort drains");

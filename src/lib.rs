@@ -33,9 +33,9 @@
 //! ```no_run
 //! use std::sync::Arc;
 //!
-//! use punch_hole::{PunchConfig, PunchError, Puncher};
+//! use punch_hole::{PunchConfig, PunchFailure, Puncher};
 //!
-//! async fn run_initiator_side() -> Result<(), PunchError> {
+//! async fn run_initiator_side() -> Result<(), PunchFailure> {
 //!     let puncher = Puncher::new(PunchConfig::default())?;
 //!
 //!     let (host_end, lib_end) = punch_hole::signaling::bridge(64);
@@ -44,6 +44,8 @@
 //!     // host_end.to_peer frames to the peer, and push frames that arrive
 //!     // from the peer into host_end.from_peer.
 //!
+//!     // A failed session returns the phase error plus the evidence it had
+//!     // collected; errors from before the session convert with none.
 //!     let punched = puncher.with_signaling(lib_end).initiator().await?;
 //!
 //!     // The business layer owns the winner from here. Tokio sockets have
@@ -62,6 +64,10 @@
 //! ```
 //!
 //! The Responder side runs the same code with `.responder()`.
+//!
+//! Progress events over an optional channel cover the same session's
+//! Probe, Exchange, and Negotiate completions; see
+//! [`Puncher::with_events`].
 
 // Port and packet arithmetic works on small fixed-width integers by design,
 // and most public constructors return fresh values, so the corresponding
@@ -73,6 +79,10 @@
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
+// The failure result carries the full diagnostics inline on a path that
+// runs at most once per session, so its size costs nothing real and boxing
+// it would tax every matcher.
+#![allow(clippy::result_large_err)]
 
 pub mod config;
 pub mod error;
@@ -90,10 +100,10 @@ mod session;
 mod strategy;
 
 pub use config::PunchConfig;
-pub use error::{Phase, PunchError};
+pub use error::{Phase, PunchError, PunchFailure};
 pub use msg::{AbortReason, StrategyId};
 pub use nat::{FilterClass, NatClass, NatInfo, PortPredictor};
-pub use report::{PhaseDurations, PunchReport, Role};
-pub use session::{PunchSession, Punched, Puncher};
+pub use report::{PhaseDurations, PunchReport, Role, SessionDiagnostics, StrategySummary};
+pub use session::{PunchSession, Punched, Puncher, SessionEvent};
 pub use signaling::{HostEnd, LibEnd, bridge};
 pub use socket::{Family, TokioFactory, UdpFactory, UdpIo};

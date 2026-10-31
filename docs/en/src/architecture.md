@@ -23,14 +23,14 @@ The driver layer owns sockets, timers, and tasks. It feeds observations into the
 src/
 ├── lib.rs         public API and crate docs
 ├── config.rs      PunchConfig
-├── error.rs       PunchError and Phase
-├── report.rs      PunchReport and per-phase statistics
+├── error.rs       PunchError, PunchFailure, and Phase
+├── report.rs      PunchReport, SessionDiagnostics, and per-phase statistics
 ├── signaling.rs   the bridge, HostEnd and LibEnd, session frame IO
 ├── msg/           signaling frames and data packets, with their codecs
 ├── nat/           probe, classification, port prediction
 ├── strategy/      selection, sizing, the five strategies, the engine
 ├── socket/        UdpIo and UdpFactory, SocketPool, rate limiting, platform options
-├── session.rs     Puncher, PunchSession, the phase state machine
+├── session.rs     Puncher, PunchSession, SessionEvent, the phase state machine
 ├── keepalive.rs   optional post-handover heartbeat
 └── compat.rs      seam impls for the nat-lab engines, behind `test-util`
 ```
@@ -64,6 +64,8 @@ Probe -> Exchange -> Negotiate -> Punch -> Confirm -> Handover -> Done
 
 The whole session runs under `overall_deadline`, and every phase deadline sits under it.
 
+A failed phase returns a `PunchFailure`: the phase-level `PunchError` plus the `SessionDiagnostics` the session had collected up to that point, assembled once at the session boundary. `Puncher::with_events` mirrors each completed phase as a `SessionEvent` on an optional channel; emission is best-effort and never blocks the session.
+
 ## The engine
 
 The engine is a single task fed by three streams: pool receive events, signaling frames, and a 50 millisecond tick. Everything the punch does happens in `select!` over those streams.
@@ -95,4 +97,4 @@ Every outbound packet passes the three guards described in [Resource control](re
 
 ## Post-handover keepalive
 
-`keepalive::spawn_io` sends a small heartbeat every ten seconds, which holds the NAT mapping open while the host idles; the `Arc`-shared tokio winner flows in through the `UdpIo` impl. The returned guard aborts the task on drop, and the task owns the socket value it received, so a host that moved its only reference in closes the socket with the guard. A heartbeat send that fails ends the task, and `KeepaliveGuard::is_alive` reports it, so a dying mapping is observable instead of silent. The heartbeat carries the attempt nonce, and hosts discard any datagram whose first byte is the data-plane magic and whose length stays under the protocol limit.
+`keepalive::spawn_io` sends a small heartbeat every ten seconds, which holds the NAT mapping open while the host idles; the `Arc`-shared tokio winner flows in through the `UdpIo` impl. The returned guard aborts the task on drop, and the task owns the socket value it received, so a host that moved its only reference in closes the socket with the guard. A heartbeat send that fails ends the task, and `KeepaliveGuard::is_alive` reports it, so a dying mapping is observable instead of silent. The heartbeat carries the attempt nonce, and hosts discard protocol-shaped datagrams with `msg::is_protocol_packet`, which covers the beats as well as late handshake retransmissions.

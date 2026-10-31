@@ -4,7 +4,7 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::{
     msg::{Nonce, StrategyId},
-    nat::{FilterClass, NatClass},
+    nat::{FilterClass, NatClass, NatInfo},
 };
 
 /// Which side of an attempt a session drove.
@@ -69,4 +69,42 @@ pub struct PhaseDurations {
     pub punch_ms: u64,
     pub confirm_ms: u64,
     pub total_ms: u64,
+}
+
+/// The plan Negotiate settled on, as both roles know it.
+///
+/// The Responder rebuilds its estimate from the local view, so both sides
+/// report the same numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrategySummary {
+    /// The punching algorithm the Initiator picked.
+    pub strategy: StrategyId,
+    /// Sockets the Initiator opens.
+    pub initiator_sockets: u16,
+    /// Sockets the Responder opens.
+    pub responder_sockets: u16,
+    /// The success model's estimate, when the strategy carries one.
+    pub estimate: Option<f64>,
+}
+
+/// Evidence a session collected before it failed, for on-site triage.
+///
+/// Each field appears as its phase completes, so the set of populated
+/// fields names the phase the failure belongs to even before the error is
+/// read. A failure before Probe leaves everything empty.
+#[derive(Debug, Clone, Default)]
+pub struct SessionDiagnostics {
+    /// The local classification, present once Probe finished or a cached
+    /// classification took its place.
+    pub local: Option<NatInfo>,
+    /// The peer classification, present once Exchange delivered its Hello.
+    pub peer: Option<NatInfo>,
+    /// The plan Negotiate settled, present once both sides agreed.
+    pub selection: Option<StrategySummary>,
+    /// The attempt nonce, drawn by the Initiator in Negotiate.
+    pub nonce: Option<Nonce>,
+    /// Wall time each completed phase consumed. `total_ms` covers the
+    /// whole attempt; the punch and confirm fields stay zero, because a
+    /// failed engine run reports no timings.
+    pub phase_ms: PhaseDurations,
 }

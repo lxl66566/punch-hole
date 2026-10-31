@@ -14,9 +14,9 @@ punch-hole = "0.1"
 ```rust,no_run
 use std::sync::Arc;
 
-use punch_hole::{PunchConfig, PunchError, Puncher};
+use punch_hole::{PunchConfig, PunchFailure, Puncher};
 
-async fn run_initiator_side() -> Result<(), PunchError> {
+async fn run_initiator_side() -> Result<(), PunchFailure> {
     let puncher = Puncher::new(PunchConfig::default())?;
 
     // 每次尝试一座桥。宿主用自己的传输通道泵 host_end：
@@ -67,6 +67,21 @@ pub struct Punched<S = tokio::net::UdpSocket> {
 ```
 
 套接字保持未连接状态，收发模式由宿主决定。`peer_addr` 是确认过的对端数据面地址。报告里有双方 NAT 类别、本地反射地址、引擎刷新查询用的 STUN 服务器、每个对称侧的端口空间估算、所用策略、脉冲类策略的成功率估算、发包计数和各阶段耗时，日志、遥测和中继决策都从这里取材。
+
+## 失败与进度
+
+失败的会话返回 `PunchFailure`，而不是裸错误：
+
+```rust
+pub struct PunchFailure {
+    pub error: PunchError,
+    pub diagnostics: SessionDiagnostics,
+}
+```
+
+`error` 指明失败所在的阶段，匹配方式照旧。`diagnostics` 带着会话到此为止已经知道的事：收集到的本地与对端 `NatInfo`、谈定的 `StrategySummary`、尝试 nonce，以及每个已完成阶段的耗时。每个字段随对应阶段完成而出现，所以光看哪些字段有值就知道失败属于哪个阶段。会话开始之前的错误，比如 `Puncher::new` 拒绝配置，转换过来时诊断为空。
+
+进度不靠轮询。`Puncher::with_events(sender)` 把每个完成的阶段按 Probe、Exchange、Negotiate 的顺序各发一条 `SessionEvent` 到一条 `mpsc` 通道。发送是尽力而为：通道满或已关闭只会丢掉该事件，绝不拖住会话，所以不需要专门的任务去收。
 
 ## 宿主职责清单
 

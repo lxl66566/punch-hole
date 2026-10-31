@@ -14,7 +14,7 @@ use std::{
 use nat_lab::{LabHost, LabSocket, NatLab, StunServer, lab as natlab, sim::NatSpec};
 use punch_hole::{
     NatClass, PunchConfig, Punched, Puncher, StrategyId,
-    error::PunchError,
+    error::PunchFailure,
     msg::{DATA_MAGIC, MAX_DATA_PACKET},
     signaling,
     socket::UdpIo,
@@ -54,8 +54,8 @@ async fn try_punch_pair(
     host_b: LabHost,
     cfg_b: PunchConfig,
 ) -> (
-    Result<Punched<LabSocket>, PunchError>,
-    Result<Punched<LabSocket>, PunchError>,
+    Result<Punched<LabSocket>, PunchFailure>,
+    Result<Punched<LabSocket>, PunchFailure>,
 ) {
     let (ha, la) = signaling::bridge(64);
     let (hb, lb) = signaling::bridge(64);
@@ -109,8 +109,8 @@ async fn punch_pair_retried(
     tries: usize,
 ) -> (
     (
-        Result<Punched<LabSocket>, PunchError>,
-        Result<Punched<LabSocket>, PunchError>,
+        Result<Punched<LabSocket>, PunchFailure>,
+        Result<Punched<LabSocket>, PunchFailure>,
     ),
     NatLab,
     NatLab,

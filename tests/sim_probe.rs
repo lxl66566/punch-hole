@@ -13,7 +13,7 @@ use common::config;
 use nat_lab::sim::{NatSpec, Net};
 use punch_hole::{
     StrategyId,
-    error::PunchError,
+    error::{PunchError, PunchFailure},
     msg::decode_sig,
     nat::{NatClass, NatInfo, V4Nat},
 };
@@ -88,7 +88,7 @@ async fn stun_timeout_is_bounded() {
     let t = tokio::time::Instant::now();
     let err = common::run_initiator(host, cfg, lib).await.unwrap_err();
     assert!(
-        matches!(err, PunchError::Timeout {
+        matches!(err.error, PunchError::Timeout {
             phase: punch_hole::Phase::Probe
         }),
         "got {err:?}"
@@ -113,7 +113,7 @@ async fn probe_window_stays_under_overall_deadline() {
     let t = tokio::time::Instant::now();
     let err = common::run_initiator(host, cfg, lib).await.unwrap_err();
     assert!(
-        matches!(err, PunchError::Timeout {
+        matches!(err.error, PunchError::Timeout {
             phase: punch_hole::Phase::Probe
         }),
         "got {err:?}"
@@ -402,7 +402,7 @@ async fn probe_phase_ends_at_its_deadline() {
     let t = tokio::time::Instant::now();
     let err = common::run_initiator(host, cfg, lib).await.unwrap_err();
     assert!(
-        matches!(err, PunchError::Timeout {
+        matches!(err.error, PunchError::Timeout {
             phase: punch_hole::Phase::Probe
         }),
         "got {err:?}"
@@ -422,8 +422,8 @@ async fn drift_pair(
     drift: Vec<nat_lab::sim::Host>,
     allocations: usize,
 ) -> (
-    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>,
-    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchError>,
+    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchFailure>,
+    Result<punch_hole::Punched<nat_lab::sim::SimSocket>, PunchFailure>,
 ) {
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);

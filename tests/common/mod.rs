@@ -1,9 +1,12 @@
 //! Shared helpers for the simulator integration tests.
 
 #![allow(dead_code, clippy::field_reassign_with_default)]
+// The shared helpers mirror the library's session signatures, whose
+// diagnostics-carrying failure is large by design.
+#![allow(clippy::result_large_err)]
 
 use nat_lab::sim::{Host, Net, SimSocket, StunServer};
-use punch_hole::{PunchConfig, Punched, Puncher, error::PunchError};
+use punch_hole::{PunchConfig, Punched, Puncher, error::PunchFailure};
 
 pub fn config(stun: &StunServer) -> PunchConfig {
     let mut cfg = PunchConfig::default();
@@ -15,7 +18,7 @@ pub async fn run_initiator(
     host: Host,
     cfg: PunchConfig,
     sig: punch_hole::signaling::LibEnd,
-) -> Result<Punched<SimSocket>, PunchError> {
+) -> Result<Punched<SimSocket>, PunchFailure> {
     let session = Puncher::with_factory(cfg, host)
         .expect("config valid")
         .with_signaling(sig);
@@ -26,7 +29,7 @@ pub async fn run_responder(
     host: Host,
     cfg: PunchConfig,
     sig: punch_hole::signaling::LibEnd,
-) -> Result<Punched<SimSocket>, PunchError> {
+) -> Result<Punched<SimSocket>, PunchFailure> {
     let session = Puncher::with_factory(cfg, host)
         .expect("config valid")
         .with_signaling(sig);
@@ -40,8 +43,8 @@ pub async fn punch_pair(
     host_b: Host,
     cfg_b: PunchConfig,
 ) -> (
-    Result<Punched<SimSocket>, PunchError>,
-    Result<Punched<SimSocket>, PunchError>,
+    Result<Punched<SimSocket>, PunchFailure>,
+    Result<Punched<SimSocket>, PunchFailure>,
 ) {
     let (ha, la) = punch_hole::signaling::bridge(64);
     let (hb, lb) = punch_hole::signaling::bridge(64);
@@ -155,8 +158,8 @@ pub async fn punch_pair_retried(
     cfg: PunchConfig,
     tries: usize,
 ) -> (
-    Result<Punched<SimSocket>, PunchError>,
-    Result<Punched<SimSocket>, PunchError>,
+    Result<Punched<SimSocket>, PunchFailure>,
+    Result<Punched<SimSocket>, PunchFailure>,
 ) {
     let mut cfg = cfg;
     let mut last = None;
