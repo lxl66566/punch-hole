@@ -110,17 +110,24 @@ pub struct PunchFailure {
 
 ## 示例程序
 
-`examples/punch-demo.rs` 在真实套接字上跑完整会话，自带一个极简配对中继。开三个终端，其中两端放在不同网络里：
+`crates/punch-hole-demo` 构建出 `punch-demo` 二进制：在真实套接字上跑完整会话，自带一个极简配对中继。一个二进制覆盖全部三种角色，构建一次拷到每台机器即可：
+
+```sh
+cargo build --release -p punch-hole-demo
+# 产物在 target/release/punch-demo，Windows 下是 punch-demo.exe
+```
+
+开三个终端，其中两端放在不同网络里：
 
 ```sh
 # 终端 1，放在双方都能访问的机器上
-cargo run --example punch-demo -- relay 0.0.0.0:9000
+punch-demo relay 0.0.0.0:9000
 
 # 终端 2
-cargo run --example punch-demo -- punch --role initiator --relay <relay-host>:9000
+punch-demo client --relay <relay-host>:9000
 
 # 终端 3，在终端 2 启动后 30 秒内
-cargo run --example punch-demo -- punch --role responder --relay <relay-host>:9000
+punch-demo server --relay <relay-host>:9000
 ```
 
-每端打印自己的 NAT 类别、选中的策略和各阶段耗时，然后在打洞出来的套接字上交换一个业务数据报。示例中继不做认证，请留在可信网络里运行。
+client 以发起方身份打洞，server 以应答方身份打洞。每端随会话推进逐阶段打印：本端 NAT 类别、对端 NAT 类别、协商出的策略，路径打通后再打印各阶段耗时。随后两端在打洞出来的套接字上聊天：输入的每一行都是发给对端的一个数据报，`/quit` 或输入结束即关闭。示例中继不做认证，请留在可信网络里运行。

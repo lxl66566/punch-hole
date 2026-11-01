@@ -11,13 +11,12 @@ categories   = ["network-programming"]
 include      = [
   "/LICENSE-*",
   "/README.md",
-  "/examples/**",
   "/src/**",
   "/tests/**",
 ]
 
 [workspace]
-members = ["crates/nat-lab"]
+members = ["crates/nat-lab", "crates/punch-hole-demo"]
 
 [dependencies]
 bytes      = "1.12.1"
@@ -32,13 +31,6 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
-
-# If you are building bin target, uncomment this
-# [profile.release]
-# lto       = true
-# opt-level = "s"
-# panic     = "abort"
-# strip     = true
 
 [features]
 default   = []
@@ -62,3 +54,10 @@ unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 # The single FFI call in socket/sys.rs carries a scoped exemption.
 unsafe_code           = "deny"
 unused_qualifications = "warn"
+
+# The demo binary under crates/punch-hole-demo is the one release artifact.
+[profile.release]
+opt-level = "s"
+strip     = true
+lto       = true
+panic     = "abort"

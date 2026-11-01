@@ -112,17 +112,24 @@ The library covers one attempt. The checklist around it:
 
 ## The demo
 
-`examples/punch-demo.rs` runs a full session over real sockets, including its own minimal rendezvous relay. Three terminals, two of them on different networks:
+`crates/punch-hole-demo` builds the `punch-demo` binary: one full session over real sockets, including its own minimal rendezvous relay. One binary serves all three roles, so build it once and copy it to each machine:
+
+```sh
+cargo build --release -p punch-hole-demo
+# target/release/punch-demo, or punch-demo.exe on Windows
+```
+
+Three terminals, two of them on different networks:
 
 ```sh
 # terminal 1, on any host both sides can reach
-cargo run --example punch-demo -- relay 0.0.0.0:9000
+punch-demo relay 0.0.0.0:9000
 
 # terminal 2
-cargo run --example punch-demo -- punch --role initiator --relay <relay-host>:9000
+punch-demo client --relay <relay-host>:9000
 
 # terminal 3, within 30 seconds of terminal 2
-cargo run --example punch-demo -- punch --role responder --relay <relay-host>:9000
+punch-demo server --relay <relay-host>:9000
 ```
 
-Each side prints its NAT class, the chosen strategy, and the phase timings, then exchanges one business datagram over the punched socket. The demo relay authenticates nobody, so it stays on a trusted network.
+The client punches as the Initiator and the server as the Responder. Each side prints every stage as it completes, its own NAT class, the peer's, and the negotiated strategy, then the phase timings once the path is up. Both sides then chat over the punched socket: each line typed is one datagram to the peer, and `/quit` or end of input closes. The demo relay authenticates nobody, so it stays on a trusted network.

@@ -10,28 +10,27 @@ the peer and feeds peer frames back.
 
 ## Try it
 
-`examples/punch-demo.rs` runs one full session over real sockets. It carries
-its own minimal rendezvous, a `relay` subcommand that pairs the first two UDP
-addresses that register, so nothing else is needed beyond STUN.
+`crates/punch-hole-demo` builds the `punch-demo` binary, which runs one full session over real sockets. It carries its own minimal rendezvous, a `relay` subcommand that pairs the first two UDP addresses that register, so nothing else is needed beyond STUN. One binary serves all three roles, so build it once and copy it to each machine:
+
+```sh
+cargo build --release -p punch-hole-demo
+# target/release/punch-demo, or punch-demo.exe on Windows
+```
 
 Run three terminals, two of them on different networks for a real NAT path:
 
 ```sh
 # terminal 1, on any host both sides can reach
-cargo run --example punch-demo -- relay 0.0.0.0:9000
+punch-demo relay 0.0.0.0:9000
 
 # terminal 2
-cargo run --example punch-demo -- punch --role initiator --relay <relay-host>:9000
+punch-demo client --relay <relay-host>:9000
 
 # terminal 3, within 30 seconds of terminal 2
-cargo run --example punch-demo -- punch --role responder --relay <relay-host>:9000
+punch-demo server --relay <relay-host>:9000
 ```
 
-STUN defaults to four public servers, so the commands above need no other
-setup. Pass `--stun host:port,...` to use your own. Each side prints its NAT
-class, the chosen strategy, the phase timings, and then exchanges one business
-datagram over the punched socket. `--target <p>` sets the success rate the
-burst sizing aims for; the demo defaults to 0.9.
+STUN defaults to four public servers, so the commands above need no other setup. Pass `--stun host:port,...` to use your own. The client punches as the Initiator and the server as the Responder. Each side prints every stage as it completes, its own NAT class, the peer's, and the negotiated strategy, then the phase timings once the path is up. Both sides then chat over the punched socket: each line typed is one datagram to the peer, and `/quit` or end of input closes. `--target <p>` sets the success rate the burst sizing aims for; the demo defaults to 0.9.
 
 Two peers on one machine also work. They punch over the local IPv6 or
 loopback path.
