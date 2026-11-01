@@ -43,7 +43,7 @@ Determinism comes from two pieces. All randomness flows through one `StdRng` see
 
 ## The loopback NAT lab
 
-The lab in `nat_lab::lab` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process. A lab spawned behind an upstream draws no address of its own — its public address reads `0.0.0.0` as a label — and its per-mapping external sockets are uplink client sockets of the upstream lab, so the OS keeps the port allocation honest.
+The lab in `nat_lab::lab` is a userspace NAT forwarder over real OS sockets. Client sockets are plain loopback sockets, every outbound datagram crosses a gateway task that applies the mapping and filtering policy of a `NatSpec`, and each lab owns one dedicated address of the `127.0.0.0/8` space so labs never collide inside one process. Linux and Windows bind every address of that block; macOS binds only the addresses aliased onto `lo0`, so there the engines draw from `127.0.0.2-254` and need those aliases first: `for i in $(seq 2 254); do sudo ifconfig lo0 alias 127.0.0.$i up; done`. A lab spawned behind an upstream draws no address of its own — its public address reads `0.0.0.0` as a label — and its per-mapping external sockets are uplink client sockets of the upstream lab, so the OS keeps the port allocation honest.
 
 What the lab covers and the simulator cannot:
 

@@ -1,7 +1,11 @@
 //! Loopback NAT lab: one emulated NAT device over real OS sockets.
 //!
 //! A [`NatLab`] is a userspace NAT forwarder that lives on the 127.0.0.0/8
-//! loopback space. Client sockets are real OS sockets; every outbound
+//! loopback space. Linux and Windows bind every address of the block; macOS
+//! and the BSDs bind only the addresses aliased onto `lo0`, so there the
+//! engines live on 127.0.0.2-254 and expect those aliases:
+//! `for i in $(seq 2 254); do sudo ifconfig lo0 alias 127.0.0.$i up; done`.
+//! Client sockets are real OS sockets; every outbound
 //! datagram crosses a gateway task that applies the mapping and filtering
 //! policy of a [`NatSpec`] and leaves through a per-mapping public socket
 //! bound on the lab's dedicated loopback address. The code under test runs
@@ -24,7 +28,7 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -41,18 +45,58 @@ use crate::{
     stun::Grid,
 };
 
-/// Lab addresses drawn in this process: 127.hi.lo.1.
+/// Lab addresses drawn in this process.
 static LAB_IPS: StdMutex<Vec<Ipv4Addr>> = StdMutex::new(Vec::new());
-/// Responder addresses drawn in this process: 127.50.hi.lo.
+/// Responder addresses drawn in this process.
 static STUN_IPS: StdMutex<Vec<Ipv4Addr>> = StdMutex::new(Vec::new());
+
+/// How much of the 127.0.0.0/8 block binds on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopbackSpace {
+    /// Every address of the block binds, as on Linux and Windows.
+    Wide,
+    /// Only addresses aliased onto the loopback interface bind, as on macOS
+    /// and the BSDs, where `lo0` carries 127.0.0.1 alone.
+    Narrow,
+}
+
+/// Probes the loopback space once per process.
+///
+/// The probe binds a wildcard port on a random address outside the narrow
+/// pools, so neither a twin process nor an alias can answer for it:
+/// `AddrNotAvailable` means the host does not carry the address.
+fn loopback_space() -> LoopbackSpace {
+    static SPACE: OnceLock<LoopbackSpace> = OnceLock::new();
+    *SPACE.get_or_init(|| {
+        let n: u16 = rand::random();
+        let probe = Ipv4Addr::new(127, 1 + ((n >> 8) as u8 % 255), (n & 0xff) as u8, 1);
+        match std::net::UdpSocket::bind(SocketAddrV4::new(probe, 0)) {
+            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => LoopbackSpace::Narrow,
+            _ => LoopbackSpace::Wide,
+        }
+    })
+}
+
+/// First host octet of the narrow lab pool, 127.0.0.3-128.
+const NARROW_LAB_FIRST: u8 = 3;
+/// First host octet of the narrow responder pool, 127.0.0.129-254.
+const NARROW_STUN_FIRST: u8 = 129;
+/// Addresses per narrow pool. 127.0.0.2 stays out of both, so a test can
+/// bind a loopback address no engine draws.
+const NARROW_POOL: u8 = 126;
+
+/// One narrow-pool address, `n` folded onto the pool starting at `first`.
+fn narrow_ip(first: u8, n: u16) -> Ipv4Addr {
+    Ipv4Addr::new(127, 0, 0, first + (n % u16::from(NARROW_POOL)) as u8)
+}
 
 /// Draws one fresh address for this process from `taken`.
 ///
 /// A process-global counter cannot keep test runners apart: cargo-nextest
 /// runs every test in its own process, and all counters would start at the
-/// same address. The draw reads OS entropy instead. A twin process that
-/// holds the drawn address surfaces as a bind failure, which the callers
-/// retry with a fresh draw.
+/// same address. The draw reads OS entropy instead. A twin process holding
+/// the drawn address refuses the claim a lab takes or the sockets a
+/// responder binds, and the caller redraws.
 fn draw_ip(
     taken: &StdMutex<Vec<Ipv4Addr>>,
     make: impl Fn(u16) -> Option<Ipv4Addr>,
@@ -74,19 +118,28 @@ fn draw_ip(
     ))
 }
 
-/// One lab address. Octet one skips the responder space, and zero would
-/// redraw the busy 127.0.0.1.
+/// One lab address: 127.hi.lo.1 on a wide loopback, where octet one skips
+/// the responder space and zero would redraw the busy 127.0.0.1; a narrow
+/// pool address otherwise.
 fn draw_lab_ip() -> io::Result<Ipv4Addr> {
-    draw_ip(&LAB_IPS, |n| {
-        (n != 0 && (n >> 8) != 50).then(|| Ipv4Addr::new(127, (n >> 8) as u8, (n & 0xff) as u8, 1))
-    })
+    match loopback_space() {
+        LoopbackSpace::Wide => draw_ip(&LAB_IPS, |n| {
+            (n != 0 && (n >> 8) != 50)
+                .then(|| Ipv4Addr::new(127, (n >> 8) as u8, (n & 0xff) as u8, 1))
+        }),
+        LoopbackSpace::Narrow => draw_ip(&LAB_IPS, |n| Some(narrow_ip(NARROW_LAB_FIRST, n))),
+    }
 }
 
-/// One responder address from the space no lab draws.
+/// One responder address: 127.50.hi.lo on a wide loopback, the space no
+/// lab draws; a narrow pool address otherwise.
 fn draw_stun_ip() -> io::Result<Ipv4Addr> {
-    draw_ip(&STUN_IPS, |n| {
-        Some(Ipv4Addr::new(127, 50, (n >> 8) as u8, (n & 0xff) as u8))
-    })
+    match loopback_space() {
+        LoopbackSpace::Wide => draw_ip(&STUN_IPS, |n| {
+            Some(Ipv4Addr::new(127, 50, (n >> 8) as u8, (n & 0xff) as u8))
+        }),
+        LoopbackSpace::Narrow => draw_ip(&STUN_IPS, |n| Some(narrow_ip(NARROW_STUN_FIRST, n))),
+    }
 }
 
 /// Returns one drawn lab address to the registry.
@@ -103,6 +156,39 @@ fn release_stun_ips(ips: &[Ipv4Addr]) {
         .lock()
         .expect("address draw lock")
         .retain(|ip| !ips.contains(ip));
+}
+
+/// Port a lab holds on its public address for its whole life, so a twin
+/// process that draws the same address meets `AddrInUse` on its own claim
+/// and redraws. No window ever holds this port: a `u16` range cannot end
+/// past 65535, so the scan never includes it.
+const CLAIM_PORT: u16 = u16::MAX;
+
+/// Claims one drawn address for this process.
+///
+/// `AddrInUse` names a twin process holding the address, and
+/// `AddrNotAvailable` an address the host does not carry: a missing alias
+/// on a narrow loopback. Any other refusal, such as a Windows port
+/// exclusion, leaves the address unclaimed; the wide space keeps a twin
+/// draw improbable there.
+fn claim_address(ip: Ipv4Addr) -> io::Result<Option<std::net::UdpSocket>> {
+    match std::net::UdpSocket::bind(SocketAddrV4::new(ip, CLAIM_PORT)) {
+        Ok(claim) => Ok(Some(claim)),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(e),
+        Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => Err(missing_alias(ip)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The error for a drawn address the host does not carry.
+fn missing_alias(ip: Ipv4Addr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        format!(
+            "{ip} is not a local address; a narrow loopback needs the aliases 127.0.0.2-254: for \
+             i in $(seq 2 254); do sudo ifconfig lo0 alias 127.0.0.$i up; done"
+        ),
+    )
 }
 
 /// Frame tag of a client datagram on its way out.
@@ -180,6 +266,10 @@ struct LabInner {
     public_ip: Ipv4Addr,
     /// Bindable window at or after `spec.port_range.start`.
     window: Range<u16>,
+    /// Holds [`CLAIM_PORT`] on the public address for the lab's life. A
+    /// nested lab draws no address and holds none; a platform port
+    /// exclusion can leave a flat lab's empty too.
+    _claim: Option<std::net::UdpSocket>,
     /// Receives client frames; mapping tasks share it to deliver In frames.
     gateway: Arc<UdpSocket>,
     table: StdMutex<MappingTable>,
@@ -307,7 +397,7 @@ impl NatLab {
     /// The gateway binds and the port window settles before the call
     /// returns, so a failed spawn leaves nothing behind.
     pub async fn spawn(seed: &str, spec: NatSpec) -> io::Result<Self> {
-        let (public_ip, window) = settle_address(&spec)?;
+        let (public_ip, window, claim) = settle_address(&spec)?;
         let gateway = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await {
             Ok(gateway) => gateway,
             Err(e) => {
@@ -316,7 +406,15 @@ impl NatLab {
             },
         };
         Ok(Self {
-            inner: start_lab(seed, spec, public_ip, window, Arc::new(gateway), None),
+            inner: start_lab(
+                seed,
+                spec,
+                public_ip,
+                window,
+                claim,
+                Arc::new(gateway),
+                None,
+            ),
         })
     }
 
@@ -348,6 +446,7 @@ impl NatLab {
                 // belongs to a nested NAT.
                 Ipv4Addr::UNSPECIFIED,
                 window,
+                None,
                 Arc::new(gateway),
                 Some(NatLab {
                     inner: Arc::clone(&uplink.inner),
@@ -523,6 +622,7 @@ fn start_lab(
     spec: NatSpec,
     public_ip: Ipv4Addr,
     window: Range<u16>,
+    claim: Option<std::net::UdpSocket>,
     gateway: Arc<UdpSocket>,
     uplink: Option<NatLab>,
 ) -> Arc<LabInner> {
@@ -530,6 +630,7 @@ fn start_lab(
         spec,
         public_ip,
         window,
+        _claim: claim,
         gateway,
         table: StdMutex::new(MappingTable {
             map: HashMap::new(),
@@ -558,19 +659,28 @@ fn start_lab(
     inner
 }
 
-/// Draws one lab address together with its bindable port window.
+/// Draws one lab address, claims it, and discovers its bindable port
+/// window.
 ///
-/// A twin process that squats the drawn address leaves no bindable port,
-/// so discovery repeats over fresh addresses; a draw whose discovery
-/// failed returns to the registry.
-fn settle_address(spec: &NatSpec) -> io::Result<(Ipv4Addr, Range<u16>)> {
+/// A twin process holding the drawn address refuses the claim, so the draw
+/// repeats over fresh addresses, and a draw that fails returns to the
+/// registry. An address the host does not carry fails every draw alike, so
+/// that error ends the spawn at once.
+fn settle_address(
+    spec: &NatSpec,
+) -> io::Result<(Ipv4Addr, Range<u16>, Option<std::net::UdpSocket>)> {
     let mut last = None;
     for _ in 0..8 {
         let ip = draw_lab_ip()?;
-        match discover_window(ip, &spec.port_range) {
-            Ok(window) => return Ok((ip, window)),
+        let settled =
+            claim_address(ip).and_then(|claim| Ok((discover_window(ip, &spec.port_range)?, claim)));
+        match settled {
+            Ok((window, claim)) => return Ok((ip, window, claim)),
             Err(e) => {
                 release_lab_ip(ip);
+                if e.kind() == io::ErrorKind::AddrNotAvailable {
+                    return Err(e);
+                }
                 last = Some(e);
             },
         }
@@ -1502,13 +1612,21 @@ pub fn stun_responder() -> io::Result<StunServer> {
         let grid = Grid::new([first, second], &PORTS);
         let layout = grid.addrs();
         let mut sockets = Vec::with_capacity(layout.len());
+        let mut refused = None;
         let bound = layout.iter().all(|&addr| {
             let SocketAddr::V4(v4) = addr else {
                 return false;
             };
-            bind_public(*v4.ip(), v4.port())
-                .map(|s| sockets.push(s))
-                .is_ok()
+            match bind_public(*v4.ip(), v4.port()) {
+                Ok(sock) => {
+                    sockets.push(sock);
+                    true
+                },
+                Err(e) => {
+                    refused = Some((*v4.ip(), e));
+                    false
+                },
+            }
         });
         if bound {
             let cancel = CancellationToken::new();
@@ -1531,9 +1649,15 @@ pub fn stun_responder() -> io::Result<StunServer> {
             });
         }
         // The failed draw never became a responder, so both addresses go
-        // back for the next attempt.
+        // back for the next attempt. An address the host does not carry
+        // fails every draw alike.
         drop(sockets);
         release_stun_ips(&[first, second]);
+        if let Some((ip, e)) = refused
+            && e.kind() == io::ErrorKind::AddrNotAvailable
+        {
+            return Err(missing_alias(ip));
+        }
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
@@ -1691,6 +1815,43 @@ mod tests {
         let window = scan_window(65_520, 10, |port| port >= 65_530).expect("a run exists");
         assert_eq!(window, 65_530..u16::MAX);
         assert!(scan_window(1, 2, |_| false).is_err());
+    }
+
+    #[test]
+    fn narrow_pools_split_the_aliases_and_spare_the_foreign_address() {
+        let labs: HashSet<Ipv4Addr> = (0..=u16::MAX)
+            .map(|n| narrow_ip(NARROW_LAB_FIRST, n))
+            .collect();
+        let stuns: HashSet<Ipv4Addr> = (0..=u16::MAX)
+            .map(|n| narrow_ip(NARROW_STUN_FIRST, n))
+            .collect();
+        assert_eq!(labs.len(), usize::from(NARROW_POOL));
+        assert_eq!(stuns.len(), usize::from(NARROW_POOL));
+        assert!(labs.is_disjoint(&stuns));
+        let hosts: HashSet<u8> = labs.union(&stuns).map(|ip| ip.octets()[3]).collect();
+        assert_eq!(hosts.len(), 2 * usize::from(NARROW_POOL));
+        assert!(hosts.iter().all(|&host| (3..=254).contains(&host)));
+    }
+
+    /// A live lab holds its claim, so a twin's claim on the same address
+    /// is refused and the twin redraws.
+    #[tokio::test]
+    async fn a_live_lab_refuses_a_twin_claim() {
+        let lab = NatLab::spawn(
+            "twin_claim",
+            spec(
+                MappingBehavior::EndpointIndependent,
+                FilterClass::EndpointIndependent,
+            ),
+        )
+        .await
+        .expect("lab spawns");
+        match claim_address(lab.public_ip()) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AddrInUse),
+            // A platform port exclusion refuses every claim alike.
+            Ok(None) => {},
+            Ok(Some(_)) => panic!("the lab holds no claim"),
+        }
     }
 
     #[tokio::test]
