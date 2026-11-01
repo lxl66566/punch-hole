@@ -898,10 +898,11 @@ impl<S: UdpIo> Engine<S> {
     /// The announce leaves the peer's NAT at its engine start, so its port
     /// supersedes the probe-time base every fitted target still carries:
     /// the allocations that landed between Probe and Punch moved the whole
-    /// sequence. The translated window keeps its length and stride, so the
-    /// sweep rotation keeps its schedule and only the ports move. Stages
-    /// without a fitted window, and announces from a peer nothing predicts,
-    /// change nothing.
+    /// sequence. The translated window keeps its length and stride, and the
+    /// rotation restarts at its base: the peer's live mappings begin there,
+    /// while the pre-announce sweeps already ran past them on the
+    /// probe-time base. Stages without a fitted window, and announces from
+    /// a peer nothing predicts, change nothing.
     fn apply_peer_base(&mut self) {
         if !self.plan.predicts_peer {
             return;
@@ -921,6 +922,11 @@ impl<S: UdpIo> Engine<S> {
         let Some(rebased) = crate::nat::predict::rebased_window(&ports, port) else {
             return;
         };
+        // The peer's live mappings begin at the announced base, so the
+        // rotation restarts there instead of holding a sweep position that
+        // already ran past them.
+        self.progress.sweep = 0;
+        self.progress.sweep_off = 0;
         let targets = rebased
             .into_iter()
             .zip(&stage.targets)
