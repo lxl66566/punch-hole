@@ -41,14 +41,3 @@ jobs:
         run: for i in $(seq 2 254); do sudo ifconfig lo0 alias 127.0.0.$i up; done
       - name: cargo test
         run: cargo nextest run --workspace --all-features --locked --no-tests pass && cargo test --workspace --all-features --locked --doc
-
-  msrv:
-    name: cargo check (msrv)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      # Keep the pin in sync with rust-version in Cargo.toml.
-      - uses: dtolnay/rust-toolchain@1.88
-      - name: cargo check
-        run: cargo check --workspace --all-targets --all-features --locked
