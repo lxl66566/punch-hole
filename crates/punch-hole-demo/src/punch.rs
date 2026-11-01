@@ -7,18 +7,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use bytes::Bytes;
 use punch_hole::{
     NatInfo, PunchConfig, Punched, Puncher, Role, SessionEvent, msg::Nonce, signaling::HostEnd,
 };
-use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc,
+    time::{sleep, timeout_at},
+};
 
 use crate::PunchArgs;
 
 /// Longest chat line sent as one datagram. Fits one unfragmented datagram
 /// on a typical path.
 const MAX_LINE: usize = 1400;
+/// Registration requests sent before the relay counts as unreachable, one
+/// per second.
+const REGISTER_ATTEMPTS: u32 = 5;
+/// Copies of the registration echo, spaced so one loss burst does not take
+/// them all.
+const VERIFY_COPIES: u32 = 3;
+const VERIFY_GAP: Duration = Duration::from_millis(150);
 
 /// Registers with the relay, runs one session as `role`, and hands the
 /// punched socket to the chat.
@@ -92,8 +103,12 @@ pub async fn run(role: Role, args: &PunchArgs) -> anyhow::Result<()> {
 /// Binds the signaling socket and completes the relay's registration.
 ///
 /// The relay answers `R` with a random token, and echoing it back proves
-/// this address receives its own datagrams. `connect` filters every source
-/// except the relay, so whatever arrives later is a peer frame.
+/// this address receives its own datagrams. Single datagrams die on a lossy
+/// path, so `R` repeats until an answer arrives and the echo goes out
+/// [`VERIFY_COPIES`] times; the relay hands one token per waiting address
+/// and swallows a repeated echo, so neither repeat needs ordering. `connect`
+/// filters every source except the relay, and the pump drops a late answer,
+/// so whatever reaches the library is a peer frame.
 async fn register(relay: SocketAddr) -> anyhow::Result<UdpSocket> {
     let any = if relay.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
@@ -102,26 +117,47 @@ async fn register(relay: SocketAddr) -> anyhow::Result<UdpSocket> {
     };
     let sock = UdpSocket::bind(any).await?;
     sock.connect(relay).await?;
-    sock.send(b"R").await?;
-    let mut ack = [0u8; 16];
-    let n = timeout(Duration::from_secs(5), sock.recv(&mut ack))
-        .await
-        .context("no registration answer from the relay within 5 s")??;
-    if n != 9 || ack[0] != b'A' {
-        bail!("unexpected registration answer from the relay");
-    }
+    let token = request_token(&sock).await?.with_context(|| {
+        format!("no registration answer from the relay within {REGISTER_ATTEMPTS} s")
+    })?;
     let mut verify = Vec::with_capacity(9);
     verify.push(b'V');
-    verify.extend_from_slice(&ack[1..9]);
-    sock.send(&verify).await?;
+    verify.extend_from_slice(&token);
+    for i in 0..VERIFY_COPIES {
+        if i > 0 {
+            sleep(VERIFY_GAP).await;
+        }
+        sock.send(&verify).await?;
+    }
     Ok(sock)
+}
+
+/// Sends `R` once per attempt and returns the first token the relay answers
+/// with. Other datagrams are drained; `None` means every attempt went
+/// unanswered.
+async fn request_token(sock: &UdpSocket) -> anyhow::Result<Option<[u8; 8]>> {
+    let mut ack = [0u8; 16];
+    for _ in 0..REGISTER_ATTEMPTS {
+        sock.send(b"R").await?;
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(received) = timeout_at(until, sock.recv(&mut ack)).await {
+            let n = received?;
+            if n == 9 && ack[0] == b'A' {
+                let mut token = [0u8; 8];
+                token.copy_from_slice(&ack[1..9]);
+                return Ok(Some(token));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Moves frames between the bridge and the signaling socket.
 ///
 /// One datagram is one frame. Frames stay under the signaling size cap, so
 /// no length prefix is needed. `connect` filters every source except the
-/// relay, so whatever arrives here is a peer frame.
+/// relay, so apart from a late registration answer, whatever arrives here
+/// is a peer frame.
 fn pump(sock: Arc<UdpSocket>, end: HostEnd) {
     let mut to_peer = end.to_peer;
     let from_peer = end.from_peer;
@@ -136,6 +172,10 @@ fn pump(sock: Arc<UdpSocket>, end: HostEnd) {
                     }
                 }
                 received = sock.recv_from(&mut buf) => match received {
+                    // An answer to a retried `R` that lands after the
+                    // registration completed would read as a frame of
+                    // protocol version `A`, which ends the session.
+                    Ok((n, _)) if n == 9 && buf[0] == b'A' => {}
                     Ok((n, _)) => {
                         let frame = Bytes::copy_from_slice(&buf[..n]);
                         if from_peer.send(frame).await.is_err() {
