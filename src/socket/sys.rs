@@ -34,9 +34,13 @@ pub(crate) fn bind(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
 ///
 /// The options speed up rebinds while the pool cycles through attempts, but
 /// a delivered winner that still carries them lets any same-euid process
-/// rebind its port and siphon its datagrams. Linux and the BSDs read the
-/// flags of the sockets already on a port when a new bind is attempted, so
-/// clearing them after bind still blocks every later grab.
+/// rebind its port and siphon its datagrams. Bind conflict checks read the
+/// options of the sockets already on the port, so the clear blocks every
+/// later `SO_REUSEPORT` duplicate. Linux demands `SO_REUSEADDR` on both
+/// sides of a wildcard-against-specific overlap too, so the clear blocks
+/// that grab as well; the BSDs consult the binding socket alone there, so
+/// on macOS a same-uid `SO_REUSEADDR` bind on a specific address still
+/// shadows a wildcard-bound winner.
 #[cfg(unix)]
 pub(crate) fn clear_reuse(sock: &tokio::net::UdpSocket) -> io::Result<()> {
     let sock = socket2::SockRef::from(sock);
@@ -133,50 +137,63 @@ mod tests {
         );
     }
 
-    /// The delivered winner must reject reuse grabs: after `clear_reuse`,
-    /// neither a `SO_REUSEADDR` overlap bind nor a `SO_REUSEPORT` duplicate
-    /// of the wildcard bind can claim the port. Linux and the BSDs demand
-    /// the reuse options on the sockets already holding the port too, so an
-    /// ordinary second socket in the same process is a faithful grabber.
+    /// Binds one punch socket on the wildcard and clears its reuse options
+    /// like the handover does.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn cleared_winner_rejects_reuse_grabs() {
+    fn cleared_winner() -> (tokio::net::UdpSocket, u16) {
         let bound = bind(SocketAddr::from(([0, 0, 0, 0], 0))).expect("punch socket binds");
         clear_reuse(&bound).expect("reuse options clear on a bound socket");
         let port = bound
             .local_addr()
             .expect("bound socket reports its address")
             .port();
+        (bound, port)
+    }
 
-        // A SO_REUSEADDR bind overlapping the wildcard, the same shape the
-        // Windows hardening rejects.
-        let overlap = SocketAddr::from(([127, 0, 0, 1], port));
+    /// Binds a grabber at `addr` with `SO_REUSEADDR`, plus `SO_REUSEPORT`
+    /// when asked.
+    #[cfg(unix)]
+    fn reuse_bind(addr: SocketAddr, reuse_port: bool) -> io::Result<socket2::Socket> {
         let grabber = socket2::Socket::new(
-            socket2::Domain::for_address(overlap),
+            socket2::Domain::for_address(addr),
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
-        )
-        .expect("grabber socket creates");
-        grabber.set_reuse_address(true).expect("reuse option sets");
-        assert!(
-            grabber.bind(&overlap.into()).is_err(),
-            "a SO_REUSEADDR bind must not overlap the delivered port"
-        );
+        )?;
+        grabber.set_reuse_address(true)?;
+        if reuse_port {
+            grabber.set_reuse_port(true)?;
+        }
+        grabber.bind(&addr.into())?;
+        Ok(grabber)
+    }
 
-        // A SO_REUSEPORT duplicate of the exact wildcard bind, the shape
-        // that shares datagrams between same-euid processes on Linux.
-        let twin = socket2::Socket::new(
-            socket2::Domain::for_address(SocketAddr::from(([0, 0, 0, 0], port))),
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .expect("twin socket creates");
-        twin.set_reuse_address(true).expect("reuse option sets");
-        twin.set_reuse_port(true).expect("reuseport option sets");
+    /// After `clear_reuse`, a `SO_REUSEPORT` duplicate of the exact
+    /// wildcard bind — the shape that shares datagrams between same-euid
+    /// processes on Linux — fails. Linux and the BSDs demand the option on
+    /// the sockets already holding the port, so an ordinary second socket
+    /// in the same process is a faithful grabber.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleared_winner_rejects_a_reuseport_duplicate() {
+        let (_bound, port) = cleared_winner();
         assert!(
-            twin.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())
-                .is_err(),
+            reuse_bind(SocketAddr::from(([0, 0, 0, 0], port)), true).is_err(),
             "a SO_REUSEPORT bind must not share the delivered port"
+        );
+    }
+
+    /// After `clear_reuse`, a `SO_REUSEADDR` bind on a specific address
+    /// overlapping the wildcard — the shape the Windows hardening rejects —
+    /// fails on Linux, which demands the option on both sockets. The BSDs
+    /// consult the binding socket alone, so macOS admits the overlap from
+    /// the same uid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cleared_winner_rejects_a_reuseaddr_overlap() {
+        let (_bound, port) = cleared_winner();
+        assert!(
+            reuse_bind(SocketAddr::from(([127, 0, 0, 1], port)), false).is_err(),
+            "a SO_REUSEADDR bind must not overlap the delivered port"
         );
     }
 }
