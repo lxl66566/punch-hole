@@ -441,7 +441,13 @@ impl<S: UdpIo> Engine<S> {
                     },
                 });
             }
+            // Biased polling keeps inbound events ahead of the tick: a spray
+            // tick can spend its whole interval inside the rate limiter,
+            // which leaves the ticker overdue at every loop head, and a
+            // random pick between the two would drain peer packets at a
+            // fraction of their arrival rate.
             tokio::select! {
+                biased;
                 ev = events.recv() => {
                     let Some(ev) = ev else {
                         // A receive task ends only by cancellation or a
