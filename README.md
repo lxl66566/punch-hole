@@ -30,7 +30,7 @@ punch-demo client --relay <relay-host>:9000
 punch-demo server --relay <relay-host>:9000
 ```
 
-STUN defaults to four public servers, so the commands above need no other setup. Pass `--stun host:port,...` to use your own. The client punches as the Initiator and the server as the Responder. Each side prints every stage as it completes, its own NAT class, the peer's, and the negotiated strategy, then the phase timings once the path is up. Both sides then chat over the punched socket: each line typed is one datagram to the peer, and `/quit` or end of input closes. `--target <p>` sets the success rate the burst sizing aims for; the demo defaults to 0.9.
+STUN defaults to four public servers, so the commands above need no other setup. Pass `--stun host:port,...` to use your own. The client punches as the Initiator and the server as the Responder. Each side prints every stage as it completes, its own NAT class, the peer's, and the negotiated strategy, then the phase timings once the path is up. Both sides then chat over the punched socket: each line typed is one datagram to the peer, and `/quit` or end of input closes. `--target <p>` sets the success rate the burst sizing aims for; the demo defaults to 0.9. `--exchange-timeout <s>` sets how long a side waits for the other to join; the demo defaults to 30. An unattended side that restarts after every attempt should wait longer and leave at least 60 seconds between starts: the relay frees an unpaired slot 60 seconds after it joined, and a registration arriving before that pairs with the stale slot.
 
 Two peers on one machine also work. They punch over the local IPv6 or
 loopback path.

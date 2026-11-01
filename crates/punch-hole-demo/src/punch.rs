@@ -32,8 +32,12 @@ pub async fn run(role: Role, args: &PunchArgs) -> anyhow::Result<()> {
     cfg.target_success = args.target;
     cfg.min_success = cfg.min_success.min(args.target);
     // Both terminals must join inside the exchange window, so the demo waits
-    // longer than the default for the second side.
-    cfg.exchange_timeout = Duration::from_secs(30);
+    // longer than the library default for the second side. The session wall
+    // moves with it, so the phases after exchange keep the budget the
+    // library default leaves them.
+    let exchange = Duration::from_secs(args.exchange_timeout);
+    cfg.overall_deadline = cfg.overall_deadline.saturating_sub(cfg.exchange_timeout) + exchange;
+    cfg.exchange_timeout = exchange;
 
     let sock = register(args.relay).await?;
     println!(

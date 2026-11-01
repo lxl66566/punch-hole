@@ -60,6 +60,9 @@ pub struct PunchArgs {
     /// Success rate the burst sizing aims for.
     #[arg(long, default_value_t = 0.9)]
     pub target: f64,
+    /// Seconds the exchange waits for the peer to join.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub exchange_timeout: u64,
 }
 
 #[tokio::main]
