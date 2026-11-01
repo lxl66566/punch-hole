@@ -49,6 +49,10 @@ pub async fn run(role: Role, args: &PunchArgs) -> anyhow::Result<()> {
     let exchange = Duration::from_secs(args.exchange_timeout);
     cfg.overall_deadline = cfg.overall_deadline.saturating_sub(cfg.exchange_timeout) + exchange;
     cfg.exchange_timeout = exchange;
+    // The negotiate window opens at session start, so a slow exchange whose
+    // retransmissions run long would otherwise leave it nothing. Its budget
+    // matches the exchange's plus margin, and stays under the session wall.
+    cfg.negotiate_timeout = exchange + Duration::from_secs(10);
 
     let sock = register(args.relay).await?;
     println!(
