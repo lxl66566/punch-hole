@@ -61,11 +61,7 @@ pub(crate) async fn probe<F: UdpFactory>(
     } else {
         (None, Vec::new())
     };
-    let v6 = if cfg.ip_policy.allows_v6() {
-        probe_v6(cfg, factory, deadline).await
-    } else {
-        None
-    };
+    let v6 = if cfg.ip_policy.allows_v6() { probe_v6(cfg, factory, deadline).await } else { None };
     Ok(NatInfo { v4, v6, local })
 }
 

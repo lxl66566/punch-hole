@@ -628,11 +628,7 @@ impl<S: UdpIo> Engine<S> {
         let probed = self.plan.stages.iter().any(|s| {
             s.family == family
                 && !s.reply_only
-                && (if s.needs_peer_ports {
-                    announced
-                } else {
-                    !s.targets.is_empty()
-                })
+                && (if s.needs_peer_ports { announced } else { !s.targets.is_empty() })
         });
         if !probed {
             return false;
@@ -1018,11 +1014,8 @@ impl<S: UdpIo> Engine<S> {
             // processing need the rate budget, so a multi-target spray backs
             // off to one packet per sweep. Single-pulse stages stay as they
             // are.
-            let per_sweep = if self.handshake.peer_addr.is_some() {
-                1
-            } else {
-                usize::from(stage.per_sweep)
-            };
+            let per_sweep =
+                if self.handshake.peer_addr.is_some() { 1 } else { usize::from(stage.per_sweep) };
             // Every bound socket of a send stage pulses, capped by the
             // buffers `run` actually built.
             let senders = stage.bind.min(group.len());

@@ -872,11 +872,7 @@ fn allocate_mapping(
                 // The rebind fault models a router restart of the port
                 // walk and stays armed for stepped walks only; the plain
                 // step-one walk of the cone presets ignores it.
-                let n = if step == 1 {
-                    n
-                } else {
-                    apply_rebind(inner, table, n)
-                };
+                let n = if step == 1 { n } else { apply_rebind(inner, table, n) };
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },

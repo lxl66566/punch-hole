@@ -175,11 +175,7 @@ impl Grid {
 
     /// The other IP of the pair.
     fn other_ip(&self, ip: Ipv4Addr) -> Ipv4Addr {
-        if ip == self.ips[0] {
-            self.ips[1]
-        } else {
-            self.ips[0]
-        }
+        if ip == self.ips[0] { self.ips[1] } else { self.ips[0] }
     }
 
     /// The port partner, rotating through the list.
@@ -197,16 +193,9 @@ impl Grid {
             // Not a grid address; the reply stays where it came from.
             return received;
         };
-        let ip = if flags.change_ip {
-            self.other_ip(*received.ip())
-        } else {
-            *received.ip()
-        };
-        let port = if flags.change_port {
-            self.other_port(received.port())
-        } else {
-            received.port()
-        };
+        let ip = if flags.change_ip { self.other_ip(*received.ip()) } else { *received.ip() };
+        let port =
+            if flags.change_port { self.other_port(received.port()) } else { received.port() };
         SocketAddr::from((ip, port))
     }
 

@@ -494,11 +494,7 @@ impl NatShared {
                 // The rebind fault models a router restart of the port
                 // walk and stays armed for stepped walks only; the plain
                 // step-one walk of the cone presets ignores it.
-                let n = if step == 1 {
-                    n
-                } else {
-                    self.apply_rebind(n, rng)
-                };
+                let n = if step == 1 { n } else { self.apply_rebind(n, rng) };
                 let offset = (n * i64::from(step)).rem_euclid(len as i64) as u16;
                 start + offset
             },

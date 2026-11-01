@@ -120,11 +120,7 @@ fn parse_xor_address(body: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
         0x02 if body.len() >= 20 => {
             let mut ip = [0u8; 16];
             for (j, b) in ip.iter_mut().enumerate() {
-                let key = if j < 4 {
-                    COOKIE[j]
-                } else {
-                    txid[j - 4]
-                };
+                let key = if j < 4 { COOKIE[j] } else { txid[j - 4] };
                 *b = body[4 + j] ^ key;
             }
             Some(SocketAddr::V6(SocketAddrV6::new(ip.into(), xport, 0, 0)))

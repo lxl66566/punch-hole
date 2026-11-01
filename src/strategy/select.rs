@@ -236,11 +236,8 @@ pub(crate) fn select(
         // replies one socket: the symmetric side shoots, or with no
         // symmetric side the ambiguous reading shoots.
         let shooter = cfg.assistant_sockets;
-        let (initiator_sockets, responder_sockets) = if initiator_shoots(mine, peer) {
-            (shooter, 1)
-        } else {
-            (1, shooter)
-        };
+        let (initiator_sockets, responder_sockets) =
+            if initiator_shoots(mine, peer) { (shooter, 1) } else { (1, shooter) };
         let mut sel = Selection {
             strategy: StrategyId::SymProbe,
             initiator_sockets,
@@ -371,11 +368,7 @@ pub(super) fn local_stage_reachable(ip: Ipv4Addr) -> bool {
 fn sym_probe_estimate(mine: &NatInfo, peer: &NatInfo, sel: &Selection, cfg: &PunchConfig) -> f64 {
     // Exactly one side is symmetric, and it holds the shooter count, which is
     // the larger of the two socket counts.
-    let sym = if is_symmetric(effective_class(mine)) {
-        mine
-    } else {
-        peer
-    };
+    let sym = if is_symmetric(effective_class(mine)) { mine } else { peer };
     let m = sel.initiator_sockets.max(sel.responder_sockets) as usize;
     let space = peer_space(sym);
     let c = spray_count(m, space, cfg);
@@ -481,11 +474,7 @@ pub(crate) fn build_plan(
                 // The sizing always reads the hard side's space, whichever
                 // side builds the stage, so both roles derive the same
                 // coverage pair from the same views.
-                let hard_space = if i_am_easy {
-                    peer_space(peer)
-                } else {
-                    peer_space(mine)
-                };
+                let hard_space = if i_am_easy { peer_space(peer) } else { peer_space(mine) };
                 stages.extend(predictive_burst::stage(
                     i_am_easy,
                     my_sockets,

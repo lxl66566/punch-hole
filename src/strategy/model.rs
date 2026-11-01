@@ -137,11 +137,7 @@ pub(crate) fn size_burst(space_i: usize, space_r: usize, cfg: &PunchConfig) -> B
     // expected-hit products, carried as an integer so the estimate can
     // verify the sizing exactly.
     let required = -(1.0 - cfg.target_success).ln() * effective_space(space_i, space_r);
-    let need = if required.is_finite() {
-        required.ceil().max(1.0) as usize
-    } else {
-        usize::MAX
-    };
+    let need = if required.is_finite() { required.ceil().max(1.0) as usize } else { usize::MAX };
     let mapping_cap = cfg
         .max_mappings
         .saturating_sub(BURST_MAPPING_HEADROOM)

@@ -79,11 +79,7 @@ fn binding_reply(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
             )
         },
     };
-    let attr_len: u16 = if family == 0x01 {
-        8
-    } else {
-        20
-    };
+    let attr_len: u16 = if family == 0x01 { 8 } else { 20 };
     let mut out = Vec::with_capacity(48);
     out.extend_from_slice(&0x0101u16.to_be_bytes());
     // The message length covers the attribute header plus the body.
