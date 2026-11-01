@@ -60,6 +60,20 @@ impl<F: UdpFactory> Puncher<F> {
         self
     }
 
+    /// Runs the Probe phase alone and returns the classification it yields.
+    ///
+    /// A session consumes a cached classification through
+    /// [`with_cached_nat`](Self::with_cached_nat) and never probes, so this
+    /// is the standalone entry: to show the NAT type before dialing, to
+    /// decide whether an attempt is worth its budget, or to refresh a cache
+    /// the network may have changed under. The run always probes fresh,
+    /// never consults a cached classification, and fits inside
+    /// `probe_timeout`. The result feeds `with_cached_nat` unchanged.
+    pub async fn probe(&self) -> Result<NatInfo, PunchError> {
+        let overall = Instant::now() + self.config.probe_timeout;
+        crate::nat::probe::probe(&self.config, &self.factory, overall).await
+    }
+
     /// Attaches the signaling bridge and creates the session.
     #[must_use]
     pub fn with_signaling(self, end: LibEnd) -> PunchSession<F> {
@@ -88,7 +102,10 @@ pub struct PunchSession<F: UdpFactory> {
 /// event, because the returned [`Punched`] carries the full report;
 /// failure needs none either, because the returned
 /// [`PunchFailure`] carries the same evidence plus its own error.
+///
+/// The set of stages grows across releases, so match with a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SessionEvent {
     /// The local classification settled, from Probe or from the cache a
     /// cached session skipped Probe with.
@@ -468,6 +485,25 @@ impl<F: UdpFactory> PunchSession<F> {
                         // The Offer carries no estimate, so the report
                         // rebuilds it over the local view.
                         sel.fill_estimate(mine, peer, &self.config);
+                        // The Initiator's select refuses a plan its own
+                        // model rates below `min_success`, and the Offer
+                        // carries no estimate, so the same bar runs here
+                        // over the local view: differing budgets or socket
+                        // caps can leave this side's model rating the plan
+                        // hopeless, and it aborts before any socket opens
+                        // instead of burning the punch window.
+                        if sel.estimate.is_some_and(|est| est < self.config.min_success) {
+                            let _ = send_deadlined(
+                                self.sig.send(Frame::Abort(AbortReason::Unpunchable)),
+                                deadline,
+                                Phase::Negotiate,
+                            )
+                            .await;
+                            return Err(PunchError::Unpunchable {
+                                local: strategy::effective_class(mine),
+                                peer: strategy::effective_class(peer),
+                            });
+                        }
                         let accept =
                             send_deadlined(self.sig.send(Frame::Accept), deadline, Phase::Negotiate)
                                 .await?;
@@ -729,5 +765,80 @@ mod tests {
             let frame = crate::msg::decode_sig(&abort).expect("abort decodes");
             assert_eq!(frame.body, Frame::Abort(super::AbortReason::Internal));
         }
+    }
+
+    /// A wide-span hard-symmetric reading with port-strict filtering, the
+    /// shape the burst model prices by the covered-set product.
+    fn hard_sym() -> NatInfo {
+        NatInfo {
+            v4: Some(V4Nat {
+                class: NatClass::HardSym,
+                reflexive: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 3), 40000),
+                alloc_seq: vec![30000, 60000],
+                distinct_probe_ips: 2,
+                filtering: FilterClass::AddressPortDependent,
+                hairpin: false,
+            }),
+            v6: None,
+            local: Vec::new(),
+        }
+    }
+
+    /// The Responder applies the same `min_success` bar the Initiator's
+    /// select applies, so an Offer from a peer with a different budget
+    /// aborts here instead of running a plan this side's model rates
+    /// hopeless through the whole punch window.
+    #[tokio::test(start_paused = true)]
+    async fn responder_refuses_a_plan_below_its_own_bar() {
+        use crate::msg::{Frame, Offer, SigFrame, StrategyId, encode_sig};
+
+        let (mut host, lib) = crate::signaling::bridge(8);
+        // The small packet budget caps the burst coverage far below what
+        // the wide port-strict pair needs, so the local estimate sits
+        // under the default `min_success` of 0.1.
+        let cfg = PunchConfig {
+            packet_budget: 256,
+            ..PunchConfig::default()
+        };
+        let session = Puncher::with_factory(cfg, TokioFactory)
+            .expect("config valid")
+            .with_cached_nat(hard_sym())
+            .with_signaling(lib);
+        let drive = tokio::spawn(session.responder());
+        for body in [
+            Frame::Hello(hard_sym()),
+            Frame::Offer(Offer {
+                nonce: [1; 16],
+                strategy: StrategyId::BirthdayBurst,
+                local_sockets: 1,
+                peer_sockets: 1,
+                start_delay_ms: 500,
+            }),
+        ] {
+            host.from_peer
+                .send(bytes::Bytes::from(encode_sig(&SigFrame {
+                    ts: 1,
+                    echo: 0,
+                    body,
+                })))
+                .await
+                .expect("host frame send");
+        }
+
+        let err = drive
+            .await
+            .expect("task joins")
+            .expect_err("the hopeless plan aborts");
+        assert!(
+            matches!(err.error, PunchError::Unpunchable { .. }),
+            "got {:?}",
+            err.error
+        );
+        assert!(err.diagnostics.selection.is_none());
+        // The host channel saw our own Hello, then the Abort.
+        let _ = host.to_peer.recv().await.expect("hello drains");
+        let abort = host.to_peer.recv().await.expect("abort drains");
+        let frame = crate::msg::decode_sig(&abort).expect("abort decodes");
+        assert_eq!(frame.body, Frame::Abort(super::AbortReason::Unpunchable));
     }
 }

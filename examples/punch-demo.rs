@@ -31,7 +31,10 @@ use std::{
 
 use bytes::Bytes;
 use punch_hole::{NatInfo, PunchConfig, Puncher};
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    time::{timeout, timeout_at},
+};
 
 const USAGE: &str = "usage:
   punch-demo relay <bind-addr>
@@ -271,7 +274,13 @@ async fn punch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         r.phase_ms.confirm_ms
     );
 
-    demo_traffic(&punched.socket, punched.peer_addr, &a.role).await?;
+    demo_traffic(
+        &punched.socket,
+        punched.peer_addr,
+        &a.role,
+        punched.report.nonce,
+    )
+    .await?;
     println!("business datagram exchanged over the direct path");
     Ok(())
 }
@@ -309,20 +318,25 @@ fn pump(sock: Arc<UdpSocket>, end: punch_hole::signaling::HostEnd) {
 }
 
 /// One datagram each way over the winner socket proves the path.
+///
+/// Late handshake retransmissions and keepalive beats of this attempt still
+/// arrive on the handed-over socket, so the receive loop filters them with
+/// the attempt nonce before it reads business data.
 async fn demo_traffic(
     sock: &UdpSocket,
     peer: SocketAddr,
     role: &str,
+    nonce: punch_hole::msg::Nonce,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; 64];
     if role == "initiator" {
         sock.send_to(b"ping", peer).await?;
-        let (n, _) = recv_with_deadline(sock, &mut buf).await?;
+        let (n, _) = recv_business(sock, &mut buf, nonce).await?;
         if &buf[..n] != b"pong" {
             return Err("peer sent unexpected business data".into());
         }
     } else {
-        let (n, from) = recv_with_deadline(sock, &mut buf).await?;
+        let (n, from) = recv_business(sock, &mut buf, nonce).await?;
         if &buf[..n] != b"ping" {
             return Err("peer sent unexpected business data".into());
         }
@@ -331,12 +345,22 @@ async fn demo_traffic(
     Ok(())
 }
 
-async fn recv_with_deadline(
+/// One receive that skips this attempt's protocol packets, under one overall
+/// deadline: every skipped datagram costs budget, not a fresh window.
+async fn recv_business(
     sock: &UdpSocket,
     buf: &mut [u8],
+    nonce: punch_hole::msg::Nonce,
 ) -> Result<(usize, SocketAddr), Box<dyn std::error::Error>> {
-    let received = timeout(Duration::from_secs(10), sock.recv_from(buf))
-        .await
-        .map_err(|_| "no business datagram within 10 s")?;
-    received.map_err(Into::into)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let received = timeout_at(deadline, sock.recv_from(buf))
+            .await
+            .map_err(|_| "no business datagram within 10 s")?;
+        let (n, from) = received?;
+        if !punch_hole::msg::is_attempt_packet(&buf[..n], nonce) {
+            continue;
+        }
+        return Ok((n, from));
+    }
 }

@@ -26,6 +26,12 @@
 //! A signaling version mismatch aborts the session, because no productive
 //! exchange can follow it.
 //!
+//! # Cancellation
+//!
+//! Dropping a session future cancels the attempt at its next await, and the
+//! socket pool's `Drop` closes every socket the attempt had opened, so a
+//! dropped attempt leaves no sockets behind. No separate cancel call exists.
+//!
 //! # Example
 //!
 //! One side of a session, with the host's own transport already in place:

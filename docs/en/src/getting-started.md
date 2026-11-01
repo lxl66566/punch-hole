@@ -58,6 +58,18 @@ The channel should preserve order. Frame retransmission covers loss, so a lossy 
 
 Both roles run the same code and reach the same result. The Initiator owns the decisions that need one owner: it draws the attempt nonce, applies the strategy matrix, and schedules the pulse start. The Responder clamps the plan to its own limits and confirms. The role matters when the two hosts disagree about who calls first, so pick it per connection the way the application already orders its connections.
 
+Both sides calling `initiator()` at once ends the attempt at once: each side reads the peer's `Offer` as its own role being taken and aborts with `PeerAborted(Internal)`. Assign the role before either side dials. Where no natural caller exists, derive it from data both sides hold after Exchange — the lower reflexive IPv4 address initiates, with the lower local address breaking a tie between equals — or let one side retry as the Responder: the collision is itself proof both transports work.
+
+## The second attempt
+
+A session is one attempt, and a second attempt is a fresh session with fresh state:
+
+- A fresh bridge and a fresh session. The nonce is drawn per attempt, so a new attempt never reuses one.
+- A fresh classification where the last one is stale. `Puncher::probe()` runs the Probe phase alone for a value to feed `with_cached_nat`; the last `SessionEvent::Probe` of the failed session serves when the network has not changed.
+- A reason to expect a different outcome. A probabilistic miss redraws its covered port set on every attempt, so a retry has a fresh chance. An `Unpunchable` verdict does not: the model rates the pair below `min_success` and retries only burn budget against it.
+- Backoff between attempts. The NAT mappings and conntrack entries of the last attempt age out in seconds, and a retry that lands inside their lifetime inherits their noise.
+- A role swap where both sides claimed the Initiator role. One side moves to the Responder, or both fall back to the tie-break above.
+
 ## Reading the result
 
 ```rust
@@ -69,6 +81,8 @@ pub struct Punched<S = tokio::net::UdpSocket> {
 ```
 
 The socket stays unconnected, so the host chooses its own receive pattern. `peer_addr` is the confirmed data-plane address of the peer. The report carries both NAT classes, the local reflexive addresses, the STUN server the engine's refresh queries used, the port-space estimate for each symmetric side, the strategy, the success estimate for burst strategies, packet counts, and the wall time of each phase, which covers logging, telemetry, and relay decisions.
+
+Delivery can lag the handshake by `grace`. A side confirmed by the peer's `SynAck` keeps answering repeated handshake packets until the peer's closing `Ack` arrives or the grace window closes, which covers the loss of that one packet without a retry. Expect the winner socket up to `grace` past the handshake and tune the window to what that tail is worth.
 
 ## Failures and progress
 
@@ -85,14 +99,16 @@ pub struct PunchFailure {
 
 Progress is observable without polling. `Puncher::with_events(sender)` feeds one `SessionEvent` per completed stage, Probe, Exchange, Negotiate in that order, into an `mpsc` channel. Emission is best-effort: a full or closed channel loses the event and never stalls the session, so no dedicated drain task is required.
 
+Cancellation is drop. Dropping the session future cancels the attempt at its next await, and the socket pool closes every socket the attempt had opened on the way out, so a dropped attempt leaves no sockets behind. There is no separate cancel call.
+
 ## Host responsibilities
 
 The library covers one attempt. The checklist around it:
 
 - **Authenticate before forwarding.** The data plane tags packets with a 128-bit nonce, and the signaling plane trusts whatever the host channel delivers. Authenticate the peer and reject replays on the host transport before anything reaches `from_peer`.
 - **Deliver frames in order.** Retransmission tolerates loss. Order is the one property the bridge expects.
-- **Retry attempts.** One session is one attempt. A probabilistic burst against a hard symmetric NAT may need a second run, and the host owns the loop.
-- **Keep the cache fresh.** `with_cached_nat` skips the Probe phase with whatever the host hands it. Networks change, so a cache older than the current network is the host's call to make.
+- **Retry attempts.** One session is one attempt. A probabilistic burst against a hard symmetric NAT may need a second run, and the host owns the loop. [The second attempt](#the-second-attempt) lists the checklist.
+- **Keep the cache fresh.** `with_cached_nat` skips the Probe phase with whatever the host hands it. Networks change, so a cache older than the current network is the host's call to make; `Puncher::probe()` runs the classification alone for a fresh value.
 
 ## The demo
 

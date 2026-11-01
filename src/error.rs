@@ -13,7 +13,10 @@ pub enum Phase {
 }
 
 /// Every way a punch session can fail.
+///
+/// The set grows across releases, so match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PunchError {
     /// A phase or the whole session ran out of time.
     #[error("phase {phase:?} ran out of time")]

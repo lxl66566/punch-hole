@@ -210,10 +210,24 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DataPacket, DecodeError> {
 /// Hosts use this to skip keepalive beats and late handshake
 /// retransmissions that still arrive on the handed-over socket. The
 /// predicate matches on shape alone; business datagrams that must never
-/// read as protocol traffic should avoid a magic first byte.
+/// read as protocol traffic should avoid a magic first byte. Hosts that
+/// hold the attempt nonce prefer [`is_attempt_packet`], which needs no
+/// first-byte reservation.
 #[must_use]
 pub fn is_protocol_packet(bytes: &[u8]) -> bool {
     bytes.first() == Some(&DATA_MAGIC) && bytes.len() <= MAX_DATA_PACKET
+}
+
+/// Whether `bytes` decodes as a data-plane packet of one attempt's nonce.
+///
+/// This is the precise form of [`is_protocol_packet`]: it drops keepalive
+/// beats and late handshake retransmissions of the named attempt without
+/// touching business datagrams, whatever their first byte is. Every
+/// delivered session reports the attempt nonce, so hosts that hold it
+/// filter with this and reserve no first byte.
+#[must_use]
+pub fn is_attempt_packet(bytes: &[u8], nonce: Nonce) -> bool {
+    matches!(decode_packet(bytes), Ok(packet) if packet.nonce() == nonce)
 }
 
 #[cfg(test)]
@@ -308,6 +322,24 @@ mod tests {
         for packet in cases {
             assert_eq!(decode_packet(&encode_packet(&packet)).unwrap(), packet);
         }
+    }
+
+    #[test]
+    fn attempt_packet_filter_matches_only_the_named_nonce() {
+        let nonce = [9; 16];
+        let beat = encode_packet(&DataPacket::Keepalive { nonce });
+        let syn = encode_packet(&DataPacket::Syn { nonce, socket: 0 });
+        let foreign = encode_packet(&DataPacket::Syn {
+            nonce: [1; 16],
+            socket: 0,
+        });
+        assert!(is_attempt_packet(&beat, nonce));
+        assert!(is_attempt_packet(&syn, nonce));
+        assert!(!is_attempt_packet(&foreign, nonce));
+        // A truncated packet and a business datagram never match, whatever
+        // their head byte.
+        assert!(!is_attempt_packet(&[DATA_MAGIC, VERSION], nonce));
+        assert!(!is_attempt_packet(b"ping", nonce));
     }
 
     #[test]

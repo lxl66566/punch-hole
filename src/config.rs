@@ -1,6 +1,6 @@
 //! Session configuration.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use crate::error::PunchError;
 
@@ -129,6 +129,9 @@ impl PunchConfig {
         if self.stun_servers.is_empty() {
             return Err(bad("stun_servers must not be empty"));
         }
+        if self.stun_servers.iter().any(|s| !server_syntax_ok(s)) {
+            return Err(bad("stun_servers entries must be host:port"));
+        }
         if self.max_sockets == 0 || self.packets_per_sec == 0 || self.packet_budget == 0 {
             return Err(bad("socket counts, rate, and budget must be positive"));
         }
@@ -200,6 +203,25 @@ impl PunchConfig {
     }
 }
 
+/// Whether one `stun_servers` entry has the `host:port` shape the prober
+/// resolves.
+///
+/// The check is syntactic: validation stays off DNS, so a hostname whose
+/// lookup fails still surfaces at Probe as `NoStunDestination`. A literal
+/// address takes the `ip:port` or `[v6]:port` form; a name takes a trailing
+/// `:port` and no inner colon.
+fn server_syntax_ok(server: &str) -> bool {
+    if server.parse::<SocketAddr>().is_ok() {
+        return true;
+    }
+    match server.rsplit_once(':') {
+        Some((host, port)) => {
+            !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok()
+        },
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +238,35 @@ mod tests {
             ..PunchConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn malformed_stun_entries_are_rejected() {
+        for server in ["no-port.example", ":3478", "stun.example.com:", "a:b:c"] {
+            let cfg = PunchConfig {
+                stun_servers: vec![server.to_owned()],
+                ..PunchConfig::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(PunchError::InvalidConfig(_))),
+                "{server} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_stun_entries_pass() {
+        for server in [
+            "stun.example.com:3478",
+            "203.0.113.5:3478",
+            "[2001:db8::1]:3478",
+        ] {
+            let cfg = PunchConfig {
+                stun_servers: vec![server.to_owned()],
+                ..PunchConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "{server} should be valid");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Optional heartbeat that holds the punched mapping open.
 
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{
     msg::{DataPacket, Nonce, encode_packet},
@@ -12,7 +12,10 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Stops the heartbeat task when dropped.
 #[must_use = "the heartbeat stops when the guard is dropped"]
-pub struct KeepaliveGuard(tokio::task::JoinHandle<()>);
+pub struct KeepaliveGuard {
+    task: tokio::task::JoinHandle<()>,
+    stopped: Option<tokio::sync::oneshot::Receiver<()>>,
+}
 
 impl KeepaliveGuard {
     /// Whether the heartbeat task is still sending.
@@ -23,13 +26,26 @@ impl KeepaliveGuard {
     /// alongside its own socket health.
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        !self.0.is_finished()
+        !self.task.is_finished()
+    }
+
+    /// Resolves when the heartbeat task ends.
+    ///
+    /// The task ends when a beat fails or the guard is dropped, so a host
+    /// that must notice the mapping's death awaits this instead of polling
+    /// [`is_alive`](Self::is_alive). The wait is single-shot: `None` means
+    /// an earlier call already took it. Dropping the returned future
+    /// cancels the wait, not the task.
+    pub fn stopped(&mut self) -> Option<impl Future<Output = ()>> {
+        self.stopped.take().map(|rx| async move {
+            let _ = rx.await;
+        })
     }
 }
 
 impl Drop for KeepaliveGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -37,8 +53,9 @@ impl Drop for KeepaliveGuard {
 ///
 /// `tokio::net::UdpSocket` has no `Clone`, so hosts share the winner behind
 /// an `Arc`. Hosts discard any datagram that satisfies
-/// [`crate::msg::is_protocol_packet`], which covers these heartbeat beats
-/// and any late handshake retransmissions.
+/// [`crate::msg::is_attempt_packet`] with the session nonce, or the coarser
+/// [`crate::msg::is_protocol_packet`] when no nonce is at hand; both cover
+/// these heartbeat beats and any late handshake retransmissions.
 impl UdpIo for Arc<tokio::net::UdpSocket> {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         (**self).send_to(buf, target).await
@@ -68,7 +85,8 @@ pub fn spawn_io<U: UdpIo>(socket: U, peer: SocketAddr, nonce: Nonce) -> Keepaliv
 /// `spawn_io` with a custom interval, which compressed-timer tests use.
 ///
 /// A heartbeat that fails to send ends the task;
-/// [`KeepaliveGuard::is_alive`] reports that.
+/// [`KeepaliveGuard::is_alive`] reports that and
+/// [`KeepaliveGuard::stopped`] resolves.
 pub fn spawn_io_with_interval<U: UdpIo>(
     socket: U,
     peer: SocketAddr,
@@ -76,6 +94,7 @@ pub fn spawn_io_with_interval<U: UdpIo>(
     interval: Duration,
 ) -> KeepaliveGuard {
     let packet = encode_packet(&DataPacket::Keepalive { nonce });
+    let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -87,8 +106,14 @@ pub fn spawn_io_with_interval<U: UdpIo>(
                 break;
             }
         }
+        // A closed receiver means the guard is already dropped; the send
+        // is best-effort by design.
+        let _ = stopped_tx.send(());
     });
-    KeepaliveGuard(handle)
+    KeepaliveGuard {
+        task: handle,
+        stopped: Some(stopped),
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +199,7 @@ mod tests {
         let sock = FailsAfter {
             ok: std::sync::atomic::AtomicUsize::new(1),
         };
-        let guard = spawn_io_with_interval(
+        let mut guard = spawn_io_with_interval(
             sock,
             SocketAddr::from(([203, 0, 113, 9], 4500)),
             [7; 16],
@@ -186,5 +211,29 @@ mod tests {
         // silent one.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!guard.is_alive(), "a failed beat ends the task");
+        // The stop resolves without waiting for a poll.
+        guard.stopped().expect("the stop is available").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_waits_while_the_heartbeat_runs() {
+        let sock = FailsAfter {
+            ok: std::sync::atomic::AtomicUsize::new(4),
+        };
+        let mut guard = spawn_io_with_interval(
+            sock,
+            SocketAddr::from(([203, 0, 113, 9], 4500)),
+            [7; 16],
+            Duration::from_millis(100),
+        );
+        let stop = guard.stopped().expect("the stop is available");
+        // Four beats succeed, so the stop stays pending through them.
+        tokio::select! {
+            () = stop => panic!("the stop resolved while the task still ran"),
+            () = tokio::time::sleep(Duration::from_millis(250)) => {},
+        }
+        assert!(guard.is_alive(), "the task still runs");
+        // The wait is single-shot: an earlier call took it.
+        assert!(guard.stopped().is_none());
     }
 }
