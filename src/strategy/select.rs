@@ -41,8 +41,8 @@ impl Selection {
             StrategyId::SymProbe => {
                 // A pair routed here with no symmetric side came from a
                 // low-confidence cone reading: success then rests on the
-                // ambiguous NAT's inbound filtering, which the probe does
-                // not measure, so no number is stated.
+                // ambiguous NAT's inbound filtering and allocation walk,
+                // which the probe does not measure, so no number is stated.
                 let either_symmetric =
                     is_symmetric(effective_class(mine)) || is_symmetric(effective_class(peer));
                 either_symmetric.then(|| sym_probe_estimate(mine, peer, self, cfg))
@@ -556,10 +556,19 @@ pub(crate) fn build_plan(
     // PredictiveExchange always, the SymProbe cone side against an easy
     // symmetric peer, and the hard side of a PredictiveBurst pair, whose
     // window covers the easy peer's continuation and moves with its
-    // announced position the same way.
+    // announced position the same way. The SymProbe reply side against an
+    // ambiguous cone peer carries a forward window from the peer's one
+    // observed port, which the announce re-base moves onto the shooter's
+    // live block the same way.
     let predicts_peer = match sel.strategy {
         StrategyId::PredictiveExchange => true,
-        StrategyId::SymProbe => !my_sym && matches!(peer_class, NatClass::EasySym { .. }),
+        StrategyId::SymProbe => {
+            !my_sym
+                && matches!(
+                    peer_class,
+                    NatClass::EasySym { .. } | NatClass::Cone | NatClass::Public
+                )
+        },
         StrategyId::PredictiveBurst => matches!(peer_class, NatClass::EasySym { .. }),
         _ => false,
     };
@@ -929,6 +938,28 @@ mod tests {
         assert_eq!(hard_plan.refresh_v4, Refresh::None);
         assert!(!hard_plan.sequence_marker);
         assert!(hard_plan.predicts_peer);
+
+        // Ambiguous cone against ambiguous cone, a single-IP fan-out on
+        // both sides: neither reading is confident, the pair routes to
+        // SymProbe, and the reply side's forward window re-bases on the
+        // shooter's announce, which names its live block's first port.
+        let ambiguous = |mut info: NatInfo| {
+            info.v4.as_mut().expect("v4 evidence").distinct_probe_ips = 1;
+            info
+        };
+        let (ac, mut bc) = (ambiguous(cone.clone()), ambiguous(cone));
+        // Distinct reflexive IPs, or the pair reads as one shared hairpin
+        // NAT and ConeExchange takes it.
+        bc.v4.as_mut().expect("v4 evidence").reflexive = SocketAddrV4::new(
+            [198, 51, 100, 9].into(),
+            bc.v4.as_ref().expect("v4").reflexive.port(),
+        );
+        let sel = select(&ac, &bc, &cfg).expect("ambiguous cone pair selects");
+        assert_eq!(sel.strategy, StrategyId::SymProbe);
+        let plan = build_plan(&ac, &bc, &sel, 1, [0; 16], Role::Initiator, None, &cfg);
+        assert_eq!(plan.refresh_v4, Refresh::Stun);
+        assert!(!plan.sequence_marker);
+        assert!(plan.predicts_peer, "the forward window rides the announce");
     }
 
     #[test]

@@ -51,7 +51,18 @@ pub(crate) fn stage(
         let targets = match effective_class(peer) {
             NatClass::EasySym { step } => predicted(ip, &v4.alloc_seq, peer_sockets, step)
                 .unwrap_or_else(|| random_spray(ip, peer, peer_sockets, nonce, cfg)),
-            _ => random_spray(ip, peer, peer_sockets, nonce, cfg),
+            // A cone or public reading shows one port for the whole fan-out,
+            // so the span collapses onto the peer's dead probe socket and a
+            // random spray over it cannot reach anything. The shooter's
+            // fresh sockets walk forward from the observed port, so the
+            // window continues that walk at the common unit stride; the
+            // announce re-base slides it when drift moved the walk on.
+            NatClass::Cone | NatClass::Public => {
+                forward_window(ip, v4.reflexive.port(), peer_sockets)
+            },
+            // A hard symmetric peer's live ports spread over its estimated
+            // span, so the spray draws distinct candidates across it.
+            NatClass::HardSym => random_spray(ip, peer, peer_sockets, nonce, cfg),
         };
         let mut stage = StageSpec::send(Family::V4, 1, targets, false, cfg.punch_timeout);
         // A lone socket covers several ports per tick, so the spray runs at
@@ -85,6 +96,25 @@ fn predicted(ip: Ipv4Addr, seq: &[u16], peer_sockets: u16, step: i16) -> Option<
             .map(|port| SocketAddr::V4(SocketAddrV4::new(ip, port)))
             .collect(),
     )
+}
+
+/// Forward continuation for a cone or public peer's fresh sockets.
+///
+/// An endpoint-independent mapping serves every destination of one socket,
+/// so the fan-out observed one port and carries no stride: the window
+/// walks from it at unit stride, sized over the shooter's socket count
+/// with the prediction slack, and the announce re-base moves it onto the
+/// shooter's live block when its allocator has drifted past the probe-time
+/// base.
+fn forward_window(ip: Ipv4Addr, base: u16, peer_sockets: u16) -> Vec<SocketAddr> {
+    let window = peer_sockets as usize + PREDICTION_SLACK;
+    (1..=window)
+        .map_while(|offset| {
+            u16::try_from(u32::from(base) + offset as u32)
+                .ok()
+                .map(|port| SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        })
+        .collect()
 }
 
 /// Distinct random candidates over the HardSym peer's estimated span.
@@ -142,5 +172,33 @@ mod tests {
         assert_eq!(stage.targets.len(), 8 + PREDICTION_SLACK);
         let ports: Vec<u16> = stage.targets.iter().map(SocketAddr::port).collect();
         assert_eq!(&ports[..4], &[5012, 5014, 5016, 5018]);
+    }
+
+    /// A cone peer shows one port for the whole fan-out, so its span
+    /// collapses onto the dead probe socket; the window walks forward
+    /// from that port instead, covering the shooter's fresh block.
+    #[test]
+    fn cone_peer_window_walks_forward_from_the_observed_port() {
+        let peer = NatInfo {
+            v4: Some(V4Nat {
+                class: NatClass::Cone,
+                reflexive: SocketAddrV4::new([203, 0, 113, 7].into(), 1024),
+                alloc_seq: vec![1024, 1024, 1024, 1024],
+                distinct_probe_ips: 1,
+                filtering: FilterClass::AddressPortDependent,
+                hairpin: true,
+            }),
+            v6: None,
+            local: Vec::new(),
+        };
+        let cfg = PunchConfig::default();
+        let stage = stage(false, 1, 16, &peer, [0; 16], &cfg).expect("stage builds");
+        assert_eq!(stage.targets.len(), 16 + PREDICTION_SLACK);
+        let ports: Vec<u16> = stage.targets.iter().map(SocketAddr::port).collect();
+        assert_eq!(*ports.first().expect("nonempty"), 1025);
+        assert_eq!(
+            *ports.last().expect("nonempty"),
+            1024 + 16 + PREDICTION_SLACK as u16
+        );
     }
 }
