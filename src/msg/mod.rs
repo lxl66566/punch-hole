@@ -16,7 +16,7 @@ use crate::nat::{FilterClass, NatClass};
 /// Wire protocol version shared by both planes. Frames stamped with a
 /// different version are rejected, so incompatible layouts never decode
 /// halfway.
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 /// First byte of every data-plane packet.
 pub const DATA_MAGIC: u8 = 0x70;
 /// Signaling frames longer than this are rejected.
@@ -25,8 +25,8 @@ pub const MAX_SIG_FRAME: usize = 1024;
 pub const MAX_DATA_PACKET: usize = 64;
 /// Smallest legal data packet: the magic byte, the version byte, one
 /// byte of variant ordinal, and the 16 nonce bytes every variant carries.
-/// `Ack` and `Keepalive` carry nothing beyond the nonce, so they encode
-/// to exactly this size.
+/// `Keepalive` carries nothing beyond the nonce, so it encodes to exactly
+/// this size.
 pub(crate) const MIN_DATA_PACKET: usize = 2 + 1 + size_of::<Nonce>();
 /// Upper bound on `alloc_seq` entries.
 pub const MAX_ALLOC_SEQ: usize = 64;
@@ -109,10 +109,27 @@ pub struct Offer {
 /// Data-plane packet bodies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataPacket {
-    Syn { nonce: Nonce, socket: u16 },
-    SynAck { nonce: Nonce, socket: u16 },
-    Ack { nonce: Nonce },
-    Keepalive { nonce: Nonce },
+    Syn {
+        nonce: Nonce,
+        socket: u16,
+    },
+    SynAck {
+        nonce: Nonce,
+        socket: u16,
+    },
+    /// Third leg of the handshake. `socket` is the sender's own socket,
+    /// so the Ack names both ends of the exchange it closes: its landing
+    /// address already selects the receiver, and the field selects the
+    /// sender. A wire that reorders packets runs several parallel
+    /// exchanges at once; the named pair lets both ends arbitrate their
+    /// confirmations onto the same socket pair.
+    Ack {
+        nonce: Nonce,
+        socket: u16,
+    },
+    Keepalive {
+        nonce: Nonce,
+    },
 }
 
 impl DataPacket {
@@ -122,7 +139,7 @@ impl DataPacket {
         match self {
             DataPacket::Syn { nonce, .. }
             | DataPacket::SynAck { nonce, .. }
-            | DataPacket::Ack { nonce }
+            | DataPacket::Ack { nonce, .. }
             | DataPacket::Keepalive { nonce } => *nonce,
         }
     }
@@ -316,7 +333,10 @@ mod tests {
                 nonce: [2; 16],
                 socket: 511,
             },
-            DataPacket::Ack { nonce: [3; 16] },
+            DataPacket::Ack {
+                nonce: [3; 16],
+                socket: 7,
+            },
             DataPacket::Keepalive { nonce: [4; 16] },
         ];
         for packet in cases {
@@ -415,14 +435,21 @@ mod tests {
 
     #[test]
     fn data_packets_never_encode_below_the_minimum() {
-        let ack = encode_packet(&DataPacket::Ack { nonce: [0; 16] });
+        let ack = encode_packet(&DataPacket::Ack {
+            nonce: [0; 16],
+            socket: 3,
+        });
         let keepalive = encode_packet(&DataPacket::Keepalive { nonce: [0; 16] });
-        assert_eq!(ack.len(), MIN_DATA_PACKET);
         assert_eq!(keepalive.len(), MIN_DATA_PACKET);
+        assert!(ack.len() > MIN_DATA_PACKET);
         // Every proper prefix of a legal packet is garbage, including the
         // one-byte-short prefix.
         assert_eq!(
             decode_packet(&ack[..ack.len() - 1]),
+            Err(DecodeError::BadFrame)
+        );
+        assert_eq!(
+            decode_packet(&keepalive[..keepalive.len() - 1]),
             Err(DecodeError::BadFrame)
         );
     }

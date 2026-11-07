@@ -89,7 +89,10 @@ fn decoders_survive_random_and_edge_inputs() {
         socket: 3,
     });
     foreign_version[1] = 9;
-    let mut short = encode_packet(&DataPacket::Ack { nonce: [0x5a; 16] });
+    let mut short = encode_packet(&DataPacket::Ack {
+        nonce: [0x5a; 16],
+        socket: 4,
+    });
     short.truncate(short.len() - 1);
     assert_eq!(
         decode_packet(&foreign_version),
@@ -169,7 +172,10 @@ fn decoders_survive_random_and_edge_inputs() {
         nonce: [0x66; 16],
         socket: 2047,
     });
-    let ack = encode_packet(&DataPacket::Ack { nonce: [0x55; 16] });
+    let ack = encode_packet(&DataPacket::Ack {
+        nonce: [0x55; 16],
+        socket: 2046,
+    });
     let keepalive = encode_packet(&DataPacket::Keepalive { nonce: [0x44; 16] });
     // The anchors round-trip before mutation, so failures point at the
     // mutation and not at the corpus itself.
@@ -189,7 +195,8 @@ fn decoders_survive_random_and_edge_inputs() {
         socket: 2047
     });
     assert_eq!(decode_packet(&ack).unwrap(), DataPacket::Ack {
-        nonce: [0x55; 16]
+        nonce: [0x55; 16],
+        socket: 2046
     });
     assert_eq!(decode_packet(&keepalive).unwrap(), DataPacket::Keepalive {
         nonce: [0x44; 16]

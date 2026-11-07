@@ -541,7 +541,10 @@ async fn stale_attempt_injection_is_counted_and_ignored() {
         nonce: wrong,
         socket: 9,
     });
-    let ack = encode_packet(&DataPacket::Ack { nonce: wrong });
+    let ack = encode_packet(&DataPacket::Ack {
+        nonce: wrong,
+        socket: 0,
+    });
     for _ in 0..ROUNDS {
         attacker.send_to(&syn, b_ext).await.expect("syn injects");
         attacker.send_to(&ack, b_ext).await.expect("ack injects");

@@ -376,8 +376,16 @@ fn sym_probe_estimate(mine: &NatInfo, peer: &NatInfo, sel: &Selection, cfg: &Pun
 }
 
 /// The full stage list one side executes.
+// The booleans are independent plan facts a strategy mixes freely, not
+// states of one axis, so they stay flags.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ExecPlan {
     pub stages: Vec<StageSpec>,
+    /// Whether this side is the attempt's Initiator. The handshake's pair
+    /// arbitration ranks a pair with the Initiator's socket first, so both
+    /// ends order their candidate pairs identically without exchanging
+    /// anything beyond the Ack's socket field.
+    pub initiator: bool,
     /// How the announced V4 socket-0 port is learned.
     pub refresh_v4: Refresh,
     /// Whether a non-reply V6 stage runs, whose socket-0 port gets
@@ -575,6 +583,7 @@ pub(crate) fn build_plan(
 
     ExecPlan {
         stages,
+        initiator: role == crate::report::Role::Initiator,
         refresh_v4,
         announce_v6,
         refresh_server,

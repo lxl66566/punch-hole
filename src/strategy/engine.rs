@@ -161,6 +161,18 @@ const REFRESH_ATTEMPTS: u8 = 4;
 /// below it, because real keys scale with both sides' socket counts.
 const MAX_SYN_REPLY_KEYS: usize = 1024;
 
+/// Canonical rank of one handshake pair, the Initiator's socket first.
+///
+/// Under reordering both ends hold two candidate pairs, each from its own
+/// side of them; the role-ordered key names the same winner for both, so
+/// the ends converge on one pair whatever order the evidence arrived in.
+/// Ordering by role rather than by value keeps two mirrored pairs — each
+/// end's socket 0 against the other's socket 6 — two different pairs
+/// instead of one shared key neither side yields on.
+fn pair_key(pair: (u16, u16), initiator: bool) -> (u16, u16) {
+    if initiator { pair } else { (pair.1, pair.0) }
+}
+
 /// Stage progression: which stage runs and where its sweep stands.
 struct Progress {
     stage_idx: usize,
@@ -179,10 +191,12 @@ struct Progress {
 /// `confirmed` is set once and never cleared; from that point the
 /// candidate stays where the confirmation found it, and only the
 /// winner's own exchange may still move `peer_addr` and `peer_socket`.
+/// A pair arbitration in [`Engine::on_ack`] may still replace the
+/// confirmed pair, when the peer's Ack proves a canonically smaller one
+/// both ends then hold.
 struct Handshake {
     candidate: Option<(Family, u16)>,
     confirmed: Option<(Family, u16)>,
-    peer_confirmed: bool,
     peer_socket: Option<u16>,
     peer_addr: Option<SocketAddr>,
     grace_end: Option<tokio::time::Instant>,
@@ -272,7 +286,6 @@ impl<S: UdpIo> Engine<S> {
             handshake: Handshake {
                 candidate: None,
                 confirmed: None,
-                peer_confirmed: false,
                 peer_socket: None,
                 peer_addr: None,
                 grace_end: None,
@@ -519,9 +532,7 @@ impl<S: UdpIo> Engine<S> {
 
     fn finished(&self, now: tokio::time::Instant) -> bool {
         self.handshake.confirmed.is_some()
-            && (self.handshake.finish_now
-                || self.handshake.peer_confirmed
-                || self.handshake.grace_end.is_some_and(|g| now >= g))
+            && (self.handshake.finish_now || self.handshake.grace_end.is_some_and(|g| now >= g))
     }
 
     /// Routes a handshake send failure.
@@ -724,8 +735,14 @@ impl<S: UdpIo> Engine<S> {
                 }
                 self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
                 let resend_ack = if let Some((family, idx)) = self.handshake.confirmed {
-                    // The peer missed our Ack; answer again while grace runs.
-                    family == ev.family && idx == ev.socket
+                    // The peer missed the Ack of the confirmed pair; answer
+                    // again while grace runs. A SynAck from any other peer
+                    // socket belongs to a parallel exchange this side never
+                    // committed to, and answering it would mint the peer a
+                    // second confirmed pair.
+                    family == ev.family
+                        && idx == ev.socket
+                        && self.handshake.peer_socket == Some(socket)
                 } else {
                     self.handshake.confirmed = Some((ev.family, ev.socket));
                     self.announce.winner = Some(ev.socket);
@@ -733,7 +750,10 @@ impl<S: UdpIo> Engine<S> {
                     true
                 };
                 if resend_ack {
-                    let buf = encode_packet(&DataPacket::Ack { nonce });
+                    let buf = encode_packet(&DataPacket::Ack {
+                        nonce,
+                        socket: ev.socket,
+                    });
                     if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
                         && let Some(e) = self.send_failed(e)
                     {
@@ -742,7 +762,9 @@ impl<S: UdpIo> Engine<S> {
                     self.handshake.next_reply = now + self.cfg.confirm_retry;
                 }
             },
-            DataPacket::Ack { .. } => self.on_ack(ev.from, ev.family, ev.socket, now),
+            DataPacket::Ack { socket, .. } => {
+                self.on_ack(socket, ev.from, ev.family, ev.socket, now);
+            },
         }
         Ok(())
     }
@@ -764,31 +786,88 @@ impl<S: UdpIo> Engine<S> {
     ///
     /// An Ack only counts on a socket that answered a Syn from the
     /// Ack's host: the answer and the Ack together prove the exchange
-    /// ran on that socket, and the socket the Ack landed on is the
-    /// winner it proves. An Ack anywhere else answers a handshake this
-    /// side never ran, so it moves nothing.
-    fn on_ack(&mut self, from: SocketAddr, family: Family, socket: u16, now: tokio::time::Instant) {
-        if self.handshake.confirmed.is_none() {
-            if self.answered_syn(socket, from) {
-                self.observe_addr(from, now);
-                self.handshake.confirmed = Some((family, socket));
-                self.announce.winner = Some(socket);
-                // The final Ack proves both directions, so no grace wait
-                // applies on this path.
-                self.handshake.finish_now = true;
-            }
-        } else if self.handshake.confirmed == Some((family, socket)) {
-            self.observe_addr(from, now);
-            self.handshake.finish_now = true;
+    /// ran on that socket, and the socket the Ack landed on is the one
+    /// end of the pair it proves, the Ack's field the other. An Ack
+    /// anywhere else answers a handshake this side never ran, so it
+    /// moves nothing.
+    ///
+    /// A reordering wire runs several parallel exchanges, so both ends
+    /// can hold differently confirmed pairs. The Ack names its pair, and
+    /// both candidate pairs arbitrate under [`pair_key`], which ranks
+    /// them identically on both ends; the winner's retransmissions carry
+    /// the decision across the loss that hid the first exchange.
+    fn on_ack(
+        &mut self,
+        peer_socket: u16,
+        from: SocketAddr,
+        family: Family,
+        socket: u16,
+        now: tokio::time::Instant,
+    ) {
+        if !self.answered_syn(socket, from) {
+            return;
         }
+        let offered = (socket, peer_socket);
+        match self.handshake.confirmed {
+            None => self.ack_confirms(offered, from, family, now),
+            Some((my_family, my_socket)) => {
+                if my_family != family {
+                    // Families elect separately; an Ack across families
+                    // answers an exchange this side's plan never ran.
+                    return;
+                }
+                let mine = (my_socket, self.handshake.peer_socket.unwrap_or(my_socket));
+                if offered == mine {
+                    // The peer's retransmission answers the pair this side
+                    // already holds: the ends agree, so the wait ends.
+                    self.observe_addr(from, now);
+                    self.handshake.finish_now = true;
+                } else if pair_key(offered, self.plan.initiator)
+                    < pair_key(mine, self.plan.initiator)
+                {
+                    self.ack_confirms(offered, from, family, now);
+                }
+                // The local pair wins the arbitration and stands.
+            },
+        }
+    }
+
+    /// Adopts a pair a validated Ack fully proved: the landing socket
+    /// answered the peer's Syn, and the Ack's field names the peer socket
+    /// whose SynAck this side answered, so both directions of the
+    /// exchange ran.
+    ///
+    /// One Ack proves the exchange ran, not that the peer settled on it:
+    /// under reordering the peer's own evidence can still arbitrate this
+    /// pair away. The grace window keeps this side answering its current
+    /// pair, and only a repeated Ack of the same pair — the retransmit
+    /// stream returning what this side holds — ends the wait early.
+    fn ack_confirms(
+        &mut self,
+        pair: (u16, u16),
+        from: SocketAddr,
+        family: Family,
+        now: tokio::time::Instant,
+    ) {
+        self.observe_addr(from, now);
+        self.handshake.confirmed = Some((family, pair.0));
+        self.handshake.peer_socket = Some(pair.1);
+        self.announce.winner = Some(pair.0);
+        self.handshake
+            .grace_end
+            .get_or_insert((now + self.cfg.grace).min(self.overall));
     }
 
     fn on_signaling(&mut self, body: &Frame) -> Result<(), PunchError> {
         match *body {
             Frame::Abort(reason) => Err(PunchError::PeerAborted(reason)),
             Frame::Confirmed { socket } => {
-                self.handshake.peer_confirmed = true;
-                self.handshake.peer_socket = Some(socket);
+                // The peer's winner is advisory: this side's exchange view
+                // of the peer socket is the evidence its own handshake
+                // proved, and overwriting it would hide a pair the
+                // arbitration has not settled yet. Only a viewless side
+                // adopts the announcement.
+                self.handshake.peer_socket.get_or_insert(socket);
                 Ok(())
             },
             Frame::PortUpdate { v4, v6 } => {
@@ -1084,12 +1163,19 @@ impl<S: UdpIo> Engine<S> {
                     self.handshake.next_reply = now + self.cfg.confirm_retry;
                 }
             }
+            // The grace Ack retransmits the confirmed pair: under
+            // reordering the two ends can hold differently confirmed
+            // pairs, and this stream is what carries each side's pair to
+            // the other for the arbitration, so it runs until the loop
+            // exits on agreement or grace, never cut short.
             if let Some((family, idx)) = self.handshake.confirmed
                 && self.handshake.grace_end.is_some()
-                && !self.handshake.peer_confirmed
                 && now >= self.handshake.next_reply
             {
-                let buf = encode_packet(&DataPacket::Ack { nonce: self.nonce });
+                let buf = encode_packet(&DataPacket::Ack {
+                    nonce: self.nonce,
+                    socket: idx,
+                });
                 if pool.send(family, idx, &buf, peer).await.is_ok() {
                     self.handshake.next_reply = now + self.cfg.confirm_retry;
                 }
@@ -1110,6 +1196,7 @@ mod tests {
     fn exec_plan(stages: Vec<StageSpec>) -> ExecPlan {
         ExecPlan {
             stages,
+            initiator: true,
             refresh_v4: Refresh::None,
             announce_v6: false,
             refresh_server: None,
@@ -1453,16 +1540,25 @@ mod tests {
             cfg.punch_timeout,
         )]);
         let mut engine: Engine<tokio::net::UdpSocket> =
-            Engine::new(plan, cfg, [0; 16], tokio::time::Instant::now());
+            Engine::new(plan, cfg.clone(), [0; 16], tokio::time::Instant::now());
         let now = tokio::time::Instant::now();
 
         // Handshake traffic from two peer sockets on two local sockets.
         engine.observe_peer(5, addr(50_001), now, Family::V4, 1);
         engine.handshake.candidate = Some((Family::V4, 1));
         // The first complete handshake elects local socket 0 with peer
-        // socket 2, mirroring the SynAck confirm path.
+        // socket 2, mirroring the SynAck confirm path. Both sockets
+        // answered Syns from the peer host.
         engine.observe_peer(2, addr(50_002), now, Family::V4, 0);
         engine.handshake.confirmed = Some((Family::V4, 0));
+        engine
+            .handshake
+            .syn_replies
+            .insert((0, addr(50_002)), now + cfg.confirm_retry);
+        engine
+            .handshake
+            .syn_replies
+            .insert((3, addr(50_009)), now + cfg.confirm_retry);
 
         // Late Syn pulses from the peer's other sockets during grace.
         engine.observe_peer(9, addr(50_009), now, Family::V4, 3);
@@ -1470,13 +1566,14 @@ mod tests {
         assert_eq!(engine.handshake.peer_addr, Some(addr(50_002)));
         assert_eq!(engine.handshake.peer_socket, Some(2));
 
-        // A stray Ack for another local socket finishes nothing.
-        engine.on_ack(addr(50_009), Family::V4, 3, now);
+        // A stray Ack for another local socket finishes nothing: its pair
+        // loses the arbitration against the confirmed one.
+        engine.on_ack(9, addr(50_009), Family::V4, 3, now);
         assert!(!engine.handshake.finish_now);
         assert_eq!(engine.handshake.peer_addr, Some(addr(50_002)));
 
         // The winner's own handshake still refreshes and finishes.
-        engine.on_ack(addr(50_002), Family::V4, 0, now);
+        engine.on_ack(2, addr(50_002), Family::V4, 0, now);
         assert!(engine.handshake.finish_now);
         assert_eq!(engine.handshake.peer_addr, Some(addr(50_002)));
     }
@@ -2213,18 +2310,219 @@ mod tests {
         // An Ack from a host no socket answered moves nothing, whatever
         // socket it lands on.
         let foreign = at(Ipv4Addr::new(198, 51, 100, 99), 50_009);
-        engine.on_ack(foreign, Family::V4, 0, now);
+        engine.on_ack(7, foreign, Family::V4, 0, now);
         assert!(engine.handshake.confirmed.is_none());
         assert!(!engine.handshake.finish_now);
 
         // The Ack on socket 0 crowns socket 0 through a fresh mapping
         // port of the answered host, the symmetric peer's shape, not the
-        // candidate socket 1.
+        // candidate socket 1, and the Ack's field names the peer socket
+        // of the confirmed pair.
         let fresh_port = at(peer, 50_077);
-        engine.on_ack(fresh_port, Family::V4, 0, now);
+        engine.on_ack(4, fresh_port, Family::V4, 0, now);
         assert_eq!(engine.handshake.confirmed, Some((Family::V4, 0)));
+        assert_eq!(engine.handshake.peer_socket, Some(4));
         assert_eq!(engine.announce.winner, Some(0));
-        assert!(engine.handshake.finish_now);
+        assert!(
+            engine.handshake.grace_end.is_some(),
+            "one Ack proves the exchange, not the peer's settlement"
+        );
+        assert!(!engine.handshake.finish_now);
         assert_eq!(engine.handshake.peer_addr, Some(fresh_port));
+
+        // The peer's retransmission of the same pair is the agreement:
+        // only it ends the wait early.
+        engine.on_ack(4, fresh_port, Family::V4, 0, now);
+        assert!(engine.handshake.finish_now);
+    }
+
+    /// Two ends of a reordering exchange hold differently confirmed
+    /// pairs; the crossing Acks each name their pair, and the canonical
+    /// key converges both ends onto the same one, whatever side of it
+    /// each sits on.
+    #[test]
+    fn crossing_acks_arbitrate_both_ends_onto_one_pair() {
+        use std::net::SocketAddrV4;
+        let at = |ip: Ipv4Addr, port: u16| SocketAddr::V4(SocketAddrV4::new(ip, port));
+        let cfg = PunchConfig::default();
+        let now = tokio::time::Instant::now();
+        let mut a: Engine<tokio::net::UdpSocket> = Engine::new(
+            exec_plan(vec![StageSpec::reply(Family::V4, cfg.punch_timeout)]),
+            cfg.clone(),
+            [0; 16],
+            now + cfg.punch_timeout,
+        );
+        let mut b: Engine<tokio::net::UdpSocket> = Engine::new(
+            exec_plan(vec![StageSpec::reply(Family::V4, cfg.punch_timeout)]),
+            cfg.clone(),
+            [0; 16],
+            now + cfg.punch_timeout,
+        );
+        b.plan.initiator = false;
+
+        // Each end confirmed the first exchange it saw complete: the
+        // initiator holds its socket 5 against the responder's socket 2,
+        // the responder its socket 7 against the initiator's socket 3,
+        // and both exchanges really ran on the Acks' landing sockets.
+        a.handshake.confirmed = Some((Family::V4, 5));
+        a.handshake.peer_socket = Some(2);
+        a.handshake.syn_replies.insert(
+            (3, at(Ipv4Addr::new(203, 0, 113, 9), 60_001)),
+            now + cfg.confirm_retry,
+        );
+        b.handshake.confirmed = Some((Family::V4, 7));
+        b.handshake.peer_socket = Some(3);
+        b.handshake.syn_replies.insert(
+            (2, at(Ipv4Addr::new(198, 51, 100, 4), 60_002)),
+            now + cfg.confirm_retry,
+        );
+
+        // The Acks cross on the wire, each landing on the socket the
+        // other side's exchange ran on and naming the sender of it.
+        a.on_ack(
+            7,
+            at(Ipv4Addr::new(203, 0, 113, 9), 60_001),
+            Family::V4,
+            3,
+            now,
+        );
+        b.on_ack(
+            5,
+            at(Ipv4Addr::new(198, 51, 100, 4), 60_002),
+            Family::V4,
+            2,
+            now,
+        );
+
+        // The pair (3, 7) ranks below (5, 2) with the initiator's socket
+        // first, so the initiator adopts it and the responder keeps it:
+        // both ends now sit on the same socket pair, each from its own
+        // side. Neither finishes on one Ack alone; the adopted pair's
+        // retransmission would.
+        assert_eq!(a.handshake.confirmed, Some((Family::V4, 3)));
+        assert_eq!(a.handshake.peer_socket, Some(7));
+        assert_eq!(b.handshake.confirmed, Some((Family::V4, 7)));
+        assert_eq!(b.handshake.peer_socket, Some(3));
+        assert!(!a.handshake.finish_now);
+        assert!(!b.handshake.finish_now);
+    }
+
+    /// Mirrored pairs — each end's socket 0 confirmed against the other's
+    /// socket 6 — are two different pairs that an unordered key would
+    /// rank equal, leaving both ends holding their own and delivering
+    /// into a socket the other dropped. The role-ordered key breaks the
+    /// deadlock toward the initiator's pair.
+    #[test]
+    fn mirrored_pairs_break_the_deadlock_toward_the_initiator() {
+        use std::net::SocketAddrV4;
+        let at = |port: u16| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), port));
+        let cfg = PunchConfig::default();
+        let now = tokio::time::Instant::now();
+        let mut init: Engine<tokio::net::UdpSocket> = Engine::new(
+            exec_plan(vec![StageSpec::reply(Family::V4, cfg.punch_timeout)]),
+            cfg.clone(),
+            [0; 16],
+            now + cfg.punch_timeout,
+        );
+        let mut resp: Engine<tokio::net::UdpSocket> = Engine::new(
+            exec_plan(vec![StageSpec::reply(Family::V4, cfg.punch_timeout)]),
+            cfg.clone(),
+            [0; 16],
+            now + cfg.punch_timeout,
+        );
+        resp.plan.initiator = false;
+
+        // Both ends hold their own socket 0 against the other's socket 6.
+        init.handshake.confirmed = Some((Family::V4, 0));
+        init.handshake.peer_socket = Some(6);
+        init.handshake
+            .syn_replies
+            .insert((6, at(60_001)), now + cfg.confirm_retry);
+        resp.handshake.confirmed = Some((Family::V4, 0));
+        resp.handshake.peer_socket = Some(6);
+        resp.handshake
+            .syn_replies
+            .insert((6, at(60_002)), now + cfg.confirm_retry);
+
+        // The responder's Ack from its socket 0 lands on the initiator's
+        // socket 6: its pair loses the arbitration, so the initiator
+        // stands. The initiator's Ack from its socket 0 lands on the
+        // responder's socket 6: its pair wins, so the responder adopts.
+        init.on_ack(0, at(60_002), Family::V4, 6, now);
+        resp.on_ack(0, at(60_001), Family::V4, 6, now);
+        assert_eq!(init.handshake.confirmed, Some((Family::V4, 0)));
+        assert_eq!(init.handshake.peer_socket, Some(6));
+        assert_eq!(resp.handshake.confirmed, Some((Family::V4, 6)));
+        assert_eq!(resp.handshake.peer_socket, Some(0));
+
+        // The initiator's retransmission of its surviving pair is the
+        // agreement the responder waits for.
+        resp.on_ack(0, at(60_001), Family::V4, 6, now);
+        assert!(resp.handshake.finish_now);
+    }
+
+    /// A SynAck that belongs to a parallel exchange earns no Ack once a
+    /// pair is confirmed: answering it would mint the peer a second
+    /// confirmed pair. The confirmed pair's own SynAck still re-answers
+    /// while grace runs.
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn synack_reack_answers_only_the_confirmed_peer_socket() {
+        use crate::socket::{RecvEvent, SocketPool};
+
+        let cfg = PunchConfig::default();
+        let peer = SocketAddr::from(([203, 0, 113, 9], 40_000));
+        let plan = exec_plan(vec![StageSpec::send(
+            Family::V4,
+            1,
+            vec![peer],
+            false,
+            cfg.punch_timeout,
+        )]);
+        let mut engine: Engine<nat_lab::sim::SimSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let net = nat_lab::sim::Net::seeded("reack_guard");
+        let host = net.public_host();
+        let (pool, _events) = SocketPool::bind(&host, &cfg, 1, 0)
+            .await
+            .expect("pool binds");
+
+        let now = tokio::time::Instant::now();
+        engine.observe_peer(2, peer, now, Family::V4, 0);
+        engine.handshake.confirmed = Some((Family::V4, 0));
+        engine.handshake.peer_socket = Some(2);
+        engine.handshake.grace_end = Some(now + cfg.grace);
+
+        let event = |socket: u16| {
+            let synack = encode_packet(&DataPacket::SynAck {
+                nonce: [0; 16],
+                socket,
+            });
+            let mut buf = [0u8; crate::msg::MAX_DATA_PACKET];
+            buf[..synack.len()].copy_from_slice(&synack);
+            RecvEvent {
+                family: Family::V4,
+                socket: 0,
+                from: peer,
+                len: synack.len(),
+                buf,
+            }
+        };
+
+        engine
+            .on_data(&pool, event(9))
+            .await
+            .expect("parallel synack drains");
+        assert_eq!(pool.sent(), 0, "no Ack for another peer socket");
+
+        engine
+            .on_data(&pool, event(2))
+            .await
+            .expect("confirmed synack answers");
+        assert_eq!(pool.sent(), 1, "the confirmed pair re-answers");
     }
 }

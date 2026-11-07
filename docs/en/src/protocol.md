@@ -29,7 +29,7 @@ Durations travel as plain millisecond integers. The API accepts `Duration` and c
 
 ## Versioning
 
-Both sides must run the same `VERSION`, currently 4. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
+Both sides must run the same `VERSION`, currently 5. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
 
 Adding a variant requires the bump just as much. postcard cannot tell an unknown variant index from corrupt bytes, so an old peer that receives a frame carrying a newer variant sees a plain decode error: on the signaling plane the frame is skipped and the peer burns to a phase timeout without ever learning of the mismatch. The version discipline is the only guard on that plane. The data plane checks the version byte before the body, so the first foreign-version packet fails the session with `VersionMismatch` on the spot.
 
@@ -159,7 +159,7 @@ pub struct Offer {
 
 **PortUpdate** names the fresh external port of the sender's punch socket, one slot per family. The reflexive address from Probe belongs to the closed probe socket, so fixed-port stages wait for this frame. A public or IPv6 sender reads its own local address, and a cone-mapped sender re-queries STUN on the punch socket itself. A symmetric sender with a confident stride has no single port its peer can aim at, so its V4 slot carries a different reading: the port marks the sender's current allocation position, which a prediction-bearing peer moves its fitted window onto. Both readings key on the negotiated strategy, so the frame keeps one shape. The frame re-sends on the signaling retry cadence until the sender's handshake completes.
 
-**Confirmed** announces that the sender finished the data-plane handshake and names its winning socket index. It stops the peer's pulse phase early and ends the sender-side grace responder.
+**Confirmed** announces that the sender finished the data-plane handshake and names its winning socket index. The announcement is advisory: the peer's own handshake evidence rules what it elects, and a side that never learned the peer's socket from its exchange adopts the announced index for its report. The arbitration below can replace a winner after its first announcement, so a side may send the frame more than once with a later index.
 
 **Abort** tells the peer the sender stopped and why. The peer fails fast with `PeerAborted(reason)` instead of draining its deadlines.
 
@@ -171,12 +171,12 @@ Frame handling is idempotent. A duplicated frame is ignored, and a frame from a 
 pub enum DataPacket {
     Syn { nonce: Nonce, socket: u16 },
     SynAck { nonce: Nonce, socket: u16 },
-    Ack { nonce: Nonce },
+    Ack { nonce: Nonce, socket: u16 },
     Keepalive { nonce: Nonce },
 }
 ```
 
-Every packet carries the attempt nonce, and the receive path validates it before any handshake action, which discards stale packets from earlier attempts between the same hosts. The `socket` field names the sender's pool index, which the reports use to say which of the peer's sockets won.
+Every packet carries the attempt nonce, and the receive path validates it before any handshake action, which discards stale packets from earlier attempts between the same hosts. The `socket` field names the sender's own pool index: `Syn` and `SynAck` say which socket the packet left, and `Ack` says which socket closed the exchange, so the reports can name which of the peer's sockets won.
 
 The confirmation handshake runs on the winner path itself:
 
@@ -184,12 +184,12 @@ The confirmation handshake runs on the winner path itself:
 Initiator socket k                    Responder socket m
    |---- Syn {nonce, k} -------------->|   repeated
    |<--- SynAck {nonce, m} ------------|   repeated
-   |---- Ack {nonce} ----------------->|   repeated until Confirmed or grace end
+   |---- Ack {nonce, k} --------------->|   repeated through the grace window
 ```
 
-`Syn` proves Initiator to Responder. `SynAck` proves the reverse direction, and the Initiator is confirmed the moment one arrives from the peer's own address, the host its stages aimed their `Syn` pulses at; an answer from any other host confirms nothing. The final `Ack` proves the forward direction again and confirms the Responder on the socket it landed on, which is the socket that answered a `Syn` from the Ack's host, so a scan across the Responder's sockets confirms only the path it actually ran. `Syn` and `SynAck` repeat on the confirm retry timer, and the grace responder answers repeated `SynAck` after the Initiator is confirmed, so a peer that is still waiting always gets its answer.
+`Syn` proves one direction, `SynAck` the reverse, and a side that receives a targeted `SynAck` holds its own receiving socket confirmed for that exchange. The `Ack` names both ends of the exchange it closes: its landing address already selects the receiver, and its `socket` field selects the sender, so one packet identifies the whole pair. An Ack only counts on a socket that answered a `Syn` from the Ack's host, so a scan across the peer's sockets confirms only paths that actually ran.
 
-Each side closes its loser sockets at its own confirmation.
+A reordering wire runs several of these exchanges in parallel, and each end can first see a different one complete, so both ends can hold differently confirmed pairs. The pairs arbitrate: each side ranks its held pair and the pair a valid Ack offers under one canonical key, the Initiator's socket first, which both ends compute identically from the role alone, and the smaller key wins. The grace `Ack` retransmissions stream each side's current pair to the other, so the arbitration converges both ends onto the same pair whatever order the evidence arrived in, and a repeated Ack of the pair a side already holds is the mutual agreement that ends its wait early — the grace window bounds the wait otherwise. Each side closes its loser sockets only when its session ends.
 
 **Keepalive** holds the NAT mapping open after handover. Hosts discard any datagram whose first byte is `0x70` and whose length stays at or under 64 bytes; `msg::is_protocol_packet` implements that predicate.
 
