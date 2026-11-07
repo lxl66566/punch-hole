@@ -61,11 +61,11 @@ let host = net.host(nat_lab::NatSpec::cone_apdf());  // 挂在 NAT 后面
 | 套件 | 覆盖 |
 |---|---|
 | `sim_contract.rs` | 信令契约：桥关闭、双发起方、版本不匹配、垃圾帧、有损与重复帧、超大 Offer |
-| `sim_hostile.rs` | 恶劣数据面上的打洞会话：丢包、抖动、重复、慢链路，以及 Accept 被延迟造成的起始错峰 |
-| `sim_probe.rs` | 模拟器上的分类：锥形、易对称、难对称、公网、超时、缓存、扇出顺序 |
+| `sim_hostile.rs` | 恶劣数据面上的打洞会话：丢包、抖动、重复、重复加延迟的组合线路、快速失败并释放资源的全黑线路、慢链路，以及 Accept 或 Offer 被延迟造成的起始错峰，含丢包线路上的 CGNAT 链 |
+| `sim_probe.rs` | 模拟器上的分类：锥形、易对称、难对称、公网、超时、缓存、扇出顺序，另含共享 NAT 与 CGNAT 链形态的完整打洞会话 |
 | `sim_strategy.rs` | 每策略一个套件，含 64 种子的蒙特卡洛运行，校验生日攻击实测命中率与模型估算 |
 | `sim_resource.rs` | 限速、预算与连接跟踪耗尽、每条退出路径的清理、丢弃 future |
-| `natlab_matrix.rs` | 同一套策略矩阵跑在两个 NAT 实验室的真实套接字上，外加映射卫生与有损转发器一遍 |
+| `natlab_matrix.rs` | 同一套策略矩阵跑在两个 NAT 实验室的真实套接字上，外加映射卫生、有损转发器一遍与嵌套实验室上的 CGNAT 链 |
 | `real_smoke.rs` | LocalStun 辅助器、回环直连、IPv6 会话用例、Windows 独立端口规则、胜者交付 |
 | `decoder_corpus.rs` | 数千个变异缓冲区过两个解码器，无 panic 无挂起 |
 

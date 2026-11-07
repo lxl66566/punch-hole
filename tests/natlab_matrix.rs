@@ -307,6 +307,52 @@ async fn easy_sym_pair_punches_via_predictions_over_two_nat_labs() {
     assert_business(&pa, &pb).await;
 }
 
+/// A home NAT behind each of two carrier NATs, the real-socket form of a
+/// CGNAT chain: the probe must learn the true external address through
+/// STUN across two forwarders, the punch rides the carrier-side mapping,
+/// and the reflexive evidence names the carrier address, not the home
+/// lab's display label.
+#[tokio::test]
+async fn cgnat_chain_pair_punches_through_nested_labs() {
+    let stun = natlab::stun_responder().expect("stun responder binds");
+    let carrier_a = NatLab::spawn("cgnat_chain_carrier_a", NatSpec::cone_eif())
+        .await
+        .expect("carrier a spawns");
+    let carrier_b = NatLab::spawn("cgnat_chain_carrier_b", NatSpec::cone_eif())
+        .await
+        .expect("carrier b spawns");
+    let home_a = NatLab::spawn_behind(&carrier_a, "cgnat_chain_home_a", NatSpec::cone_eif())
+        .await
+        .expect("home a spawns");
+    let home_b = NatLab::spawn_behind(&carrier_b, "cgnat_chain_home_b", NatSpec::cone_eif())
+        .await
+        .expect("home b spawns");
+    let cfg = lab_config(&stun);
+    let (pa, pb) = punch_pair(home_a.host(), cfg.clone(), home_b.host(), cfg).await;
+
+    // The chain reads as one cone: an endpoint-independent inner mapping
+    // rides one uplink socket, and the carrier holds one mapping for it.
+    assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
+    assert_eq!(pa.report.local_class, Some(NatClass::Cone));
+    assert_eq!(pb.report.local_class, Some(NatClass::Cone));
+    // The evidence learned through STUN names the carrier's address, not
+    // the home lab's 0.0.0.0 display label.
+    assert_eq!(
+        pa.report.local_reflexive_v4.map(|a| *a.ip()),
+        Some(carrier_a.public_ip())
+    );
+    assert_eq!(
+        pb.report.local_reflexive_v4.map(|a| *a.ip()),
+        Some(carrier_b.public_ip())
+    );
+    // Both winner paths end at the other home's carrier address.
+    assert_eq!(pa.peer_addr.ip(), IpAddr::from(carrier_b.public_ip()));
+    assert_eq!(pb.peer_addr.ip(), IpAddr::from(carrier_a.public_ip()));
+    assert_business(&pa, &pb).await;
+    assert!(home_a.forwarded() > 0, "the home lab forwarded");
+    assert!(carrier_a.forwarded() > 0, "the carrier lab forwarded");
+}
+
 /// A hard symmetric initiator against a port-filtered cone responder:
 /// the cone-side spray carries the exchange.
 #[tokio::test]

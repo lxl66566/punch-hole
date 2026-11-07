@@ -667,3 +667,54 @@ async fn shared_nat_strict_filter_pair_punches_through_the_matrix() {
     assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
     common::assert_business_traffic(&pa, &pb).await;
 }
+
+/// Two homes behind two separate carrier NATs punch across the stacked
+/// chains: every probe learns the true external address through STUN
+/// across two translations, and the punch rides the carrier-side mapping
+/// each chain opened, so the winner path names a carrier address.
+#[tokio::test(start_paused = true)]
+async fn cgnat_chain_pair_punches_through_two_carriers() {
+    let net = Net::seeded("cgnat_chain_pair");
+    let stun = net.stun_server();
+    let carrier_a = net.host(NatSpec::cone_eif());
+    let carrier_b = net.host(NatSpec::cone_eif());
+    let a = net.host_behind(&carrier_a, NatSpec::cone_eif());
+    let b = net.host_behind(&carrier_b, NatSpec::cone_eif());
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("stacked pair punches across two chains");
+    let pb = rb.expect("peer side punches across two chains");
+    // Both winner paths end at a carrier external address, not a LAN one:
+    // the punch crossed two translations each way.
+    assert!(
+        pa.peer_addr.ip().to_string().starts_with("100.64."),
+        "initiator saw carrier address {}, not a LAN one",
+        pa.peer_addr
+    );
+    assert!(
+        pb.peer_addr.ip().to_string().starts_with("100.64."),
+        "responder saw carrier address {}, not a LAN one",
+        pb.peer_addr
+    );
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// Two homes behind one carrier NAT punch through the carrier's hairpin:
+/// each home learns the same carrier public address behind its own port,
+/// and the crossing loops back inside the carrier the way
+/// `cgnat_sibling_loopback_crosses_the_chain` proves at the transport
+/// level, here through a full punch session.
+#[tokio::test(start_paused = true)]
+async fn cgnat_sibling_hairpin_pair_punches() {
+    let net = Net::seeded("cgnat_sibling_hairpin");
+    let stun = net.stun_server();
+    let carrier = net.host(NatSpec::cone_eif());
+    let a = net.host_behind(&carrier, NatSpec::cone_eif());
+    let b = net.host_behind(&carrier, NatSpec::cone_eif());
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("same-carrier pair punches");
+    let pb = rb.expect("peer side punches");
+    // Both sides see the one carrier address, each behind its own port.
+    assert_eq!(pa.peer_addr.ip(), pb.peer_addr.ip());
+    assert_ne!(pa.peer_addr, pb.peer_addr, "the homes hold distinct ports");
+    common::assert_business_traffic(&pa, &pb).await;
+}

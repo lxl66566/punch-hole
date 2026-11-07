@@ -61,11 +61,11 @@ A socket close releases its mappings through a Bye frame, so election and handov
 | suite | covers |
 |---|---|
 | `sim_contract.rs` | signaling contract: closed bridge, dual initiator, version mismatch, garbage frames, lossy and duplicated frames, oversized offers |
-| `sim_hostile.rs` | punch sessions over a hostile data plane: loss, jitter, duplication, a slow wire, and the start skew of a delayed Accept |
-| `sim_probe.rs` | classification against the simulator: cone, easy, hard, public, timeouts, caching, fan-out ordering |
+| `sim_hostile.rs` | punch sessions over a hostile data plane: loss, jitter, duplication, a duplicated-and-delayed wire, a dead wire that fails fast and releases, a slow wire, and the start skew of a delayed Accept or Offer, including a CGNAT chain over a lossy wire |
+| `sim_probe.rs` | classification against the simulator: cone, easy, hard, public, timeouts, caching, fan-out ordering, plus full punch sessions for the shared-NAT and CGNAT-chain shapes |
 | `sim_strategy.rs` | one suite per strategy, including a 64-seed Monte Carlo run that checks the measured birthday rate against the model estimate |
 | `sim_resource.rs` | rate caps, budget and conntrack exhaustion, cleanup on every exit path, drop-the-future |
-| `natlab_matrix.rs` | the same strategy matrix over real sockets behind two NAT labs, plus mapping hygiene and a lossy-forwarder pass |
+| `natlab_matrix.rs` | the same strategy matrix over real sockets behind two NAT labs, plus mapping hygiene, a lossy-forwarder pass, and a CGNAT chain over nested labs |
 | `real_smoke.rs` | LocalStun helper, direct loopback punches, the IPv6 session case, the Windows distinct-port rule, winner handover |
 | `decoder_corpus.rs` | thousands of mutated buffers through both decoders, no panic, no hang |
 

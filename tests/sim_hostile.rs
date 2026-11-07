@@ -41,11 +41,7 @@ fn held_pump(
 }
 
 /// Wires two host ends through one per-frame hold, both directions.
-fn connect_held<F>(a: HostEnd, b: HostEnd, hold: F)
-where
-    F: Fn(&Frame) -> Duration + Send + Sync + 'static,
-{
-    let hold: Arc<dyn Fn(&Frame) -> Duration + Send + Sync> = Arc::new(hold);
+fn connect_held(a: HostEnd, b: HostEnd, hold: Arc<dyn Fn(&Frame) -> Duration + Send + Sync>) {
     held_pump(a.to_peer, b.from_peer, Arc::clone(&hold));
     held_pump(b.to_peer, a.from_peer, hold);
 }
@@ -57,6 +53,16 @@ where
 fn accept_hold(hold: Duration) -> impl Fn(&Frame) -> Duration {
     move |frame| match frame {
         Frame::Accept => hold,
+        _ => Duration::ZERO,
+    }
+}
+
+/// Holds only the Offer, so the Initiator starts on time and the
+/// Responder lands `hold` late: the mirrored skew, where the Initiator's
+/// stages run against a peer that has not classified itself yet.
+fn offer_hold(hold: Duration) -> impl Fn(&Frame) -> Duration {
+    move |frame| match frame {
+        Frame::Offer(_) => hold,
         _ => Duration::ZERO,
     }
 }
@@ -157,7 +163,7 @@ async fn slow_wire_refresh_survives() {
     common::assert_business_traffic(&pa, &pb).await;
 }
 
-/// Runs the pair behind the Accept hold on a fresh net per try, until both
+/// Runs the pair behind the held frame on a fresh net per try, until both
 /// sides punch; returns the last results.
 ///
 /// A spray against fixed ports carries the residual miss the model leaves
@@ -169,7 +175,7 @@ async fn skew_pair_retried(
     a: NatSpec,
     b: NatSpec,
     cfg: PunchConfig,
-    hold: Duration,
+    hold: Arc<dyn Fn(&Frame) -> Duration + Send + Sync>,
     tries: usize,
 ) -> (
     Result<Punched<nat_lab::sim::SimSocket>, PunchFailure>,
@@ -183,7 +189,7 @@ async fn skew_pair_retried(
         cfg.stun_servers = stun.addrs.clone();
         let (ha, la) = punch_hole::signaling::bridge(64);
         let (hb, lb) = punch_hole::signaling::bridge(64);
-        connect_held(ha, hb, accept_hold(hold));
+        connect_held(ha, hb, Arc::clone(&hold));
         let init = tokio::spawn(run_initiator(net.host(a.clone()), cfg.clone(), la));
         let resp = tokio::spawn(run_responder(net.host(b.clone()), cfg.clone(), lb));
         let pair = (
@@ -215,7 +221,7 @@ async fn late_initiator_cone_punches() {
         NatSpec::cone_apdf(),
         NatSpec::cone_apdf(),
         cfg,
-        Duration::from_secs(2),
+        Arc::new(accept_hold(Duration::from_secs(2))),
         3,
     )
     .await;
@@ -242,11 +248,112 @@ async fn late_initiator_birthday_punches() {
         NatSpec::random(30000..30100),
         NatSpec::random(30000..30100),
         cfg,
-        Duration::from_secs(2),
+        Arc::new(accept_hold(Duration::from_secs(2))),
         3,
     )
     .await;
     let pa = ra.expect("a late initiator punches");
     let pb = rb.expect("b on-time responder punches");
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// A cone pair whose Responder starts about two seconds late because the
+/// Offer crossed a held signaling path: the Initiator's stages wait, and
+/// the late Responder still classifies and lands its side of the
+/// handshake.
+#[tokio::test(start_paused = true)]
+async fn late_responder_cone_punches() {
+    let cfg = PunchConfig {
+        stun_servers: Net::seeded("late_responder_cone_punches")
+            .stun_server()
+            .addrs
+            .clone(),
+        ..PunchConfig::default()
+    };
+    let (ra, rb) = skew_pair_retried(
+        "late_responder_cone_punches",
+        NatSpec::cone_apdf(),
+        NatSpec::cone_apdf(),
+        cfg,
+        Arc::new(offer_hold(Duration::from_secs(2))),
+        3,
+    )
+    .await;
+    let pa = ra.expect("a on-time initiator punches");
+    let pb = rb.expect("b late responder punches");
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// A cone pair over a wire that drops everything: the probe phase cannot
+/// confirm a mapping, so both sides fail by their phase deadlines, and
+/// every mapping and socket is released.
+#[tokio::test(start_paused = true)]
+async fn dead_wire_fails_fast_and_releases() {
+    use punch_hole::error::PunchError;
+
+    let net = Net::seeded("dead_wire_fails_fast_and_releases");
+    net.set_loss(1000);
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_apdf());
+    let b = net.host(NatSpec::cone_apdf());
+    let cfg = config(&stun);
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    // The wire blackholes STUN both ways, so the probe phase misses its
+    // deadline. Whoever ends first closes the bridge, and the peer then
+    // sees SignalingClosed instead of its own timeout.
+    let bounded = |r: &Result<Punched<nat_lab::sim::SimSocket>, PunchFailure>| {
+        matches!(
+            r,
+            Err(PunchFailure {
+                error: PunchError::Timeout { .. } | PunchError::SignalingClosed,
+                ..
+            })
+        )
+    };
+    assert!(bounded(&ra), "got {ra:?}");
+    assert!(bounded(&rb), "got {rb:?}");
+    net.wait_mappings_drained().await;
+    assert_eq!(net.mapping_count(), 0, "no mapping outlives the failure");
+}
+
+/// A cone pair over a wire that both duplicates and delays: a duplicated
+/// copy can land after the reply to the original, so duplicate handling
+/// must hold one attempt while reordering reshuffles the rest.
+#[tokio::test(start_paused = true)]
+async fn duplicated_and_delayed_wire_still_punches() {
+    let net = Net::seeded("duplicated_and_delayed_wire_still_punches");
+    net.set_dup(200);
+    net.set_delay(Duration::from_millis(20)..Duration::from_millis(120));
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::cone_apdf());
+    let b = net.host(NatSpec::cone_apdf());
+    let cfg = config(&stun);
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("a punches over a duplicating delayed wire");
+    let pb = rb.expect("b punches over a duplicating delayed wire");
+    net.set_dup(0);
+    net.set_delay(Duration::ZERO..Duration::ZERO);
+    common::assert_business_traffic(&pa, &pb).await;
+}
+
+/// The stacked CGNAT chains over a wire that loses a fifth of every
+/// crossing: the handshake retransmissions must cross two translations
+/// and the lossy wire, and the winner path still carries business
+/// traffic.
+#[tokio::test(start_paused = true)]
+async fn cgnat_chain_over_lossy_wire_still_punches() {
+    let net = Net::seeded("cgnat_chain_over_lossy_wire_still_punches");
+    net.set_loss(200);
+    let stun = net.stun_server();
+    let carrier_a = net.host(NatSpec::cone_eif());
+    let carrier_b = net.host(NatSpec::cone_eif());
+    let a = net.host_behind(&carrier_a, NatSpec::cone_eif());
+    let b = net.host_behind(&carrier_b, NatSpec::cone_eif());
+    let cfg = config(&stun);
+    let (ra, rb) = common::punch_pair(a, cfg.clone(), b, cfg).await;
+    let pa = ra.expect("a punches across a lossy chain");
+    let pb = rb.expect("b punches across a lossy chain");
+    assert!(net.dropped() > 0, "the wire dropped during the punch");
+    net.set_loss(0);
     common::assert_business_traffic(&pa, &pb).await;
 }
