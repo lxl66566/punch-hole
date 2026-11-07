@@ -38,7 +38,7 @@ Consumer code sees hosts and sockets through two small traits, `UdpFactory` and 
 
 ## Fault injection and observation
 
-Both engines expose the same fault surface: data-plane loss (`set_loss`) with a drop counter, uplink faults on the host (`drop_first_send_to`, `fail_sends_to`), allocation-sequence control (`external_allocations`, `rebind_sequence_after`), close expiry (`set_mapping_expiry`), idle expiry (`set_idle_expiry`) with its eviction counter, and a per-packet tap (`set_tap`) that forwards, drops, or rewrites any crossing. Observation covers forwarded and drop counters, the live mapping table, peak mappings, snapshots, and a bounded drain wait, with the `NAT_LAB_TRACE` environment variable printing every routing decision either engine makes.
+Both engines expose the same fault surface: data-plane loss (`set_loss`) with a drop counter, uplink faults on the host (`drop_first_send_to`, `fail_sends_to`), allocation-sequence control (`external_allocations`, `rebind_sequence_after`), close expiry (`set_mapping_expiry`), idle expiry (`set_idle_expiry`) with its eviction counter, and a per-packet tap (`set_tap`) that forwards, drops, or rewrites any crossing. The simulator adds per-crossing duplication (`set_dup`) and delay (`set_delay`): a delayed copy sleeps and re-enters the router as an arrival, so it translates against the mapping state of the instant it lands and packets of one exchange overtake each other. Observation covers forwarded and drop counters, the live mapping table, peak mappings, snapshots, and a bounded drain wait, with the `NAT_LAB_TRACE` environment variable printing every routing decision either engine makes.
 
 ## Non-goals
 

@@ -250,6 +250,37 @@ async fn cone_eif_pair_punches_through_two_nat_labs() {
     assert_business(&pa, &pb).await;
 }
 
+/// Two cone NATs whose forwarders drop 15% of crossings, the real-socket
+/// form of the simulator's lossy wire: the handshake retransmissions must
+/// carry the real pipeline, and the business traffic below proves the
+/// elected pair is the one both ends settled on.
+#[tokio::test]
+async fn cone_pair_punches_over_lossy_lab_forwarders() {
+    let stun = natlab::stun_responder().expect("stun responder binds");
+    let nat_a = NatLab::spawn("cone_lossy_a", NatSpec::cone_apdf())
+        .await
+        .expect("lab a spawns");
+    let nat_b = NatLab::spawn("cone_lossy_b", NatSpec::cone_apdf())
+        .await
+        .expect("lab b spawns");
+    nat_a.set_loss(150);
+    nat_b.set_loss(150);
+    let cfg = lab_config(&stun);
+    let (pa, pb) = punch_pair(nat_a.host(), cfg.clone(), nat_b.host(), cfg).await;
+
+    assert_eq!(pa.report.strategy, StrategyId::ConeExchange);
+    assert_eq!(pb.report.strategy, StrategyId::ConeExchange);
+    assert!(
+        nat_a.dropped_by_loss() + nat_b.dropped_by_loss() > 0,
+        "the forwarders dropped during the punch"
+    );
+
+    // Business traffic proves the delivered pair against the clean wire.
+    nat_a.set_loss(0);
+    nat_b.set_loss(0);
+    assert_business(&pa, &pb).await;
+}
+
 /// Two stepped symmetric NATs, steps 2 and 3, punch on port predictions.
 ///
 /// The stepped allocations of the emulated NATs must survive the whole

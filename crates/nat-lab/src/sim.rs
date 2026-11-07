@@ -3,9 +3,10 @@
 //! A [`Net`] owns one router task and a virtual IPv4 space. Hosts attach
 //! directly or behind a [`NatSpec`], STUN servers answer binding requests,
 //! and every packet crosses the router, which applies translation,
-//! filtering, and loss. All randomness flows through one seeded generator,
-//! and tests run under paused tokio time, so a run reproduces from its seed.
-//! Hosts plug into consumer code through the [`UdpFactory`] seam.
+//! filtering, loss, duplication, and wire delay. All randomness flows
+//! through one seeded generator, and tests run under paused tokio time, so
+//! a run reproduces from its seed. Hosts plug into consumer code through
+//! the [`UdpFactory`] seam.
 // Trait signatures stay async even when a virtual operation never yields.
 #![allow(clippy::unused_async_trait_impl)]
 
@@ -18,6 +19,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU32, Ordering},
     },
+    time::Duration,
 };
 
 use rand::{prelude::*, rngs::StdRng};
@@ -709,7 +711,15 @@ async fn uplink_loop(
 }
 
 enum Msg {
+    /// A datagram leaving a host, about to cross the wire.
     Packet {
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: Vec<u8>,
+    },
+    /// A datagram at the far end of the wire; the router translates and
+    /// delivers it against the mapping state of this instant.
+    Arrive {
         src: SocketAddr,
         dst: SocketAddr,
         payload: Vec<u8>,
@@ -741,6 +751,9 @@ struct Inner {
     rng: StdMutex<StdRng>,
     nats: StdMutex<Vec<Arc<NatShared>>>,
     loss_permille: AtomicU32,
+    dup_permille: AtomicU32,
+    /// Wire delay drawn per datagram; an empty range is a fixed delay.
+    delay: StdMutex<Range<Duration>>,
     forwarded: AtomicU32,
     dropped: AtomicU32,
     port_counter: AtomicU32,
@@ -750,7 +763,32 @@ struct Inner {
     /// registry entry.
     bound: StdMutex<HashSet<SocketAddr>>,
     /// Delay between a socket closing and its mappings going away.
-    mapping_expiry: StdMutex<std::time::Duration>,
+    mapping_expiry: StdMutex<Duration>,
+}
+
+/// Lands one datagram: inbound traffic to a NAT address crosses the NAT
+/// against its current mapping table, everything else lands on a public
+/// endpoint.
+async fn arrive(
+    inner: &Inner,
+    registry: &HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: Vec<u8>,
+) {
+    let target = inner
+        .nats
+        .lock()
+        .expect("nat list lock")
+        .iter()
+        .find_map(|nat| nat.translate_inbound(dst, src));
+    let deliver = target.unwrap_or(dst);
+    if std::env::var_os("NAT_LAB_TRACE").is_some() {
+        eprintln!("PKT {src} -> {dst} deliver={deliver} len={}", payload.len());
+    }
+    if let Some(inbox) = registry.get(&deliver) {
+        let _ = inbox.send((src, payload)).await;
+    }
 }
 
 /// One virtual network. Create with [`Net::seeded`].
@@ -782,12 +820,14 @@ impl Net {
             rng: StdMutex::new(StdRng::seed_from_u64(seed)),
             nats: StdMutex::new(Vec::new()),
             loss_permille: AtomicU32::new(0),
+            dup_permille: AtomicU32::new(0),
+            delay: StdMutex::new(Duration::ZERO..Duration::ZERO),
             forwarded: AtomicU32::new(0),
             dropped: AtomicU32::new(0),
             port_counter: AtomicU32::new(20_000),
             subnet_counter: AtomicU32::new(1),
             bound: StdMutex::new(HashSet::new()),
-            mapping_expiry: StdMutex::new(std::time::Duration::ZERO),
+            mapping_expiry: StdMutex::new(Duration::ZERO),
         });
         let router_inner = Arc::clone(&inner);
         tokio::spawn(async move {
@@ -819,35 +859,59 @@ impl Net {
                             });
                         }
                     },
-                    Msg::Packet { src, dst, payload } => {
-                        let loss = router_inner.loss_permille.load(Ordering::Relaxed);
-                        if loss > 0
-                            && router_inner
-                                .rng
-                                .lock()
-                                .expect("rng lock")
-                                .random_range(0..1000)
-                                < loss
-                        {
-                            router_inner.dropped.fetch_add(1, Ordering::Relaxed);
-                            continue;
+                    Msg::Packet {
+                        src,
+                        dst,
+                        mut payload,
+                    } => {
+                        // Every random decision of the crossing is drawn
+                        // here, in send order, so a run stays reproducible;
+                        // a delayed copy only sleeps and re-enters as an
+                        // arrival.
+                        let copies = {
+                            let mut rng = router_inner.rng.lock().expect("rng lock");
+                            let loss = router_inner.loss_permille.load(Ordering::Relaxed);
+                            if loss > 0 && rng.random_range(0..1000) < loss {
+                                router_inner.dropped.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let dup = router_inner.dup_permille.load(Ordering::Relaxed);
+                            let copies =
+                                if dup > 0 && rng.random_range(0..1000) < dup { 2 } else { 1 };
+                            let delay = router_inner.delay.lock().expect("delay lock").clone();
+                            (0..copies)
+                                .map(|_| {
+                                    if delay.is_empty() {
+                                        delay.start
+                                    } else {
+                                        rng.random_range(delay.clone())
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        router_inner
+                            .forwarded
+                            .fetch_add(copies.len() as u32, Ordering::Relaxed);
+                        let mut copies = copies.into_iter().peekable();
+                        while let Some(delay) = copies.next() {
+                            let payload = if copies.peek().is_some() {
+                                payload.clone()
+                            } else {
+                                std::mem::take(&mut payload)
+                            };
+                            if delay.is_zero() {
+                                arrive(&router_inner, &registry, src, dst, payload).await;
+                                continue;
+                            }
+                            let tx = router_inner.tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = tx.send(Msg::Arrive { src, dst, payload });
+                            });
                         }
-                        router_inner.forwarded.fetch_add(1, Ordering::Relaxed);
-                        // Inbound traffic to a NAT address crosses the NAT;
-                        // everything else lands on a public endpoint.
-                        let target = router_inner
-                            .nats
-                            .lock()
-                            .expect("nat list lock")
-                            .iter()
-                            .find_map(|nat| nat.translate_inbound(dst, src));
-                        let deliver = target.unwrap_or(dst);
-                        if std::env::var_os("NAT_LAB_TRACE").is_some() {
-                            eprintln!("PKT {src} -> {dst} deliver={deliver} len={}", payload.len());
-                        }
-                        if let Some(inbox) = registry.get(&deliver) {
-                            let _ = inbox.send((src, payload)).await;
-                        }
+                    },
+                    Msg::Arrive { src, dst, payload } => {
+                        arrive(&router_inner, &registry, src, dst, payload).await;
                     },
                 }
             }
@@ -1015,12 +1079,30 @@ impl Net {
         self.inner.loss_permille.store(permille, Ordering::Relaxed);
     }
 
+    /// Sets the chance in permille that the router carries a datagram
+    /// twice. Each copy draws its own wire delay.
+    pub fn set_dup(&self, permille: u32) {
+        self.inner.dup_permille.store(permille, Ordering::Relaxed);
+    }
+
+    /// Sets the wire delay, drawn uniformly per datagram from `delay`; an
+    /// empty range applies `delay.start` to every datagram.
+    ///
+    /// Datagrams whose draws cross arrive out of order, so a wide range
+    /// models a jittery path. A datagram is translated and filtered when
+    /// it arrives, so a mapping that opens or expires while it is in
+    /// flight decides its fate. A stacked NAT draws once per layer, like
+    /// the loss roll.
+    pub fn set_delay(&self, delay: Range<Duration>) {
+        *self.inner.delay.lock().expect("delay lock") = delay;
+    }
+
     /// Sets how long mappings survive the close of their socket.
     ///
     /// The default of zero releases mappings at close. A nonzero delay
     /// models the tens of seconds a real NAT keeps translating after the
     /// loser socket of a punch went away.
-    pub fn set_mapping_expiry(&self, expiry: std::time::Duration) {
+    pub fn set_mapping_expiry(&self, expiry: Duration) {
         *self.inner.mapping_expiry.lock().expect("expiry lock") = expiry;
     }
 
@@ -1096,9 +1178,9 @@ impl Net {
 
     /// Waits until every mapping is gone, bounded by a virtual timeout.
     pub async fn wait_mappings_drained(&self) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while self.mapping_count() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -1337,5 +1419,170 @@ impl Drop for SimSocket {
         // The router releases the mappings, at close by default or after
         // the configured expiry.
         let _ = self.inner.tx.send(Msg::Unregister { addr: self.local });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::socket::{Family, UdpFactory, UdpIo};
+
+    /// Receives one datagram within two seconds, or panics.
+    async fn recv<S: UdpIo>(sock: &S) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0u8; 2048];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("datagram arrives within 2s")
+            .expect("socket stays alive");
+        (buf[..len].to_vec(), from)
+    }
+
+    /// A send only queues a message; the router reads the fault knobs when
+    /// it processes it. A test that retunes the knobs between sends must
+    /// let the router drain the earlier message first. A real timer parks
+    /// the test task, and paused time only advances once every runnable
+    /// task, the router included, has parked.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_crossing_lands_behind_a_faster_one() {
+        let net = Net::seeded("a_delayed_crossing_lands_behind_a_faster_one");
+        let a = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("a binds");
+        let b = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("b binds");
+        let b_addr = b.local_addr().expect("b addr");
+
+        net.set_delay(Duration::from_millis(200)..Duration::from_millis(200));
+        a.send_to(b"1", b_addr).await.expect("slow send");
+        settle().await;
+        net.set_delay(Duration::from_millis(50)..Duration::from_millis(50));
+        a.send_to(b"2", b_addr).await.expect("fast send");
+        net.set_delay(Duration::ZERO..Duration::ZERO);
+
+        let (first, _) = recv(&b).await;
+        let (second, _) = recv(&b).await;
+        assert_eq!(first, b"2", "the faster crossing overtakes");
+        assert_eq!(second, b"1", "the slower crossing lands after it");
+        assert_eq!(net.forwarded(), 2);
+        assert_eq!(net.dropped(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dup_carries_each_datagram_twice() {
+        let net = Net::seeded("dup_carries_each_datagram_twice");
+        let a = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("a binds");
+        let b = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("b binds");
+
+        net.set_dup(1000);
+        a.send_to(b"once", b.local_addr().expect("b addr"))
+            .await
+            .expect("send");
+        let (first, _) = recv(&b).await;
+        let (second, _) = recv(&b).await;
+        assert_eq!(first, b"once");
+        assert_eq!(second, b"once", "the duplicate also lands");
+        assert_eq!(net.forwarded(), 2, "each copy counts");
+    }
+
+    /// A datagram is filtered against the mapping table when it arrives,
+    /// not when it was sent: a source the mapping had not yet sent to at
+    /// send time is admitted because the refresh landed while the datagram
+    /// was in flight.
+    #[tokio::test(start_paused = true)]
+    async fn delay_decides_against_the_mapping_state_at_arrival() {
+        let net = Net::seeded("delay_decides_against_the_mapping_state_at_arrival");
+        let dest = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("dest binds");
+        let stranger = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("stranger binds");
+        let client = net
+            .host(NatSpec::cone_apdf())
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("client binds");
+
+        // The mapping opens for the destination only.
+        client
+            .send_to(b"open", dest.local_addr().expect("dest addr"))
+            .await
+            .expect("mapping opens");
+        let ext = net.mappings_snapshot()[0].1;
+
+        net.set_delay(Duration::from_millis(300)..Duration::from_millis(300));
+        stranger
+            .send_to(b"hello", ext)
+            .await
+            .expect("slow crossing enters the wire");
+        settle().await;
+        // The refresh for the stranger's address lands before the crossing.
+        net.set_delay(Duration::ZERO..Duration::ZERO);
+        client
+            .send_to(b"refresh", stranger.local_addr().expect("stranger addr"))
+            .await
+            .expect("refresh sends");
+
+        let (got, from) = recv(&client).await;
+        assert_eq!(got, b"hello", "the delayed crossing passes the filter");
+        assert_eq!(
+            from,
+            stranger.local_addr().expect("stranger addr"),
+            "the source crosses untranslated"
+        );
+        assert_eq!(net.dropped_by_filter(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn loss_drops_and_counts() {
+        let net = Net::seeded("loss_drops_and_counts");
+        let a = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("a binds");
+        let b = net
+            .public_host()
+            .bind(Family::V4.any_addr())
+            .await
+            .expect("b binds");
+
+        net.set_loss(1000);
+        a.send_to(b"gone", b.local_addr().expect("b addr"))
+            .await
+            .expect("send reports success");
+        settle().await;
+        assert_eq!(net.dropped(), 1);
+        assert_eq!(net.forwarded(), 0);
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing was delivered"
+        );
     }
 }

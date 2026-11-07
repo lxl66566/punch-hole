@@ -39,6 +39,8 @@ The router exposes observation hooks for assertions: forwarded and dropped count
 
 Hosts carry fault injection for the paths a clean net never walks: `drop_first_send_to` and `fail_sends_to` break the uplink, `external_allocations` walks a NAT's sequence forward like unrelated traffic behind the same carrier NAT, and `rebind_sequence_after` jumps the port walk to a fresh base mid-session.
 
+The wire itself is hostile too. `set_loss(permille)` drops a random share of every crossing, `set_dup(permille)` delivers a random share twice, and `set_delay(range)` holds each crossing for a drawn duration before it lands, so packets of one exchange overtake each other; every random decision is drawn in send order, so a run stays reproducible. Delayed crossings translate against the mapping state of the instant they arrive, which is what a NAT whose table moved mid-flight really does to a late packet.
+
 Determinism comes from two pieces. All randomness flows through one `StdRng` seeded from the test name, and all tests run under `#[tokio::test(start_paused = true)]`, so a full session completes in milliseconds of wall time.
 
 ## The loopback NAT lab
@@ -59,10 +61,11 @@ A socket close releases its mappings through a Bye frame, so election and handov
 | suite | covers |
 |---|---|
 | `sim_contract.rs` | signaling contract: closed bridge, dual initiator, version mismatch, garbage frames, lossy and duplicated frames, oversized offers |
+| `sim_hostile.rs` | punch sessions over a hostile data plane: loss, jitter, duplication, a slow wire, and the start skew of a delayed Accept |
 | `sim_probe.rs` | classification against the simulator: cone, easy, hard, public, timeouts, caching, fan-out ordering |
 | `sim_strategy.rs` | one suite per strategy, including a 64-seed Monte Carlo run that checks the measured birthday rate against the model estimate |
 | `sim_resource.rs` | rate caps, budget and conntrack exhaustion, cleanup on every exit path, drop-the-future |
-| `natlab_matrix.rs` | the same strategy matrix over real sockets behind two NAT labs, plus mapping hygiene |
+| `natlab_matrix.rs` | the same strategy matrix over real sockets behind two NAT labs, plus mapping hygiene and a lossy-forwarder pass |
 | `real_smoke.rs` | LocalStun helper, direct loopback punches, the IPv6 session case, the Windows distinct-port rule, winner handover |
 | `decoder_corpus.rs` | thousands of mutated buffers through both decoders, no panic, no hang |
 
