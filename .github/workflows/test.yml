@@ -48,6 +48,8 @@ jobs:
   # fuzz/Cargo.toml), so the clippy leg above never compiles it and a
   # decoder signature change could rot the targets while CI stays green.
   # A plain check suffices: libfuzzer-sys builds without sanitizers.
+  # RUSTFLAGS supplies the `fuzzing` cfg that cargo-fuzz sets, which the
+  # fuzz-only library API is gated on.
   fuzz-check:
     name: cargo check fuzz
     runs-on: ubuntu-latest
@@ -55,6 +57,7 @@ jobs:
     # must be cleared; an empty value reads as "no wrapper" to cargo.
     env:
       RUSTC_WRAPPER: ""
+      RUSTFLAGS: "--cfg fuzzing"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

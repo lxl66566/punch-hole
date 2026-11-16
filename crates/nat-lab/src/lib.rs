@@ -73,7 +73,7 @@
     clippy::cast_precision_loss,
     clippy::large_futures,
     clippy::large_stack_arrays,
-    clippy::large_stack_frames
+    clippy::large_unopt_stack_frames
 )]
 
 pub mod lab;

@@ -1,6 +1,6 @@
 [package]
 name         = "punch-hole-demo"
-version      = "0.1.0"
+version      = "0.1.1"
 edition      = "2024"
 rust-version = "1.88"
 description  = "Two-terminal demo of punch-hole over real sockets: a pairing relay plus a client and a server that chat over the punched path"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 anyhow     = "1.0.104"
 bytes      = "1.12.1"
 clap       = { version = "4.6.7", features = ["derive"] }
-punch-hole = { path = "../..", version = "0.1.0" }
+punch-hole = { path = "../..", version = "0.1.1" }
 rand       = "0.10.3"
 tokio      = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
