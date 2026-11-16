@@ -35,7 +35,7 @@ src/
 └── compat.rs      seam impls for the nat-lab engines, behind `test-util`
 ```
 
-The workspace carries one member next to the root crate: `crates/nat-lab`, the standalone NAT test lab published as the `nat-lab` crate. Its virtual network and loopback engines serve the integration rings behind the `test-util` feature.
+The workspace carries two members next to the root crate: `crates/nat-lab`, the standalone NAT test lab published as the `nat-lab` crate, and `crates/punch-hole-demo`, which builds the `punch-demo` binary. The lab's virtual network and loopback engines serve the integration rings behind the `test-util` feature.
 
 Dependencies stay small: `tokio` and `tokio-util` for async IO and cancellation, `socket2` for platform options, `serde` plus `postcard` for frames, `rand` for nonces and burst draws, `bytes` for the bridge, and `thiserror` for the error type. The STUN subset the prober needs is small enough to live in-tree, and the only test dependency is the workspace's own `nat-lab` crate.
 
@@ -97,4 +97,4 @@ Every outbound packet passes the three guards described in [Resource control](re
 
 ## Post-handover keepalive
 
-`keepalive::spawn_io` sends a small heartbeat every ten seconds, which holds the NAT mapping open while the host idles; the `Arc`-shared tokio winner flows in through the `UdpIo` impl. The returned guard aborts the task on drop, and the task owns the socket value it received, so a host that moved its only reference in closes the socket with the guard. A heartbeat send that fails ends the task, and `KeepaliveGuard::is_alive` reports it, so a dying mapping is observable instead of silent. The heartbeat carries the attempt nonce, and hosts discard protocol-shaped datagrams with `msg::is_protocol_packet`, which covers the beats as well as late handshake retransmissions.
+`keepalive::spawn_io` sends a small heartbeat every ten seconds — `KEEPALIVE_INTERVAL`, the default — which holds the NAT mapping open while the host idles; the `Arc`-shared tokio winner flows in through the `UdpIo` impl. `spawn_io_with_interval` takes a custom interval in its place. The returned guard aborts the task on drop, and the task owns the socket value it received, so a host that moved its only reference in closes the socket with the guard. A heartbeat send that fails ends the task, and `KeepaliveGuard::is_alive` reports it, so a dying mapping is observable instead of silent. `KeepaliveGuard::stopped` resolves when the task ends, the signal a host uses to decide relay fallback; the wait is single-shot, and dropping the future cancels the wait, not the task. The heartbeat carries the attempt nonce, and hosts discard protocol-shaped datagrams with `msg::is_protocol_packet`, which covers the beats as well as late handshake retransmissions.

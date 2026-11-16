@@ -70,7 +70,7 @@ Selection reads the effective classes, which means a weak `EasySym` fit has alre
 
 A Direct stage runs first when the pair needs no NAT cooperation: both sides public, or both with global IPv6 addresses. Two hosts behind one NAT reach each other over the LAN underneath it, through the Local stage, or through the mutual sweep of ConeExchange when that NAT hairpins; a home router behind a carrier-grade NAT is classified across the chain. `IpPolicy::Ipv6Only` makes the IPv6 Direct stage the whole plan.
 
-In SymProbe the symmetric side sprays: a predicted window against an easy symmetric peer, a random spread over the estimated port span against a hard one. The burst strategies size their coverage from a collision model against `target_success` and report the estimate; an estimate below `min_success` fails Negotiate with `Unpunchable` before any data packet is sent. A cone reading short of two server IPs routes to SymProbe rather than ConeExchange, and two easy symmetric sides that both filter port-strict go straight to the burst sizing.
+In SymProbe the cone side sprays candidate ports at the symmetric peer — a fitted predicted window when the peer is easy symmetric, a random spread over the estimated port span when it is hard — while the symmetric side pulses Syn from its assistant sockets. The burst strategies size their coverage from a collision model against `target_success` and report the estimate; an estimate below `min_success` fails Negotiate with `Unpunchable` before any data packet is sent. A cone reading short of two server IPs routes to SymProbe rather than ConeExchange, and two easy symmetric sides that both filter port-strict go straight to the burst sizing.
 
 ## Scope and limits
 
@@ -82,7 +82,7 @@ In SymProbe the symmetric side sprays: a predicted window against an easy symmet
 
 ## Docs
 
-`mdbook build docs/en && mdbook build docs/zh` and deployed to <https://lxl66566.github.io/punch-hole/>):
+The books build with `mdbook build docs/en && mdbook build docs/zh` and are deployed to <https://lxl66566.github.io/punch-hole/>:
 
 - `punch-hole`: this crate; crate docs carry the same API screen, compiled by `cargo test --doc`.
 - `crates/nat-lab`: emulated NAT devices, a deterministic virtual network and a loopback NAT over real sockets, attaching through `Puncher::with_factory`. Standalone as the `nat-lab` crate, behind `test-util` here.

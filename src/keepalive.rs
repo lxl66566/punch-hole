@@ -87,6 +87,12 @@ pub fn spawn_io<U: UdpIo>(socket: U, peer: SocketAddr, nonce: Nonce) -> Keepaliv
 /// A heartbeat that fails to send ends the task;
 /// [`KeepaliveGuard::is_alive`] reports that and
 /// [`KeepaliveGuard::stopped`] resolves.
+///
+/// # Panics
+///
+/// Panics when `interval` is zero. The ticker is built before the spawn,
+/// so the panic surfaces on the caller's stack; built inside the task it
+/// would kill the heartbeat on its first poll with no diagnostic here.
 pub fn spawn_io_with_interval<U: UdpIo>(
     socket: U,
     peer: SocketAddr,
@@ -94,10 +100,10 @@ pub fn spawn_io_with_interval<U: UdpIo>(
     interval: Duration,
 ) -> KeepaliveGuard {
     let packet = encode_packet(&DataPacket::Keepalive { nonce });
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             // The socket is usually the reason a beat fails, so the task
@@ -235,5 +241,19 @@ mod tests {
         assert!(guard.is_alive(), "the task still runs");
         // The wait is single-shot: an earlier call took it.
         assert!(guard.stopped().is_none());
+    }
+
+    /// A zero interval panics at the call site, before the task spawns:
+    /// built inside the task, the heartbeat would die on its first poll
+    /// with no diagnostic at the spawn.
+    #[should_panic(expected = "`period` must be non-zero.")]
+    #[tokio::test(start_paused = true)]
+    async fn zero_interval_panics_at_the_call_site() {
+        let _ = spawn_io_with_interval(
+            Recorder::default(),
+            SocketAddr::from(([203, 0, 113, 9], 4500)),
+            [7; 16],
+            Duration::ZERO,
+        );
     }
 }

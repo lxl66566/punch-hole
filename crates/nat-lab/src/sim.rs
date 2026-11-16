@@ -260,6 +260,8 @@ struct MappingEntry {
     /// Fires when the mapping goes away, ending the uplink task so the
     /// uplink socket closes and the upstream mapping releases with it.
     cancel: Option<CancellationToken>,
+    /// Last crossing in either direction, which the idle reaper reads.
+    last_seen: tokio::time::Instant,
 }
 
 struct NatShared {
@@ -354,6 +356,9 @@ impl NatShared {
         }
         let entry = mappings.get_mut(&key).expect("entry just inserted");
         entry.dests.insert(dst);
+        // Every translated crossing restarts the idle timer, like the lab's
+        // touch on the outbound path.
+        entry.last_seen = tokio::time::Instant::now();
         Ok(SocketAddr::V4(SocketAddrV4::new(
             self.public_ip,
             entry.ext_port,
@@ -382,6 +387,7 @@ impl NatShared {
                 uplink: None,
                 cancel: None,
                 dests: HashSet::new(),
+                last_seen: tokio::time::Instant::now(),
             });
         };
         let len = u64::from(self.spec.port_range.end - self.spec.port_range.start);
@@ -412,6 +418,7 @@ impl NatShared {
                 uplink: Some(uplink),
                 cancel: Some(cancel),
                 dests: HashSet::new(),
+                last_seen: tokio::time::Instant::now(),
             });
         }
     }
@@ -441,8 +448,8 @@ impl NatShared {
         from: SocketAddr,
         payload: &[u8],
     ) {
-        let mappings = self.mappings.lock().expect("mapping lock");
-        let Some(entry) = mappings.values().find(|entry| {
+        let mut mappings = self.mappings.lock().expect("mapping lock");
+        let Some(entry) = mappings.values_mut().find(|entry| {
             entry
                 .uplink
                 .as_ref()
@@ -450,6 +457,9 @@ impl NatShared {
         }) else {
             return;
         };
+        // Any arrival on the mapping's external socket restarts the idle
+        // timer, filter verdict pending.
+        entry.last_seen = tokio::time::Instant::now();
         if self.allows(entry, from) {
             // The private destination matches no NAT, so the router hands
             // the datagram to the client unchanged.
@@ -539,13 +549,16 @@ impl NatShared {
         if *dst_v4.ip() != self.public_ip {
             return None;
         }
-        let mappings = self.mappings.lock().expect("mapping lock");
+        let mut mappings = self.mappings.lock().expect("mapping lock");
         let mut matched = false;
-        for entry in mappings.values() {
+        for entry in mappings.values_mut() {
             if entry.ext_port != dst.port() {
                 continue;
             }
             matched = true;
+            // Any arrival aimed at the mapping's port restarts its idle
+            // timer, like the lab's inbound touch before the filter check.
+            entry.last_seen = tokio::time::Instant::now();
             if self.allows(entry, src) {
                 return Some(entry.local);
             }
@@ -574,7 +587,7 @@ impl NatShared {
         if *dst.ip() != self.public_ip {
             return HairpinFate::None;
         }
-        let mappings = self.mappings.lock().expect("mapping lock");
+        let mut mappings = self.mappings.lock().expect("mapping lock");
         if !mappings.values().any(|entry| entry.ext_port == dst.port()) {
             // Nobody translates at this port: the datagram goes out and is
             // lost, not turned into a hairpin drop.
@@ -584,12 +597,20 @@ impl NatShared {
             self.hairpin_drops.fetch_add(1, Ordering::Relaxed);
             return HairpinFate::Disabled;
         }
-        if let Some(entry) = mappings
-            .values()
+        // The loop crosses the target mapping's inbound path, whose idle
+        // touch comes before the filter verdict.
+        let mut deliver = None;
+        for entry in mappings
+            .values_mut()
             .filter(|entry| entry.ext_port == dst.port())
-            .find(|entry| self.allows(entry, src))
         {
-            return HairpinFate::Deliver(entry.local);
+            entry.last_seen = tokio::time::Instant::now();
+            if deliver.is_none() && self.allows(entry, src) {
+                deliver = Some(entry.local);
+            }
+        }
+        if let Some(local) = deliver {
+            return HairpinFate::Deliver(local);
         }
         self.filter_drops.fetch_add(1, Ordering::Relaxed);
         HairpinFate::Filtered
@@ -619,6 +640,28 @@ impl NatShared {
         for token in canceled {
             token.cancel();
         }
+    }
+
+    /// Removes mappings whose last crossing predates the expiry, ending
+    /// their uplink tasks, and returns how many left.
+    fn evict_idle(&self, now: tokio::time::Instant, expiry: Duration) -> usize {
+        let (canceled, removed) = {
+            let mut mappings = self.mappings.lock().expect("mapping lock");
+            let idle =
+                |entry: &MappingEntry| now.saturating_duration_since(entry.last_seen) >= expiry;
+            let canceled: Vec<CancellationToken> = mappings
+                .values()
+                .filter(|entry| idle(entry))
+                .filter_map(|entry| entry.cancel.clone())
+                .collect();
+            let before = mappings.len();
+            mappings.retain(|_, entry| !idle(entry));
+            (canceled, before - mappings.len())
+        };
+        for token in canceled {
+            token.cancel();
+        }
+        removed
     }
 
     fn snapshot(&self) -> Vec<(SocketAddr, SocketAddr)> {
@@ -764,6 +807,39 @@ struct Inner {
     bound: StdMutex<HashSet<SocketAddr>>,
     /// Delay between a socket closing and its mappings going away.
     mapping_expiry: StdMutex<Duration>,
+    /// Idle time after which an unused mapping is evicted.
+    idle_expiry: StdMutex<Duration>,
+    /// Mappings the idle reaper evicted.
+    idled: AtomicU32,
+}
+
+/// Evicts mappings idle past the inactivity expiry.
+///
+/// The reaper runs from the spawn and idles while the expiry is zero, so
+/// enabling the timer needs no extra synchronization. Every crossing in
+/// either direction restarts a mapping's timer, which the translate paths
+/// stamp; the reaper only reads and removes.
+async fn idle_reaper(inner: Arc<Inner>) {
+    loop {
+        let expiry = *inner.idle_expiry.lock().expect("idle expiry lock");
+        // The tick tracks the expiry, bounded so a huge setting still polls
+        // and a tiny one still yields.
+        let tick = if expiry.is_zero() {
+            Duration::from_millis(200)
+        } else {
+            (expiry / 4).clamp(Duration::from_millis(10), Duration::from_secs(1))
+        };
+        tokio::time::sleep(tick).await;
+        if expiry.is_zero() {
+            continue;
+        }
+        let now = tokio::time::Instant::now();
+        let nats: Vec<_> = inner.nats.lock().expect("nat list lock").clone();
+        let evicted: usize = nats.iter().map(|nat| nat.evict_idle(now, expiry)).sum();
+        if evicted > 0 {
+            inner.idled.fetch_add(evicted as u32, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Lands one datagram: inbound traffic to a NAT address crosses the NAT
@@ -828,8 +904,13 @@ impl Net {
             subnet_counter: AtomicU32::new(1),
             bound: StdMutex::new(HashSet::new()),
             mapping_expiry: StdMutex::new(Duration::ZERO),
+            idle_expiry: StdMutex::new(Duration::ZERO),
+            idled: AtomicU32::new(0),
         });
         let router_inner = Arc::clone(&inner);
+        // One reaper per network, alive from the spawn: enabling the idle
+        // timer needs no extra synchronization.
+        tokio::spawn(idle_reaper(Arc::clone(&inner)));
         tokio::spawn(async move {
             let mut registry: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, Vec<u8>)>> =
                 HashMap::new();
@@ -1104,6 +1185,23 @@ impl Net {
     /// loser socket of a punch went away.
     pub fn set_mapping_expiry(&self, expiry: Duration) {
         *self.inner.mapping_expiry.lock().expect("expiry lock") = expiry;
+    }
+
+    /// Sets how long a mapping survives without traffic in either
+    /// direction, like a real NAT's UDP refresh timer per RFC 4787.
+    ///
+    /// The default of zero disables eviction. Every datagram the mapping
+    /// translates out and every datagram arriving on its external port
+    /// restarts the timer; an expired mapping is evicted with its external
+    /// port released, counted by [`Net::idled_mappings`].
+    pub fn set_idle_expiry(&self, expiry: Duration) {
+        *self.inner.idle_expiry.lock().expect("idle expiry lock") = expiry;
+    }
+
+    /// Mappings the idle reaper evicted.
+    #[must_use]
+    pub fn idled_mappings(&self) -> u32 {
+        self.inner.idled.load(Ordering::Relaxed)
     }
 
     /// Packets the router forwarded.

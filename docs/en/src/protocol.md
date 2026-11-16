@@ -21,7 +21,7 @@ signaling: [version: u8][postcard SigFrame]
 data:      [magic: 0x70][version: u8][postcard DataPacket]
 ```
 
-The two planes treat garbage differently. A signaling frame that fails to decode is skipped and reception continues, which keeps a stray datagram on a shared host channel from ending the session. A data packet that fails to decode is dropped silently, because the data plane is hostile by design. A version mismatch on either plane ends the session, because no productive exchange can follow it.
+The two planes treat garbage differently. A signaling frame that fails to decode is skipped and reception continues, which keeps a stray datagram on a shared host channel from ending the session. A data packet that fails to decode is dropped silently, because the data plane is hostile by design. A version mismatch on the signaling plane ends the session, because no productive exchange can follow it; on the data plane the mismatched packet is one more piece of garbage and drops the same way, so the attempt runs on to its stage deadlines.
 
 Two postcard properties matter to hosts. The encoding is not canonical: varint fields admit overlong forms, so equal values do not guarantee equal bytes, and hosts must not deduplicate or reconcile frames by raw byte equality. Decoding rejects trailing bytes, so a valid encoding followed by extra bytes fails rather than yielding a second interpretation.
 
@@ -31,7 +31,7 @@ Durations travel as plain millisecond integers. The API accepts `Duration` and c
 
 Both sides must run the same `VERSION`, currently 5. Enum variants are append-only across releases, and postcard encodes them as variant indices, so adding, reordering, or removing a variant requires a version bump.
 
-Adding a variant requires the bump just as much. postcard cannot tell an unknown variant index from corrupt bytes, so an old peer that receives a frame carrying a newer variant sees a plain decode error: on the signaling plane the frame is skipped and the peer burns to a phase timeout without ever learning of the mismatch. The version discipline is the only guard on that plane. The data plane checks the version byte before the body, so the first foreign-version packet fails the session with `VersionMismatch` on the spot.
+Adding a variant requires the bump just as much. postcard cannot tell an unknown variant index from corrupt bytes, so an old peer that receives a frame carrying a newer variant sees a plain decode error: on the signaling plane the frame is skipped and the peer burns to a phase timeout without ever learning of the mismatch. The version discipline is the only guard on that plane. The data plane checks the version byte before the body and drops a foreign-version packet as silently as any broken one: punch sockets are fresh ephemeral ports, so stray internet noise can carry the magic byte, and the version byte alone cannot prove a peer behind it. Both mismatching peers simply burn to their phase timeouts.
 
 ## Shared values
 

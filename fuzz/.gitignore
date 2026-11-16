@@ -1,4 +1,4 @@
 target
-corpus
 coverage
 artifacts
+# Seed corpora are tracked; a locally grown corpus shows as untracked noise.

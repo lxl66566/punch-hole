@@ -25,7 +25,7 @@ use super::stun::binding_response;
 pub(crate) use super::stun::{binding_request, parse_mapped};
 use super::stun::{change_request, is_binding_request, parse_response};
 use crate::{
-    config::PunchConfig,
+    config::{IpPolicy, PunchConfig},
     error::{Phase, PunchError},
     msg::{MAX_ALLOC_SEQ, MAX_V6_ADDRS},
     nat::{FilterClass, NatInfo, V4Nat, V6Nat, classify},
@@ -44,7 +44,9 @@ const FILTER_TEST_WAIT: Duration = Duration::from_millis(400);
 /// Runs the Probe phase and returns the evidence it collected.
 ///
 /// Both address families fit inside `cfg.probe_timeout`, and the whole
-/// phase never outlives `overall`, the session's wall-clock deadline.
+/// phase never outlives `overall`, the session's wall-clock deadline. A
+/// family the `ip_policy` made mandatory fails the phase when it yields no
+/// observation; the optional half of `Dual` may come back `None`.
 pub(crate) async fn probe<F: UdpFactory>(
     cfg: &PunchConfig,
     factory: &F,
@@ -62,6 +64,15 @@ pub(crate) async fn probe<F: UdpFactory>(
         (None, Vec::new())
     };
     let v6 = if cfg.ip_policy.allows_v6() { probe_v6(cfg, factory, deadline).await } else { None };
+    // A family the policy made mandatory is the whole plan: no observation
+    // from it means the path is dead, and an empty Ok would read exactly
+    // like success. Under Dual the v6 half stays optional — the v4 matrix
+    // carries the session — and a dead v4 path already fails in probe_v4.
+    if cfg.ip_policy == IpPolicy::Ipv6Only && v6.is_none() {
+        return Err(PunchError::Timeout {
+            phase: Phase::Probe,
+        });
+    }
     Ok(NatInfo { v4, v6, local })
 }
 
@@ -605,6 +616,10 @@ async fn filter_test<S: UdpIo>(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use tokio::sync::{Mutex, mpsc};
+
     use super::*;
 
     #[test]
@@ -741,6 +756,136 @@ mod tests {
         assert_eq!(filtering_class(true, false), F::EndpointIndependent);
         assert_eq!(filtering_class(false, true), F::AddressDependent);
         assert_eq!(filtering_class(false, false), F::AddressPortDependent);
+    }
+
+    /// One socket of a fake path. A live socket answers every binding
+    /// request from its own destination, like a responsive server; a dead
+    /// one accepts every send into silence. No real timing exists — the
+    /// paused test clock drives every wait.
+    struct FakeSocket {
+        live: bool,
+        outbox: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+        inbox: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+    }
+
+    // The send body is fully synchronous; only recv_from truly waits.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl UdpIo for FakeSocket {
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+            if self.live && buf.len() >= 20 {
+                // The transaction id closes the loop between request and
+                // the queued answer.
+                let txid: [u8; 12] = buf[8..20].try_into().expect("request header");
+                let _ = self.outbox.send((target, binding_response(&txid, 41234)));
+            }
+            Ok(buf.len())
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            match self.inbox.lock().await.recv().await {
+                Some((from, payload)) => {
+                    buf[..payload.len()].copy_from_slice(&payload);
+                    Ok((payload.len(), from))
+                },
+                None => std::future::pending().await,
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 9999)))
+        }
+    }
+
+    /// Binds fake sockets; `v4_live` picks a live v4 server path, every
+    /// other path stays dead.
+    struct FakeFactory {
+        v4_live: bool,
+    }
+
+    // The bind body is fully synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl UdpFactory for FakeFactory {
+        type Socket = FakeSocket;
+
+        async fn bind(&self, addr: SocketAddr) -> io::Result<FakeSocket> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            Ok(FakeSocket {
+                live: self.v4_live && addr.is_ipv4(),
+                outbox: tx,
+                inbox: Mutex::new(rx),
+            })
+        }
+    }
+
+    /// A probe config over literal servers, so the lookups touch no DNS.
+    fn probe_cfg(policy: IpPolicy, servers: &[&str]) -> PunchConfig {
+        PunchConfig {
+            stun_servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+            ip_policy: policy,
+            probe_timeout: Duration::from_millis(300),
+            ..PunchConfig::default()
+        }
+    }
+
+    /// A policy that makes IPv4 mandatory fails the phase when nothing
+    /// answers, instead of returning an empty success.
+    #[tokio::test(start_paused = true)]
+    async fn mandatory_v4_dead_path_fails_the_phase() {
+        let cfg = probe_cfg(IpPolicy::Ipv4Only, &["203.0.113.9:3478"]);
+        let err = probe(
+            &cfg,
+            &FakeFactory { v4_live: false },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a dead mandatory path");
+        assert!(
+            matches!(err, PunchError::Timeout {
+                phase: Phase::Probe
+            }),
+            "got {err:?}"
+        );
+    }
+
+    /// A dead IPv6 path under `Ipv6Only` is an error, not an empty
+    /// `NatInfo` that reads exactly like success: the family is the whole
+    /// plan. The live v4 path proves the failure is the policy's verdict,
+    /// not a dead network.
+    #[tokio::test(start_paused = true)]
+    async fn mandatory_v6_dead_path_fails_the_phase() {
+        let cfg = probe_cfg(IpPolicy::Ipv6Only, &["[2001:db8::1]:3478"]);
+        let err = probe(
+            &cfg,
+            &FakeFactory { v4_live: true },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a dead mandatory path");
+        assert!(
+            matches!(err, PunchError::Timeout {
+                phase: Phase::Probe
+            }),
+            "got {err:?}"
+        );
+    }
+
+    /// Under `Dual` a dead v6 half is optional: the probe succeeds with
+    /// `v6: None` and the v4 evidence stands.
+    #[tokio::test(start_paused = true)]
+    async fn dual_with_only_v4_alive_succeeds_with_v6_none() {
+        let cfg = probe_cfg(IpPolicy::Dual, &["203.0.113.9:3478", "[2001:db8::1]:3478"]);
+        let info = probe(
+            &cfg,
+            &FakeFactory { v4_live: true },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("the live v4 half carries a Dual probe");
+        assert!(
+            info.v4.is_some(),
+            "the live path reports its classification"
+        );
+        assert!(info.v6.is_none(), "the dead optional half stays None");
     }
 
     /// A dual-stack server can answer the v6 fan-out with an IPv4-mapped

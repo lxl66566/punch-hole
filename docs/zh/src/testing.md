@@ -75,8 +75,8 @@ let host = net.host(nat_lab::NatSpec::cone_apdf());  // 挂在 NAT 后面
 
 三个 `cargo-fuzz` 目标解码任意字节：`fuzz_sig_frame` 和 `fuzz_data_packet` 覆盖线上编解码，`fuzz_stun` 覆盖 STUN 应答解析器。三者断言同一契约：任何输入要么产出合法消息，要么产出错误，绝不 panic 或挂起。
 
-CI 不跑模糊器。`decoder_corpus.rs` 用固定语料在每次运行里覆盖同一性质。Windows 上模糊目标需要 MSVC AddressSanitizer 运行时在 `PATH` 里。
+CI 只对模糊目标做编译检查，不实际运行；`decoder_corpus.rs` 用固定语料在每次运行里覆盖同一性质。Windows 上模糊目标需要 MSVC AddressSanitizer 运行时在 `PATH` 里。
 
 ## CI 策略
 
-CI 用 `cargo-nextest` 跑 Linux、Windows、macOS 三平台，另有固定在 MSRV 上的 cargo check 任务。模拟器测试由构造保证确定性、按测试名做种子，失败用同一种子复现，抖动按缺陷分诊而不是重试了事。
+CI 在每次 pull request 与推送到 main 时于 Linux、Windows、macOS 三平台运行 `cargo-nextest`，另有单独的任务编译检查模糊目标。MSRV（各 manifest 里的 `rust-version`）只在准备发布时验证，CI 不校验它。模拟器测试由构造保证确定性、按测试名做种子，失败用同一种子复现，抖动按缺陷分诊而不是重试了事。

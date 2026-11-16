@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -41,3 +43,20 @@ jobs:
         run: for i in $(seq 2 254); do sudo ifconfig lo0 alias 127.0.0.$i up; done
       - name: cargo test
         run: cargo nextest run --workspace --all-features --locked --no-tests pass && cargo test --workspace --all-features --locked --doc
+
+  # The fuzz crate sits outside the workspace (a bare [workspace] in
+  # fuzz/Cargo.toml), so the clippy leg above never compiles it and a
+  # decoder signature change could rot the targets while CI stays green.
+  # A plain check suffices: libfuzzer-sys builds without sanitizers.
+  fuzz-check:
+    name: cargo check fuzz
+    runs-on: ubuntu-latest
+    # sccache never starts in this job, so the workflow-level RUSTC_WRAPPER
+    # must be cleared; an empty value reads as "no wrapper" to cargo.
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets

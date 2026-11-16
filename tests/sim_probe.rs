@@ -389,6 +389,27 @@ async fn persistent_send_failure_keeps_the_stride() {
     assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: 2 }));
     assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
 }
+
+/// A descending allocation walk fits the same EasySym stride as an
+/// ascending one: the classifier reads step -2, the prediction windows
+/// continue backwards, and PredictiveExchange punches. A stepped walk
+/// starts at the range floor, where a descending first step wraps to the
+/// top of the range, so each NAT enters the session one allocation in —
+/// the busy-router position — and the probe reads the descent unwrapped.
+#[tokio::test(start_paused = true)]
+async fn negative_stride_walk_reads_easy_and_punches() {
+    let net = Net::seeded("negative_stride");
+    let stun = net.stun_server();
+    let a = net.host(NatSpec::sequential(-2));
+    let b = net.host(NatSpec::sequential(-2));
+    a.external_allocations(1).await;
+    b.external_allocations(1).await;
+    let (ra, rb) = common::punch_pair(a, config(&stun), b, config(&stun)).await;
+    let pa = ra.expect("descending easy pair punches");
+    let _ = rb.expect("peer side punches");
+    assert_eq!(pa.report.local_class, Some(NatClass::EasySym { step: -2 }));
+    assert_eq!(pa.report.strategy, StrategyId::PredictiveExchange);
+}
 #[tokio::test(start_paused = true)]
 async fn probe_phase_ends_at_its_deadline() {
     let net = Net::seeded("probe_deadline");
@@ -410,6 +431,58 @@ async fn probe_phase_ends_at_its_deadline() {
     // Round one waits half the budget, round two waits out the rest; paused
     // time makes the deadline exact.
     assert_eq!(t.elapsed(), std::time::Duration::from_millis(600));
+}
+
+/// `Puncher::probe` runs the Probe phase standalone: a live server grid
+/// yields the classification a session would cache, without any signaling
+/// attached. The IPv4-only simulator leaves the optional v6 half of the
+/// Dual policy empty.
+#[tokio::test(start_paused = true)]
+async fn standalone_probe_classifies_a_live_server() {
+    let net = Net::seeded("standalone_probe_live");
+    let stun = net.stun_server();
+    let host = net.host(NatSpec::sequential(2));
+    let puncher = punch_hole::Puncher::with_factory(config(&stun), host).expect("config valid");
+    let info = puncher.probe().await.expect("live servers answer");
+    let v4 = info.v4.expect("v4 observation");
+    assert_eq!(v4.class, NatClass::EasySym { step: 2 });
+    assert_eq!(
+        v4.reflexive.port(),
+        30_000,
+        "the reflexive port is the walk base"
+    );
+    assert!(
+        info.v6.is_none(),
+        "a v4-only network leaves the optional family empty"
+    );
+}
+
+/// `Puncher::probe` against servers that never answer fails at the Probe
+/// phase deadline under every policy that makes v4 mandatory; a mandatory
+/// family without an observation is a dead path, and the optional half of
+/// Dual never rescues it.
+#[tokio::test(start_paused = true)]
+async fn standalone_probe_times_out_on_dead_servers() {
+    for policy in [punch_hole::IpPolicy::Dual, punch_hole::IpPolicy::Ipv4Only] {
+        let net = Net::seeded("standalone_probe_dead");
+        // No STUN server on this address; the router drops the queries.
+        let mut cfg = punch_hole::PunchConfig::default();
+        cfg.stun_servers = vec!["9.9.9.9:3478".to_owned()];
+        cfg.ip_policy = policy;
+        let host = net.host(NatSpec::cone_eif());
+        let puncher = punch_hole::Puncher::with_factory(cfg, host).expect("config valid");
+
+        let t = tokio::time::Instant::now();
+        let err = puncher.probe().await.unwrap_err();
+        assert!(
+            matches!(err, PunchError::Timeout {
+                phase: punch_hole::Phase::Probe
+            }),
+            "{policy:?} got {err:?}"
+        );
+        // Both fan-out rounds fit inside the phase budget.
+        assert!(t.elapsed() <= std::time::Duration::from_secs(3));
+    }
 }
 
 /// Wires the pair so every frame crosses, and walks `drift` hosts'

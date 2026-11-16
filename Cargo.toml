@@ -16,6 +16,10 @@ include      = [
   "/tests/**",
 ]
 
+# The `test-util` seam and simulator docs render on docs.rs too.
+[package.metadata.docs.rs]
+all-features = true
+
 [workspace]
 members = ["crates/nat-lab", "crates/punch-hole-demo"]
 

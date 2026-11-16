@@ -191,6 +191,49 @@ async fn sequential_mapping_walks_one_step_per_destination(e: impl Engine) {
     assert_eq!(e.mapping_count(), 2);
 }
 
+/// Three destinations in send order walk a descending stride: base, then
+/// one step below it, then two below. The walk is modular over the window,
+/// so the ports below the base surface from the window top.
+async fn sequential_mapping_walks_down_one_step_per_destination(e: impl Engine) {
+    let d1 = e.public_socket().await.expect("d1 binds");
+    let d2 = e.public_socket().await.expect("d2 binds");
+    let d3 = e.public_socket().await.expect("d3 binds");
+    let client = e.client().await.expect("client binds");
+
+    client
+        .send_to(b"one", d1.local_addr().expect("d1 addr"))
+        .await
+        .expect("send one");
+    client
+        .send_to(b"two", d2.local_addr().expect("d2 addr"))
+        .await
+        .expect("send two");
+    client
+        .send_to(b"three", d3.local_addr().expect("d3 addr"))
+        .await
+        .expect("send three");
+
+    let (_, from1) = recv_from(&d1).await;
+    let (_, from2) = recv_from(&d2).await;
+    let (_, from3) = recv_from(&d3).await;
+    let window = e.port_window();
+    let base = window.start;
+    let width = u16::try_from(window.len()).expect("test window fits u16");
+    assert_eq!(from1.port(), base, "the first destination reads the base");
+    assert_eq!(
+        from2.port(),
+        base + width - 2,
+        "the second reads one step below the base, wrapped to the window top"
+    );
+    assert_eq!(
+        from3.port(),
+        base + width - 4,
+        "the third reads two steps below it"
+    );
+    e.wait_mappings(3).await;
+    assert_eq!(e.mapping_count(), 3);
+}
+
 /// Two ports of one destination address share one mapping; a second
 /// destination address opens its own mapping one step ahead.
 async fn address_sequential_shares_one_mapping_per_destination_address(e: impl Engine) {
@@ -402,6 +445,29 @@ async fn socket_drop_releases_mappings_and_keeps_the_peak(e: impl Engine) {
     assert_eq!(e.peak_mappings(), 1, "the peak records what existed");
 }
 
+/// A mapping idle past the expiry is evicted with its port released and
+/// counted, while periodic traffic through the mapping refreshes the timer
+/// across several expiries.
+async fn idle_expiry_evicts_a_quiet_mapping_and_traffic_refreshes(e: impl Engine) {
+    e.set_idle_expiry(Duration::from_millis(300));
+    let dest = e.public_socket().await.expect("dest binds");
+    let client = e.client().await.expect("client binds");
+    let target = dest.local_addr().expect("dest addr");
+
+    for _ in 0..8 {
+        client.send_to(b"tick", target).await.expect("send");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(e.mapping_count(), 1, "traffic refreshes the idle timer");
+        assert_eq!(e.idled_mappings(), Some(0));
+    }
+
+    // With traffic stopped, the reaper evicts and counts.
+    e.wait_drained().await;
+    assert_eq!(e.mapping_count(), 0);
+    assert_eq!(e.idled_mappings(), Some(1));
+    assert_eq!(e.peak_mappings(), 1, "the peak records what existed");
+}
+
 /// Declares one behavior claim on both engines: the simulator under paused
 /// time and the lab on real time. Each engine seeds itself with its test
 /// name, so a failure reproduces.
@@ -439,6 +505,19 @@ conformance!(
         hairpin: true,
     },
     sequential_mapping_walks_one_step_per_destination
+);
+
+conformance!(
+    sim_sequential_mapping_walks_down_one_step_per_destination,
+    lab_sequential_mapping_walks_down_one_step_per_destination,
+    NatSpec {
+        mapping: MappingBehavior::AddressPortDependent,
+        allocation: Allocation::Increment { step: -2 },
+        filtering: FilterClass::AddressDependent,
+        port_range: 30_000..30_040,
+        hairpin: true,
+    },
+    sequential_mapping_walks_down_one_step_per_destination
 );
 
 conformance!(
@@ -515,6 +594,16 @@ conformance!(
         FilterClass::EndpointIndependent
     ),
     socket_drop_releases_mappings_and_keeps_the_peak
+);
+
+conformance!(
+    sim_idle_expiry_evicts_a_quiet_mapping_and_traffic_refreshes,
+    lab_idle_expiry_evicts_a_quiet_mapping_and_traffic_refreshes,
+    spec(
+        MappingBehavior::EndpointIndependent,
+        FilterClass::EndpointIndependent
+    ),
+    idle_expiry_evicts_a_quiet_mapping_and_traffic_refreshes
 );
 
 conformance!(

@@ -75,8 +75,8 @@ The matrix strategy cases run on both simulated and real NATs: cone pairs, the e
 
 Three `cargo-fuzz` targets decode arbitrary bytes: `fuzz_sig_frame` and `fuzz_data_packet` over the wire codecs, `fuzz_stun` over the STUN response parser. All three assert the same contract: any input produces either a valid message or an error, never a panic or a hang.
 
-CI runs no fuzzer. `decoder_corpus.rs` covers the same property with a fixed corpus in every run. On Windows the fuzz targets need the MSVC AddressSanitizer runtime on `PATH`.
+CI compile-checks the fuzz targets without running them; `decoder_corpus.rs` covers the same property with a fixed corpus in every run. On Windows the fuzz targets need the MSVC AddressSanitizer runtime on `PATH`.
 
 ## CI policy
 
-CI runs `cargo-nextest` on Linux, Windows, and macOS, plus a cargo check job pinned to the MSRV. Simulator tests are deterministic by construction, seeded by test name, so a failure reproduces with the same seed and flakes are triaged as defects instead of retried.
+CI runs `cargo-nextest` on Linux, Windows, and macOS on every pull request and push to main, and a separate job compile-checks the fuzz targets. The MSRV (`rust-version` in every manifest) is exercised only when preparing a release, so CI does not verify it. Simulator tests are deterministic by construction, seeded by test name, so a failure reproduces with the same seed and flakes are triaged as defects instead of retried.

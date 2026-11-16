@@ -1,9 +1,11 @@
 //! Seam trait implementations for the [`nat-lab`] engines.
 //!
-//! The session engine is generic over this crate's own [`UdpFactory`] and
-//! [`UdpIo`]. These impls bridge the two engines of the `nat-lab` crate onto
-//! that seam, so a test can hand a simulated host or a loopback NAT host
-//! straight to [`Puncher::with_factory`](crate::Puncher::with_factory).
+//! The session engine is generic over this crate's own
+//! [`UdpFactory`](crate::socket::UdpFactory) and
+//! [`UdpIo`](crate::socket::UdpIo). These impls bridge the two engines of
+//! the `nat-lab` crate onto that seam, so a test can hand a simulated host
+//! or a loopback NAT host straight to
+//! [`Puncher::with_factory`](crate::Puncher::with_factory).
 //!
 //! [`nat-lab`]: https://docs.rs/nat-lab
 

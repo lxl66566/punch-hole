@@ -35,7 +35,7 @@ src/
 └── compat.rs      nat-lab 引擎的接缝实现，位于 `test-util` 特性之后
 ```
 
-workspace 在根 crate 旁带一个成员：`crates/nat-lab`，即独立发布为 `nat-lab` crate 的 NAT 测试实验室。它的虚拟网络与回环两个引擎在 `test-util` 特性之后服务于集成测试层。
+workspace 在根 crate 旁带两个成员：`crates/nat-lab`，即独立发布为 `nat-lab` crate 的 NAT 测试实验室，以及 `crates/punch-hole-demo`，构建 `punch-demo` 二进制。实验室的虚拟网络与回环两个引擎在 `test-util` 特性之后服务于集成测试层。
 
 依赖保持很少：`tokio` 和 `tokio-util` 负责异步 IO 与取消，`socket2` 负责平台选项，`serde` 加 `postcard` 负责帧，`rand` 负责 nonce 和脉冲抽取，`bytes` 负责桥，`thiserror` 负责错误类型。探测器需要的 STUN 子集很小，直接写在库里；唯一的测试依赖是 workspace 自家的 `nat-lab` crate。
 
@@ -97,4 +97,4 @@ Probe -> Exchange -> Negotiate -> Punch -> Confirm -> Handover -> Done
 
 ## 交付后的心跳
 
-`keepalive::spawn_io` 每十秒发一个小心跳，宿主空闲时保住 NAT 映射，`Arc` 共享的 tokio 胜出套接字经 `UdpIo` 实现流入。返回的 guard 在 drop 时中止任务；任务持有传入的套接字值，宿主若把仅有的引用移进来，随 guard 一起关闭。心跳发送失败会结束任务，`KeepaliveGuard::is_alive` 能查到，映射的死亡可观察而非无声。心跳载荷带尝试 nonce，宿主用 `msg::is_protocol_packet` 丢弃协议形状的数据报，它同时覆盖心跳与迟到的握手重传。
+`keepalive::spawn_io` 每十秒发一个小心跳（默认间隔 `KEEPALIVE_INTERVAL`），宿主空闲时保住 NAT 映射，`Arc` 共享的 tokio 胜出套接字经 `UdpIo` 实现流入。`spawn_io_with_interval` 可改用自定义间隔。返回的 guard 在 drop 时中止任务；任务持有传入的套接字值，宿主若把仅有的引用移进来，随 guard 一起关闭。心跳发送失败会结束任务，`KeepaliveGuard::is_alive` 能查到，映射的死亡可观察而非无声。`KeepaliveGuard::stopped` 在任务结束时完成，宿主以此决定是否降级中继；等待单次有效，丢弃返回的 future 只取消等待，不取消任务。心跳载荷带尝试 nonce，宿主用 `msg::is_protocol_packet` 丢弃协议形状的数据报，它同时覆盖心跳与迟到的握手重传。

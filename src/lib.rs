@@ -9,7 +9,8 @@
 //! The book under `docs/` carries the full tutorial and reference, in
 //! English and Chinese: the UDP hole punching primer, the strategy
 //! walkthrough, the architecture, the wire protocol, and the test system.
-//! A runnable two-terminal demo lives in `crates/punch-hole-demo`.
+//! It is hosted at <https://lxl66566.github.io/punch-hole/>. A runnable
+//! two-terminal demo lives in `crates/punch-hole-demo`.
 //!
 //! # Trust model
 //!

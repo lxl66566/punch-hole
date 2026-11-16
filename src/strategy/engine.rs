@@ -196,6 +196,11 @@ struct Progress {
 /// both ends then hold.
 struct Handshake {
     candidate: Option<(Family, u16)>,
+    /// Source the candidate was pinned with. The SynAck retransmission
+    /// answers this pair, because `peer_addr` follows the latest Syn of
+    /// any socket and in multi-socket plans belongs to a different
+    /// exchange.
+    candidate_addr: Option<SocketAddr>,
     confirmed: Option<(Family, u16)>,
     peer_socket: Option<u16>,
     peer_addr: Option<SocketAddr>,
@@ -248,6 +253,12 @@ pub(crate) struct Engine<S: UdpIo> {
     plan: ExecPlan,
     nonce: Nonce,
     syn_bufs: [Vec<Vec<u8>>; 2],
+    /// Pre-encoded SynAck per family and socket index, so the
+    /// confirm-cadence retransmission sends cached bytes instead of
+    /// re-serializing every tick of the grace window.
+    synack_bufs: [Vec<Vec<u8>>; 2],
+    /// Pre-encoded Ack, same shape and reason as `synack_bufs`.
+    ack_bufs: [Vec<Vec<u8>>; 2],
     start: Option<tokio::time::Instant>,
     punch_deadline: tokio::time::Instant,
     /// The session's wall-clock deadline, from the session start.
@@ -261,6 +272,12 @@ pub(crate) struct Engine<S: UdpIo> {
 }
 
 impl<S: UdpIo> Engine<S> {
+    /// One pre-encoded buffer per bound socket index for a variant whose
+    /// only variable field is the socket index.
+    fn packet_bufs(count: usize, make: impl Fn(u16) -> DataPacket) -> Vec<Vec<u8>> {
+        (0..count).map(|i| encode_packet(&make(i as u16))).collect()
+    }
+
     /// `overall` is the session's wall-clock deadline; every engine
     /// deadline stays at or before it.
     pub(crate) fn new(
@@ -275,6 +292,8 @@ impl<S: UdpIo> Engine<S> {
             nonce,
             overall,
             syn_bufs: [Vec::new(), Vec::new()],
+            synack_bufs: [Vec::new(), Vec::new()],
+            ack_bufs: [Vec::new(), Vec::new()],
             start: None,
             punch_deadline: overall,
             progress: Progress {
@@ -285,6 +304,7 @@ impl<S: UdpIo> Engine<S> {
             },
             handshake: Handshake {
                 candidate: None,
+                candidate_addr: None,
                 confirmed: None,
                 peer_socket: None,
                 peer_addr: None,
@@ -336,14 +356,15 @@ impl<S: UdpIo> Engine<S> {
             .unwrap_or(0);
         let (pool, mut events) = SocketPool::bind(factory, &self.cfg, v4, v6).await?;
         for family in [Family::V4, Family::V6] {
-            self.syn_bufs[family.index()] = (0..pool.bound(family))
-                .map(|i| {
-                    encode_packet(&DataPacket::Syn {
-                        nonce: self.nonce,
-                        socket: i as u16,
-                    })
-                })
-                .collect();
+            let idx = family.index();
+            let bound = pool.bound(family);
+            let nonce = self.nonce;
+            self.syn_bufs[idx] =
+                Self::packet_bufs(bound, |socket| DataPacket::Syn { nonce, socket });
+            self.synack_bufs[idx] =
+                Self::packet_bufs(bound, |socket| DataPacket::SynAck { nonce, socket });
+            self.ack_bufs[idx] =
+                Self::packet_bufs(bound, |socket| DataPacket::Ack { nonce, socket });
         }
         self.start_refresh(&pool);
         let result = self.drive(&pool, &mut events, sig).await;
@@ -591,7 +612,10 @@ impl<S: UdpIo> Engine<S> {
     ///
     /// One reply per confirm window covers the peer, because the
     /// retransmission tick repeats the SynAck on that same cadence for a
-    /// live candidate.
+    /// live candidate. The mute itself lands in `mute_syn_reply` only
+    /// after the reply left, so a skipped send (conntrack full, budget
+    /// gone) mutes nothing: the source's next Syn retries rather than
+    /// waiting out a window for an answer that never left.
     fn syn_reply_due(&mut self, socket: u16, from: SocketAddr, now: tokio::time::Instant) -> bool {
         let key = (socket, from);
         if let Some(&mute_until) = self.handshake.syn_replies.get(&key)
@@ -609,10 +633,16 @@ impl<S: UdpIo> Engine<S> {
                 return false;
             }
         }
+        true
+    }
+
+    /// Mutes one Syn source for a confirm window, once its SynAck left.
+    /// The record doubles as the proof `answered_syn` checks before an
+    /// Ack may confirm, so it may only exist for answers that went out.
+    fn mute_syn_reply(&mut self, socket: u16, from: SocketAddr, now: tokio::time::Instant) {
         self.handshake
             .syn_replies
-            .insert(key, now + self.cfg.confirm_retry);
-        true
+            .insert((socket, from), now + self.cfg.confirm_retry);
     }
 
     /// Whether this side aimed Syns at the host of `addr`.
@@ -688,15 +718,14 @@ impl<S: UdpIo> Engine<S> {
         }
         let pkt = match decode_packet(&ev.buf[..ev.len]) {
             Ok(pkt) => pkt,
-            // A frame with our magic but a foreign version can only be a
-            // peer running an incompatible protocol; fail the session now
-            // instead of letting it burn to a phase timeout.
-            Err(DecodeError::Version { local, peer }) => {
-                return Err(PunchError::VersionMismatch { local, peer });
-            },
-            // Any other broken frame is foreign traffic on a fresh
-            // ephemeral port and stays noise.
-            Err(DecodeError::BadFrame) => return Ok(()),
+            // Broken bytes and a foreign version read the same here: punch
+            // sockets are fresh ephemeral ports, so internet noise can
+            // carry the magic head with any second byte, and the version
+            // byte alone cannot prove a peer behind it. The frame drops
+            // and the stage deadlines name the failure; only the
+            // authenticated signaling plane escalates a version mismatch
+            // into a session abort.
+            Err(DecodeError::Version { .. } | DecodeError::BadFrame) => return Ok(()),
         };
         let nonce = pkt.nonce();
         if nonce != self.nonce {
@@ -710,18 +739,25 @@ impl<S: UdpIo> Engine<S> {
                 // Peer state refreshes on every Syn, duplicates included;
                 // only the reply is gated.
                 self.observe_peer(socket, ev.from, now, ev.family, ev.socket);
-                self.handshake
-                    .candidate
-                    .get_or_insert((ev.family, ev.socket));
+                if self.handshake.candidate.is_none() {
+                    self.handshake.candidate = Some((ev.family, ev.socket));
+                    // The retransmit stream repeats this socket's answer to
+                    // this source: the pair was observed together, while
+                    // `peer_addr` tracks the latest Syn of any socket.
+                    self.handshake.candidate_addr = Some(ev.from);
+                }
                 if self.syn_reply_due(ev.socket, ev.from, now) {
                     let buf = encode_packet(&DataPacket::SynAck {
                         nonce,
                         socket: ev.socket,
                     });
-                    if let Err(e) = pool.send(ev.family, ev.socket, &buf, ev.from).await
-                        && let Some(e) = self.send_failed(e)
-                    {
-                        return Err(e);
+                    match pool.send(ev.family, ev.socket, &buf, ev.from).await {
+                        Ok(()) => self.mute_syn_reply(ev.socket, ev.from, now),
+                        Err(e) => {
+                            if let Some(e) = self.send_failed(e) {
+                                return Err(e);
+                            }
+                        },
                     }
                     self.handshake.next_reply = now + self.cfg.confirm_retry;
                 }
@@ -1015,13 +1051,27 @@ impl<S: UdpIo> Engine<S> {
         self.targets.entries = Some((self.progress.stage_idx, None, Arc::new(targets)));
     }
 
+    /// One heartbeat: stage advancement, refresh retries, announce
+    /// retransmission, the Syn pulse sweep, and the confirm-cadence
+    /// retransmissions, each in its own timing regime below.
     async fn on_tick(&mut self, pool: &SocketPool<S>) -> Result<(), PunchError> {
         let now = tokio::time::Instant::now();
-        // A tick delayed by an event storm can land past several stage
-        // boundaries at once, so the advance runs until the active stage
-        // owns `now`. Plans hold at most two stages today and validation
-        // keeps every stage longer than a tick, which makes one advance
-        // per tick sufficient; the loop keeps that true for any plan.
+        self.advance_stage(now);
+        self.refresh_tick(pool, now).await?;
+        self.announce_tick(now);
+        self.pulse_tick(pool, now).await?;
+        self.retransmit_tick(pool, now).await;
+        Ok(())
+    }
+
+    /// Moves the active stage forward until it owns `now`.
+    ///
+    /// A tick delayed by an event storm can land past several stage
+    /// boundaries at once, so the advance runs until the active stage
+    /// owns `now`. Plans hold at most two stages today and validation
+    /// keeps every stage longer than a tick, which makes one advance
+    /// per tick sufficient; the loop keeps that true for any plan.
+    fn advance_stage(&mut self, now: tokio::time::Instant) {
         while now >= self.stage_end(self.progress.stage_idx)
             && self.progress.stage_idx + 1 < self.plan.stages.len()
         {
@@ -1029,17 +1079,25 @@ impl<S: UdpIo> Engine<S> {
             self.progress.sweep = 0;
             self.progress.sweep_off = 0;
         }
+    }
 
-        // Refresh retries.
+    /// Retries the pending refresh query on the confirm cadence, and ends
+    /// the pending state once the attempts ran out.
+    ///
+    /// Without the announced port the peer has nothing to aim at. With
+    /// handshake traffic already flowing, the grace path decides instead
+    /// of the refresh. A sequence marker that never crossed only leaves
+    /// the peer's prediction on its probe-time base, so the plan
+    /// continues.
+    async fn refresh_tick(
+        &mut self,
+        pool: &SocketPool<S>,
+        now: tokio::time::Instant,
+    ) -> Result<(), PunchError> {
         if let Some(pending) = &self.announce.stun
             && now >= pending.next_retry
             && pending.attempts_left == 0
         {
-            // Without the announced port the peer has nothing to aim at.
-            // With handshake traffic already flowing, the grace path
-            // decides instead of the refresh. A sequence marker that never
-            // crossed only leaves the peer's prediction on its probe-time
-            // base, so the plan continues.
             if self.handshake.first_traffic.is_none() && !self.plan.sequence_marker {
                 return Err(PunchError::RefreshExhausted);
             }
@@ -1056,9 +1114,13 @@ impl<S: UdpIo> Engine<S> {
             pending.attempts_left -= 1;
             pending.next_retry = now + self.cfg.confirm_retry;
         }
+        Ok(())
+    }
 
-        // PortUpdate retransmits on the signaling retry cadence until the
-        // handshake completes, because the frame carries no acknowledgement.
+    /// Arms the next own-port retransmission. PortUpdate repeats on the
+    /// signaling retry cadence until the handshake completes, because the
+    /// frame carries no acknowledgement.
+    fn announce_tick(&mut self, now: tokio::time::Instant) {
         if let Some(ports) = self.announce.own
             && self.handshake.confirmed.is_none()
             && now >= self.announce.next
@@ -1066,9 +1128,17 @@ impl<S: UdpIo> Engine<S> {
             self.announce.pending = Some(ports);
             self.announce.next = now + self.cfg.signaling_retry;
         }
+    }
 
-        // Syn pulses. The handle is taken before the stage borrow, so the
-        // sends below can work on `&mut self` without fighting it.
+    /// Spends this tick's share of the rate grid on the active stage's Syn
+    /// sweep.
+    async fn pulse_tick(
+        &mut self,
+        pool: &SocketPool<S>,
+        now: tokio::time::Instant,
+    ) -> Result<(), PunchError> {
+        // The handle is taken before the stage borrow, so the sends below
+        // can work on `&mut self` without fighting it.
         self.apply_peer_base();
         let targets = self.live_targets();
         let stage = &self.plan.stages[self.progress.stage_idx];
@@ -1145,43 +1215,45 @@ impl<S: UdpIo> Engine<S> {
                 return Err(e);
             }
         }
+        Ok(())
+    }
 
-        // Handshake retransmissions on the confirm timer.
-        if let Some(peer) = self.handshake.peer_addr {
-            if let Some((family, idx)) = self.handshake.candidate
-                && self.handshake.confirmed.is_none()
-                && now >= self.handshake.next_reply
-            {
-                let buf = encode_packet(&DataPacket::SynAck {
-                    nonce: self.nonce,
-                    socket: idx,
-                });
-                // A handshake already ran on this path, so a failed
-                // retransmission waits for a later tick instead of failing
-                // the session.
-                if pool.send(family, idx, &buf, peer).await.is_ok() {
-                    self.handshake.next_reply = now + self.cfg.confirm_retry;
-                }
-            }
-            // The grace Ack retransmits the confirmed pair: under
-            // reordering the two ends can hold differently confirmed
-            // pairs, and this stream is what carries each side's pair to
-            // the other for the arbitration, so it runs until the loop
-            // exits on agreement or grace, never cut short.
-            if let Some((family, idx)) = self.handshake.confirmed
-                && self.handshake.grace_end.is_some()
-                && now >= self.handshake.next_reply
-            {
-                let buf = encode_packet(&DataPacket::Ack {
-                    nonce: self.nonce,
-                    socket: idx,
-                });
-                if pool.send(family, idx, &buf, peer).await.is_ok() {
-                    self.handshake.next_reply = now + self.cfg.confirm_retry;
-                }
+    /// Repeats the handshake answers on the confirm timer: the SynAck of
+    /// the pinned candidate pair while unconfirmed, the Ack of the
+    /// confirmed pair through grace. Both send the pre-encoded buffers
+    /// `run` built, so a tick costs no serialization.
+    async fn retransmit_tick(&mut self, pool: &SocketPool<S>, now: tokio::time::Instant) {
+        // The SynAck answers the (candidate socket, source) pair it was
+        // pinned with: `peer_addr` follows the latest Syn of any socket,
+        // which in multi-socket plans belongs to a different exchange.
+        if let Some((family, idx)) = self.handshake.candidate
+            && let Some(peer) = self.handshake.candidate_addr
+            && self.handshake.confirmed.is_none()
+            && now >= self.handshake.next_reply
+        {
+            let buf = &self.synack_bufs[family.index()][usize::from(idx)];
+            // A handshake already ran on this path, so a failed
+            // retransmission waits for a later tick instead of failing
+            // the session.
+            if pool.send(family, idx, buf, peer).await.is_ok() {
+                self.handshake.next_reply = now + self.cfg.confirm_retry;
             }
         }
-        Ok(())
+        // The grace Ack retransmits the confirmed pair: under reordering
+        // the two ends can hold differently confirmed pairs, and this
+        // stream is what carries each side's pair to the other for the
+        // arbitration, so it runs until the loop exits on agreement or
+        // grace, never cut short.
+        if let Some(peer) = self.handshake.peer_addr
+            && let Some((family, idx)) = self.handshake.confirmed
+            && self.handshake.grace_end.is_some()
+            && now >= self.handshake.next_reply
+        {
+            let buf = &self.ack_bufs[family.index()][usize::from(idx)];
+            if pool.send(family, idx, buf, peer).await.is_ok() {
+                self.handshake.next_reply = now + self.cfg.confirm_retry;
+            }
+        }
     }
 }
 
@@ -1611,14 +1683,20 @@ mod tests {
             .await
             .expect("pool binds");
         // A handshake ran on socket 0 and its retransmission is due. The
-        // pulse buffers normally come from `run`, which this test bypasses.
+        // pulse and confirm buffers normally come from `run`, which this
+        // test bypasses.
         engine.syn_bufs[0] = vec![encode_packet(&DataPacket::Syn {
+            nonce: [0; 16],
+            socket: 0,
+        })];
+        engine.synack_bufs[0] = vec![encode_packet(&DataPacket::SynAck {
             nonce: [0; 16],
             socket: 0,
         })];
         let now = tokio::time::Instant::now();
         engine.observe_peer(3, peer, now, Family::V4, 0);
         engine.handshake.candidate = Some((Family::V4, 0));
+        engine.handshake.candidate_addr = Some(peer);
         engine.start = Some(now);
         engine.handshake.next_reply = now;
 
@@ -1627,6 +1705,122 @@ mod tests {
             engine.progress.send_stalled,
             "sends stalled after the failure"
         );
+    }
+
+    /// Recorded sends: pool socket index, bytes, destination.
+    type Recording = Vec<(usize, Vec<u8>, SocketAddr)>;
+
+    /// A factory whose sockets record every send and never receive, so a
+    /// test can assert which socket sent what where. Sockets take their
+    /// pool index from the bind order.
+    #[derive(Default)]
+    struct RecordingFactory {
+        next: std::sync::atomic::AtomicUsize,
+        sent: Arc<std::sync::Mutex<Recording>>,
+    }
+
+    struct RecordingSocket {
+        idx: usize,
+        sent: Arc<std::sync::Mutex<Recording>>,
+    }
+
+    // The bind body is fully synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl UdpFactory for RecordingFactory {
+        type Socket = RecordingSocket;
+
+        async fn bind(&self, _addr: SocketAddr) -> std::io::Result<RecordingSocket> {
+            let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(RecordingSocket {
+                idx,
+                sent: Arc::clone(&self.sent),
+            })
+        }
+    }
+
+    // The recording body is fully synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl UdpIo for RecordingSocket {
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.sent
+                .lock()
+                .expect("record lock")
+                .push((self.idx, buf.to_vec(), target));
+            Ok(buf.len())
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 9000 + self.idx as u16)))
+        }
+    }
+
+    /// The SynAck retransmission answers the (candidate socket, source)
+    /// pair it was pinned with, never the latest observed source: in a
+    /// multi-socket plan that source belongs to a different exchange.
+    #[tokio::test(start_paused = true)]
+    async fn synack_retransmit_answers_the_pinned_candidate_source() {
+        use crate::socket::SocketPool;
+
+        let cfg = PunchConfig::default();
+        // A reply stage keeps the pulse sweep out of the recording; the
+        // pool still binds the two sockets a multi-socket plan runs.
+        let plan = exec_plan(vec![StageSpec::reply(Family::V4, cfg.punch_timeout)]);
+        let mut engine: Engine<RecordingSocket> = Engine::new(
+            plan,
+            cfg.clone(),
+            [0; 16],
+            tokio::time::Instant::now() + cfg.punch_timeout,
+        );
+        let factory = RecordingFactory::default();
+        let (pool, _events) = SocketPool::bind(&factory, &cfg, 2, 0)
+            .await
+            .expect("pool binds");
+        // The confirm buffers normally come from `run`, which this test
+        // bypasses.
+        engine.synack_bufs[0] = (0..2)
+            .map(|i| {
+                encode_packet(&DataPacket::SynAck {
+                    nonce: [0; 16],
+                    socket: i,
+                })
+            })
+            .collect();
+
+        // Syns from two peer sockets land on two local sockets: the
+        // candidate pins to the first pair, the second Syn moves only
+        // `peer_addr`.
+        let now = tokio::time::Instant::now();
+        let pinned = SocketAddr::from(([203, 0, 113, 9], 50_001));
+        let later = SocketAddr::from(([203, 0, 113, 9], 50_009));
+        engine.observe_peer(3, pinned, now, Family::V4, 0);
+        engine.handshake.candidate = Some((Family::V4, 0));
+        engine.handshake.candidate_addr = Some(pinned);
+        engine.observe_peer(4, later, now, Family::V4, 1);
+        assert_eq!(engine.handshake.peer_addr, Some(later));
+        engine.start = Some(now);
+        engine.punch_deadline = now + cfg.punch_timeout;
+        engine.handshake.next_reply = now;
+
+        engine.on_tick(&pool).await.expect("tick runs");
+        let sent = factory.sent.lock().expect("record lock").clone();
+        assert_eq!(sent.len(), 1, "one retransmission left");
+        assert_eq!(sent[0].0, 0, "the candidate socket sent it");
+        assert_eq!(
+            sent[0].2, pinned,
+            "the retransmission targets the pinned source"
+        );
+        assert_eq!(
+            decode_packet(&sent[0].1),
+            Ok(DataPacket::SynAck {
+                nonce: [0; 16],
+                socket: 0
+            })
+        );
+        pool.shutdown().await;
     }
 
     /// A SynAck reply that hits the conntrack bound skips only that
@@ -1681,7 +1875,7 @@ mod tests {
         assert_eq!(pool.sent(), 1);
 
         // Source B overflows the bound; its reply is skipped, nothing
-        // stalls.
+        // stalls, and no mute lands for an answer that never left.
         engine
             .on_data(&pool, event(b))
             .await
@@ -1691,6 +1885,10 @@ mod tests {
             "conntrack exhaustion is no stall"
         );
         assert_eq!(pool.sent(), 1);
+        assert!(
+            !engine.handshake.syn_replies.contains_key(&(0, b)),
+            "a skipped send mutes nothing"
+        );
 
         // The tracked source keeps its live path once the window passes.
         tokio::time::advance(cfg.confirm_retry).await;

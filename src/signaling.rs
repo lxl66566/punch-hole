@@ -46,6 +46,13 @@ pub struct LibEnd {
     pub(crate) inn: mpsc::Receiver<Bytes>,
 }
 
+/// Undecodable frames one `recv` call skips before it yields to the
+/// scheduler: a host streaming garbage keeps the channel Ready, and
+/// `mpsc::Receiver::recv` would answer every skip from inside one future
+/// poll, spinning the loop and starving the engine's deadline checks and
+/// ticks.
+const SKIP_YIELD: u32 = 16;
+
 /// Session-side wrapper over the bridge with timestamp and RTT bookkeeping.
 pub(crate) struct SigIo {
     out: mpsc::Sender<Bytes>,
@@ -115,11 +122,22 @@ impl SigIo {
     /// session keeps receiving; a version mismatch stays fatal because no
     /// productive exchange can follow it.
     pub(crate) async fn recv(&mut self) -> Result<SigFrame, PunchError> {
+        // The skip count is local to one call, so it resets on every good
+        // frame the call returns; only a run of garbage inside one poll
+        // can reach the yield.
+        let mut skipped = 0;
         loop {
             let bytes = self.inn.recv().await.ok_or(PunchError::SignalingClosed)?;
             let frame = match decode_sig(&bytes) {
                 Ok(frame) => frame,
-                Err(DecodeError::BadFrame) => continue,
+                Err(DecodeError::BadFrame) => {
+                    skipped += 1;
+                    if skipped == SKIP_YIELD {
+                        tokio::task::yield_now().await;
+                        skipped = 0;
+                    }
+                    continue;
+                },
                 Err(DecodeError::Version { local, peer }) => {
                     return Err(PunchError::VersionMismatch { local, peer })
                 },
@@ -210,6 +228,35 @@ mod tests {
             sig.rtt() < Duration::from_millis(200),
             "rtt stayed at the default"
         );
+        drop(host);
+    }
+
+    /// A run of undecodable frames far past the yield bound still ends in
+    /// the next good frame: the periodic yield hands control back without
+    /// losing the skip loop's place. The garbage carries our own version
+    /// byte, because a foreign version stays a fatal mismatch.
+    #[tokio::test]
+    async fn garbage_run_still_returns_the_next_good_frame() {
+        use crate::msg::VERSION;
+
+        let (host, lib) = bridge(256);
+        let mut sig = SigIo::new(lib);
+        for _ in 0..100 {
+            host.from_peer
+                .send(Bytes::from_static(&[VERSION, 0xff, 0xff]))
+                .await
+                .expect("garbage send");
+        }
+        host.from_peer
+            .send(Bytes::from(encode_sig(&SigFrame {
+                ts: 1,
+                echo: 0,
+                body: Frame::Accept,
+            })))
+            .await
+            .expect("good send");
+        let frame = sig.recv().await.expect("recv survives the garbage run");
+        assert_eq!(frame.body, Frame::Accept);
         drop(host);
     }
 }

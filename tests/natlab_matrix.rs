@@ -92,31 +92,51 @@ async fn punch_pair(
     (ra.expect("lab punch"), rb.expect("lab punch"))
 }
 
+/// Both sides' session results of one pair run.
+type PairResult = (
+    Result<Punched<LabSocket>, PunchFailure>,
+    Result<Punched<LabSocket>, PunchFailure>,
+);
+
+/// One line of retry evidence: the strategy a side reached, or the phase
+/// error that ended it.
+fn try_evidence(try_no: usize, pair: &PairResult) -> String {
+    let side = |name: &str, r: &Result<Punched<LabSocket>, PunchFailure>| match r {
+        Ok(p) => format!("{name}: ok ({:?})", p.report.strategy),
+        Err(f) => format!("{name}: {:?}", f.error),
+    };
+    format!(
+        "try {try_no}: {}, {}",
+        side("initiator", &pair.0),
+        side("responder", &pair.1)
+    )
+}
+
 /// Runs the pair on a fresh lab pair per try until both sides punch, and
-/// returns the last results together with the labs that produced them.
+/// returns the winning results together with the labs that produced them.
 ///
 /// A spray covers a fixed port set drawn from the attempt nonce, and every
 /// sweep repeats that set, so the residual miss the model leaves below a
 /// perfect target can only end the run in failure. A fresh session draws a
 /// fresh nonce, so a few retries push the residual far below any single
 /// target while each run keeps its full assertion. The STUN responder
-/// stays across tries, because it answers statelessly.
+/// stays across tries, because it answers statelessly. Every try failing
+/// is a test failure, and the panic lists each try's outcome so the
+/// residual and a broken run tell apart at a glance.
+///
+/// # Panics
+///
+/// Panics when every try failed, or when `tries` is zero.
 async fn punch_pair_retried(
     seed: &str,
     spec_a: NatSpec,
     spec_b: NatSpec,
     cfg: PunchConfig,
     tries: usize,
-) -> (
-    (
-        Result<Punched<LabSocket>, PunchFailure>,
-        Result<Punched<LabSocket>, PunchFailure>,
-    ),
-    NatLab,
-    NatLab,
-) {
-    let mut last = None;
-    for _ in 0..tries {
+) -> (PairResult, NatLab, NatLab) {
+    assert!(tries > 0, "tries is nonzero");
+    let mut evidence = Vec::new();
+    for try_no in 0..tries {
         let nat_a = NatLab::spawn(&format!("{seed}_a"), spec_a.clone())
             .await
             .expect("lab a spawns");
@@ -127,9 +147,9 @@ async fn punch_pair_retried(
         if pair.0.is_ok() && pair.1.is_ok() {
             return (pair, nat_a, nat_b);
         }
-        last = Some((pair, nat_a, nat_b));
+        evidence.push(try_evidence(try_no + 1, &pair));
     }
-    last.expect("tries is nonzero")
+    panic!("every try failed:\n{}", evidence.join("\n"));
 }
 
 /// Reads until a business datagram arrives, skipping handshake retries by

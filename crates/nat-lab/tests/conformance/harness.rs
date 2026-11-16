@@ -84,6 +84,14 @@ pub trait Engine {
 
     /// Sets how long mappings survive the close of their socket.
     fn set_expiry(&self, expiry: Duration);
+
+    /// Sets how long a mapping survives without traffic in either
+    /// direction; an expired mapping is evicted with its port released.
+    fn set_idle_expiry(&self, expiry: Duration);
+
+    /// Mappings the idle reaper evicted, when the engine exposes the
+    /// counter.
+    fn idled_mappings(&self) -> Option<u32>;
 }
 
 /// Receives one datagram within two seconds, or panics.
@@ -288,6 +296,14 @@ impl Engine for SimEng {
     fn set_expiry(&self, expiry: Duration) {
         self.net.set_mapping_expiry(expiry);
     }
+
+    fn set_idle_expiry(&self, expiry: Duration) {
+        self.net.set_idle_expiry(expiry);
+    }
+
+    fn idled_mappings(&self) -> Option<u32> {
+        Some(self.net.idled_mappings())
+    }
 }
 
 /// The lab engine: one userspace NAT forwarder over real loopback sockets.
@@ -411,5 +427,13 @@ impl Engine for LabEng {
 
     fn set_expiry(&self, expiry: Duration) {
         self.lab.set_mapping_expiry(expiry);
+    }
+
+    fn set_idle_expiry(&self, expiry: Duration) {
+        self.lab.set_idle_expiry(expiry);
+    }
+
+    fn idled_mappings(&self) -> Option<u32> {
+        Some(self.lab.idled_mappings())
     }
 }

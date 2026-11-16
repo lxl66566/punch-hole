@@ -1,0 +1,6 @@
+[timeouts]
+# A past bug parked a test on a datagram no path would ever deliver; a
+# hang is named and terminated here instead of parking until the CI job
+# timeout.
+slow-timeout    = "300s"
+terminate-after = "600s"

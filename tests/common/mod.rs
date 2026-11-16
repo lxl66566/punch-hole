@@ -60,12 +60,21 @@ pub async fn punch_pair(
 /// Reads until a business datagram arrives, skipping handshake packets
 /// still in flight around handover by the library's shape rule for its
 /// own traffic.
+///
+/// The read carries its own bound: a datagram the peer sent but the path
+/// lost (an evicted mapping, a dropped forward) would otherwise park the
+/// test forever, because the simulator's router keeps time alive without
+/// ever delivering.
 async fn recv_business<S: punch_hole::socket::UdpIo>(
     sock: &S,
     buf: &mut [u8],
 ) -> (usize, std::net::SocketAddr) {
     loop {
-        let (n, from) = sock.recv_from(buf).await.expect("business recv");
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), sock.recv_from(buf))
+                .await
+                .expect("business datagram arrives within 30s")
+                .expect("business recv");
         if !punch_hole::msg::is_protocol_packet(&buf[..n]) {
             return (n, from);
         }
@@ -144,27 +153,51 @@ pub fn cone_net(name: &str) -> (Net, StunServer, Host, Host) {
     )
 }
 
+/// Both sides' session results of one pair run.
+type PairResult = (
+    Result<Punched<SimSocket>, PunchFailure>,
+    Result<Punched<SimSocket>, PunchFailure>,
+);
+
+/// One line of retry evidence: the strategy a side reached, or the phase
+/// error that ended it.
+fn try_evidence(try_no: usize, pair: &PairResult) -> String {
+    let side = |name: &str, r: &Result<Punched<SimSocket>, PunchFailure>| match r {
+        Ok(p) => format!("{name}: ok ({:?})", p.report.strategy),
+        Err(f) => format!("{name}: {:?}", f.error),
+    };
+    format!(
+        "try {try_no}: {}, {}",
+        side("initiator", &pair.0),
+        side("responder", &pair.1)
+    )
+}
+
 /// Runs the pair on a fresh net per try until both sides punch, and returns
-/// the last results.
+/// the winning results.
 ///
 /// A spray covers a fixed port set drawn from the attempt nonce, and every
 /// sweep repeats that set, so the residual miss the model leaves below a
 /// perfect target can only end the run in failure. A fresh run draws a fresh
 /// nonce, so a few retries push the residual far below any single target
-/// while each run keeps its full assertion.
+/// while each run keeps its full assertion. Every try failing is a test
+/// failure, and the panic lists each try's outcome so the residual and a
+/// broken run tell apart at a glance.
+///
+/// # Panics
+///
+/// Panics when every try failed, or when `tries` is zero.
 pub async fn punch_pair_retried(
     name: &str,
     a: NatSpec,
     b: NatSpec,
     cfg: PunchConfig,
     tries: usize,
-) -> (
-    Result<Punched<SimSocket>, PunchFailure>,
-    Result<Punched<SimSocket>, PunchFailure>,
-) {
+) -> PairResult {
+    assert!(tries > 0, "tries is nonzero");
     let mut cfg = cfg;
-    let mut last = None;
-    for _ in 0..tries {
+    let mut evidence = Vec::new();
+    for try_no in 0..tries {
         let net = Net::seeded(name);
         let stun = net.stun_server();
         cfg.stun_servers = stun.addrs.clone();
@@ -178,7 +211,7 @@ pub async fn punch_pair_retried(
         if pair.0.is_ok() && pair.1.is_ok() {
             return pair;
         }
-        last = Some(pair);
+        evidence.push(try_evidence(try_no + 1, &pair));
     }
-    last.expect("tries is nonzero")
+    panic!("every try failed:\n{}", evidence.join("\n"));
 }

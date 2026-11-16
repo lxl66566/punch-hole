@@ -76,6 +76,51 @@ async fn hard_sym_cone_apdf_punches_via_spray() {
     common::assert_business_traffic(&pa, &pb).await;
 }
 
+/// SymProbe across independent seeds against the port-strict cone: the
+/// measured success rate must track the spray model's estimate. Every run
+/// solves `c = ceil(ln(100) * space / 16)` against the span its probe saw,
+/// so the estimate sits at the 0.99 target while the span estimator's thin
+/// undershoot tail — four clustered samples of the 100-wide range — leaves
+/// a rare run below it.
+#[tokio::test(start_paused = true)]
+async fn sym_probe_measured_rate_tracks_the_estimate() {
+    const RUNS: usize = 64;
+    let mut wins = 0usize;
+    for i in 0..RUNS as u64 {
+        let net = Net::from_seed_u64(0x5eed_a000 + i);
+        let stun = net.stun_server();
+        let mut cfg = PunchConfig::default();
+        cfg.stun_servers = stun.addrs.clone();
+        cfg.target_success = 0.99;
+        let (ra, rb) = common::punch_pair(
+            net.host(NatSpec::random(30000..30100)),
+            cfg.clone(),
+            net.host(NatSpec::cone_apdf()),
+            cfg,
+        )
+        .await;
+        if let Ok(pa) = &ra {
+            assert_eq!(pa.report.strategy, StrategyId::SymProbe);
+            assert!(pa.report.success_estimate.unwrap_or(0.0) > 0.98);
+            rb.expect("a won run carries both sides");
+        }
+        wins += usize::from(ra.is_ok());
+    }
+    let rate = wins as f64 / RUNS as f64;
+    // Bound rationale: at the expected span reading (~60 of 100 observed,
+    // widened to ~140) a run holds c ~ 41 and a true chance past 0.998,
+    // and the undershoot tail costs a run only when the four samples
+    // cluster tight, so the measurements sit near the estimate. Treating
+    // every run as a 0.99 coin makes the count binomial with a standard
+    // deviation near 0.012 over 64 runs, and 0.90 sits seven deviations
+    // under the estimate, absorbing the undershoot tail plus the binomial
+    // noise.
+    assert!(
+        rate >= 0.90,
+        "measured rate {rate} fell far under the 0.99 estimate"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn easy_sym_cone_apdf_punches_via_prediction() {
     let net = Net::seeded("easy_sym_cone_apdf");
