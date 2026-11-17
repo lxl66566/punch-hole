@@ -43,6 +43,11 @@ default   = []
 # hosts and sockets drive a session.
 test-util = ["dep:nat-lab"]
 
+# The nat-lab example builds only when the simulator is enabled.
+[[example]]
+name              = "simulated_nat_pair"
+required-features = ["test-util"]
+
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
 cargo                   = { level = "warn", priority = -1 }

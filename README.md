@@ -22,7 +22,7 @@ STUN defaults to four public servers (`--stun host:port,...` overrides), the bur
 
 ## Example
 
-`examples/host_session.rs` is the complete program (`cargo run --example host_session`), with the transport pump, the failure triage, and the handover:
+`examples/` holds a set of runnable lessons with a README: from `nat_probe` (what NAT is this machine behind) and `minimal_pair` (the smallest complete session) to `tcp_signaling_pair` (a real two-process run over a stream transport), `retry_until_connected` (the host-owned retry loop), and `simulated_nat_pair` (a full session through simulated NATs, offline). `host_session.rs` is the complete program (`cargo run --example host_session`), with the transport pump, the failure triage, and the handover:
 
 ```rust,no_run
 use std::sync::Arc;
@@ -82,7 +82,7 @@ In SymProbe the cone side sprays candidate ports at the symmetric peer — a fit
 
 ## Docs
 
-The books build with `mdbook build docs/en && mdbook build docs/zh` and are deployed to <https://lxl66566.github.io/punch-hole/>:
+The books build with `mdbook build docs/en && mdbook build docs/zh`.
 
 - `punch-hole`: this crate; crate docs carry the same API screen, compiled by `cargo test --doc`.
 - `crates/nat-lab`: emulated NAT devices, a deterministic virtual network and a loopback NAT over real sockets, attaching through `Puncher::with_factory`. Standalone as the `nat-lab` crate, behind `test-util` here.
