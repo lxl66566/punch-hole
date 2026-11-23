@@ -50,7 +50,7 @@ jobs:
     steps:
       # enablement covers the first run on a repository where Pages is
       # still switched off in the settings.
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
         with:
           enablement: true
       - id: deployment
